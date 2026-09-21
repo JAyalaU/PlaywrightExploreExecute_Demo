@@ -1,0 +1,5 @@
+- main [ref=f5e2]:
+  - region "Profile" [ref=f5e3]:
+    - button "Edit profile" [ref=f5e4]
+    - button "Save" [ref=f5e5]
+    - status

@@ -1,0 +1,5 @@
+- generic [active] [ref=f8e1] [box=0,32,929,39]:
+  - banner "Application header" [ref=f8e2] [box=16,32,897,39]:
+    - generic [aria-hidden] [ref=f8e3] [cursor=pointer] [box=881,32,32,39]: ☰
+  - main [box=16,71,897,0]:
+    - status [box=16,71,0,0]

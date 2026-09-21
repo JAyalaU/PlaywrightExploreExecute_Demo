@@ -1,0 +1,293 @@
+{
+  "schemaVersion": 1,
+  "results": [
+    {
+      "id": 1,
+      "locator": "getByRole('button', { name: 'Save' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 2,
+      "locator": "getByRole('link', { name: 'Settings' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 3,
+      "locator": "getByRole('menuitem', { name: 'Admin' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 4,
+      "locator": "getByLabel('Role', { exact: true })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 5,
+      "locator": "getByRole('dialog', { name: 'Edit profile dialog' }).getByRole('button', { name: 'Save' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 6,
+      "locator": "getByRole('button', { name: 'Continue' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 7,
+      "locator": "getByRole('button', { name: 'Search' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 8,
+      "locator": "getByText('\u2630')",
+      "quality": "FAIL",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 9,
+      "locator": "getByRole('row', { name: 'Billing row' }).getByRole('button', { name: 'Edit' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 10,
+      "locator": "locator('iframe[title=\"payment frame\"]').contentFrame().getByRole('button', { name: 'Submit' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 11,
+      "locator": "getByRole('option', { name: 'High' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    },
+    {
+      "id": 12,
+      "locator": "getByRole('button', { name: 'Apply' })",
+      "quality": "PASS",
+      "runs": [
+        {
+          "run": 1,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        },
+        {
+          "run": 2,
+          "executed": true,
+          "unique": true,
+          "targetIdentityOk": true,
+          "stateOk": true,
+          "failure": null
+        }
+      ],
+      "bothRunsPass": true
+    }
+  ]
+}

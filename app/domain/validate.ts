@@ -1,0 +1,125 @@
+import {
+  ResolvedTestSpecSchema,
+  ResultRecordSchema,
+  TestSpecSchema,
+  type AuthoredStep,
+  type ExecutionStep,
+  type ResolvedTestSpec,
+  type ResultRecord,
+  type TestSpec,
+} from './schema.js';
+
+export class ContractValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ContractValidationError';
+  }
+}
+
+function ensureUnique(values: readonly string[], label: string): void {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) throw new ContractValidationError(`Duplicate ${label}: ${value}`);
+    seen.add(value);
+  }
+}
+
+export function parseTestSpec(input: unknown): TestSpec {
+  const spec = TestSpecSchema.parse(input);
+  ensureUnique(spec.steps.map((step) => step.id), 'authored step ID');
+  return spec;
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** A revision may keep its ID only when its validated content is unchanged. */
+export function assertImmutableTestSpec(previousInput: unknown, candidateInput: unknown): void {
+  const previous = parseTestSpec(previousInput);
+  const candidate = parseTestSpec(candidateInput);
+  if (previous.testSpecId === candidate.testSpecId && !sameJson(previous, candidate)) {
+    throw new ContractValidationError('A changed TestSpec requires a new testSpecId');
+  }
+}
+
+function assertAuthoredOperationMatches(authored: AuthoredStep, execution: ExecutionStep): void {
+  if (authored.type !== execution.type) {
+    throw new ContractValidationError(`Authored step ${authored.id} changed operation type`);
+  }
+  switch (authored.type) {
+    case 'navigate':
+      if (execution.type !== 'navigate' || execution.url !== authored.url) throw new ContractValidationError(`Authored step ${authored.id} changed URL`);
+      break;
+    case 'fill':
+    case 'select_option':
+      if (execution.type !== authored.type || !sameJson(execution.value, authored.value)) throw new ContractValidationError(`Authored step ${authored.id} changed input value`);
+      break;
+    case 'assert_text':
+      if (execution.type !== 'assert_text' || execution.expectedText !== authored.expectedText || execution.match !== authored.match) throw new ContractValidationError(`Authored step ${authored.id} changed text assertion`);
+      break;
+    case 'assert_value':
+      if (execution.type !== 'assert_value' || !sameJson(execution.expectedValue, authored.expectedValue)) throw new ContractValidationError(`Authored step ${authored.id} changed value assertion`);
+      break;
+    case 'assert_url':
+      if (execution.type !== 'assert_url' || execution.expectedUrl !== authored.expectedUrl || execution.match !== authored.match) throw new ContractValidationError(`Authored step ${authored.id} changed URL assertion`);
+      break;
+    case 'wait_for':
+      if (execution.type !== 'wait_for' || execution.timeoutPolicyRef !== authored.timeoutPolicyRef || !sameJson(execution.condition, authored.condition)) throw new ContractValidationError(`Authored step ${authored.id} changed wait condition`);
+      break;
+    case 'click':
+    case 'assert_visible':
+      break;
+  }
+}
+
+/**
+ * Validate the accepted artifact together with its source TestSpec. The source
+ * is required because origin references and authored intent cannot be checked
+ * from a resolved artifact alone.
+ */
+export function parseResolvedTestSpec(input: unknown, sourceInput: unknown): ResolvedTestSpec {
+  const source = parseTestSpec(sourceInput);
+  const resolved = ResolvedTestSpecSchema.parse(input);
+  if (resolved.testSpecId !== source.testSpecId) {
+    throw new ContractValidationError('Resolved spec references a different TestSpec');
+  }
+  if (!sameJson(resolved.executionProfileRef, source.executionProfileRef)) {
+    throw new ContractValidationError('Resolved spec changed the execution profile reference');
+  }
+  ensureUnique(resolved.executionSteps.map((step) => step.id), 'execution step ID');
+  ensureUnique(resolved.executionSteps.flatMap((step) => 'locatorId' in step ? [step.locatorId] : []), 'locator ID');
+
+  let authoredIndex = 0;
+  for (const execution of resolved.executionSteps) {
+    const authored = source.steps[authoredIndex];
+    if (!authored || execution.originStepId !== authored.id) {
+      throw new ContractValidationError(`Execution step ${execution.id} has an absent or out-of-order origin`);
+    }
+    if (execution.source === 'authored') {
+      assertAuthoredOperationMatches(authored, execution);
+      authoredIndex += 1;
+    }
+  }
+  if (authoredIndex !== source.steps.length) {
+    throw new ContractValidationError('Each authored step requires one final execution step');
+  }
+  return resolved;
+}
+
+/** Re-resolution requires both a new attempt and a new resolved artifact ID. */
+export function assertImmutableResolvedTestSpec(previous: ResolvedTestSpec, candidate: ResolvedTestSpec): void {
+  if (previous.resolvedSpecId === candidate.resolvedSpecId && !sameJson(previous, candidate)) {
+    throw new ContractValidationError('A changed ResolvedTestSpec requires a new resolvedSpecId');
+  }
+  if (previous.resolvedSpecId !== candidate.resolvedSpecId && previous.explorationAttemptId === candidate.explorationAttemptId) {
+    throw new ContractValidationError('A new resolved artifact requires a new explorationAttemptId');
+  }
+  if (previous.resolvedSpecId === candidate.resolvedSpecId && previous.explorationAttemptId !== candidate.explorationAttemptId) {
+    throw new ContractValidationError('An exploration attempt cannot reuse a resolvedSpecId');
+  }
+}
+
+export function parseResultRecord(input: unknown): ResultRecord {
+  return ResultRecordSchema.parse(input);
+}

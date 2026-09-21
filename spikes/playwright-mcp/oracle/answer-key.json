@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "private": "Never serve, snapshot, or provide this file to an MCP explorer.",
+  "scenarios": {
+    "1": {"route": "/scenario/1/", "target": "save-button", "kind": "click", "expected": {"saveState": "Saved"}},
+    "2": {"route": "/scenario/2/", "target": "settings-link", "kind": "navigate", "expected": {"urlPath": "/settings.html"}},
+    "3": {"route": "/scenario/3/", "target": "admin-menu-item", "kind": "click", "expected": {"saveState": "Admin selected"}},
+    "4": {"route": "/scenario/4/", "target": "role-select", "kind": "select", "expected": {"value": "User"}},
+    "5": {"route": "/scenario/5/", "target": "dialog-save", "kind": "assert-visible", "expected": {"dialogOpen": true}},
+    "6": {"route": "/scenario/6/", "target": "continue-button", "kind": "click", "expected": {"saveState": "Continued"}},
+    "7": {"route": "/scenario/7/", "target": "search-button", "kind": "click", "expected": {}},
+    "8": {"route": "/scenario/8/", "target": "unlabeled-menu-icon", "kind": "click", "expected": {}},
+    "9": {"route": "/scenario/9/", "target": "billing-edit", "kind": "click", "expected": {"editState": "Billing edit selected"}},
+    "10": {"route": "/scenario/10/", "target": "payment-submit", "kind": "click", "expected": {"frameResult": "Submitted"}},
+    "11": {"route": "/scenario/11/", "target": "priority-control", "kind": "select", "expected": {"value": "High"}},
+    "12": {"route": "/scenario/12/", "target": "preferences-apply", "kind": "click", "expected": {"shadowResult": "Applied"}}
+  }
+}

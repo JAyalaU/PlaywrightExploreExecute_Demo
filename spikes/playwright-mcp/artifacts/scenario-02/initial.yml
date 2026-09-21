@@ -1,0 +1,4 @@
+- main [ref=f1e2]:
+  - region "Navigation" [ref=f1e3]:
+    - link "Settings" [ref=f1e4] [cursor=pointer]:
+      - /url: /settings.html

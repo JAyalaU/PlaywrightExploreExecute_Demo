@@ -1,0 +1,4 @@
+- main [ref=f7e2]:
+  - region "Search" [ref=f7e3]:
+    - button "Search" [active] [ref=f7e4]: ⌕
+    - status [ref=f7e5]: Search selected

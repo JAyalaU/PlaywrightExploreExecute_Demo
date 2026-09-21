@@ -1,0 +1,18 @@
+{
+  "scenario": 1,
+  "run": 1,
+  "locator": "getByRole('button', { name: 'Save' })",
+  "route": "/scenario/1/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "save-button",
+    "tagName": "button",
+    "role": null,
+    "accessibleName": "Save"
+  },
+  "resultingState": {
+    "saveState": "Saved"
+  },
+  "actionOk": true
+}

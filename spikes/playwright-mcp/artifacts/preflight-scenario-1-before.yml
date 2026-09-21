@@ -1,0 +1,44 @@
+- generic [active] [ref=e1]:
+  - banner "Application header" [ref=e2]:
+    - link "Settings" [ref=e3] [cursor=pointer]:
+      - /url: /settings.html
+    - generic [ref=e4]:
+      - button "Account menu" [ref=e5]: Menu
+      - button "Search" [ref=e6]: ⌕
+      - generic [aria-hidden] [ref=e7] [cursor=pointer]: ☰
+  - main [ref=e8]:
+    - region "Save area" [ref=e9]:
+      - button "Save" [ref=e10]
+      - status
+    - region "Role settings" [ref=e11]:
+      - text: Role
+      - combobox "Role" [ref=e12]:
+        - option "Admin" [selected]
+        - option "User"
+        - option "Config"
+      - status
+    - region "Profile" [ref=e13]:
+      - button "Edit profile" [ref=e14]
+      - button "Save" [ref=e15]
+    - region "Dynamic content" [ref=e16]:
+      - button "Load next step" [ref=e17]
+    - region "Billing settings" [ref=e18]:
+      - row "Billing row" [ref=e19]:
+        - text: Billing
+        - button "Edit" [ref=e20]
+      - row "Shipping row" [ref=e21]:
+        - text: Shipping
+        - button "Edit" [ref=e22]
+      - status
+    - region "Payment" [ref=e23]:
+      - iframe [ref=e24]:
+        - generic [ref=f1e1]:
+          - button "Submit" [ref=f1e2]
+          - status
+    - region "Task priority" [ref=e25]:
+      - text: Priority
+      - button "Priority Low" [ref=e26]: Low
+    - region "Preferences" [ref=e27]:
+      - generic [ref=e28]:
+        - button "Apply" [ref=e29]
+        - status

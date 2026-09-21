@@ -1,0 +1,18 @@
+{
+  "scenario": 12,
+  "run": 2,
+  "locator": "getByRole('button', { name: 'Apply' })",
+  "route": "/scenario/12/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "preferences-apply",
+    "tagName": "button",
+    "role": null,
+    "accessibleName": "Apply"
+  },
+  "resultingState": {
+    "shadowResult": "Applied"
+  },
+  "actionOk": true
+}

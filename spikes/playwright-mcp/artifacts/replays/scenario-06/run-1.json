@@ -1,0 +1,18 @@
+{
+  "scenario": 6,
+  "run": 1,
+  "locator": "getByRole('button', { name: 'Continue' })",
+  "route": "/scenario/6/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "continue-button",
+    "tagName": "button",
+    "role": null,
+    "accessibleName": "Continue"
+  },
+  "resultingState": {
+    "saveState": "Continued"
+  },
+  "actionOk": true
+}

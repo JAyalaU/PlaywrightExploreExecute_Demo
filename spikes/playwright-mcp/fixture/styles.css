@@ -1,0 +1,9 @@
+body { font: 16px system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+header { display: flex; justify-content: flex-end; align-items: center; }
+section, .row { border: 1px solid #bbb; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+[hidden] { display: none !important; }
+#menu { position: absolute; right: 1rem; background: white; border: 1px solid #888; padding: .75rem; }
+.icon { width: 2.25rem; height: 2.25rem; }
+.plain-control { cursor: pointer; border: 1px solid #777; padding: .5rem; display: inline-block; }
+dialog { padding: 1.5rem; }
+.billing { background: #f4f8ff; }

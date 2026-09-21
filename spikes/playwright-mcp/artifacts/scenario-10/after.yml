@@ -1,0 +1,6 @@
+- main [ref=f10e2]:
+  - region "Payment" [ref=f10e3]:
+    - iframe [active] [ref=f10e4]:
+      - generic [ref=f11e1]:
+        - button "Submit" [active] [ref=f11e2]
+        - status [ref=f11e3]: Submitted

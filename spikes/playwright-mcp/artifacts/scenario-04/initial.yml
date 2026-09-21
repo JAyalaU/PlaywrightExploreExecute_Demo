@@ -1,0 +1,8 @@
+- main [ref=f4e2]:
+  - region "Role settings" [ref=f4e3]:
+    - text: Role
+    - combobox "Role" [ref=f4e4]:
+      - option "Admin" [selected]
+      - option "User"
+      - option "Config"
+    - status

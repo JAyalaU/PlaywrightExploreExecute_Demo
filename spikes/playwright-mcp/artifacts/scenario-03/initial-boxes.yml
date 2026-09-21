@@ -1,0 +1,5 @@
+- generic [active] [ref=f3e1] [box=0,32,929,21]:
+  - banner "Application header" [ref=f3e2] [box=16,32,897,21]:
+    - button "Account menu" [ref=f3e3] [box=864,32,49,21]: Menu
+  - main [box=16,53,897,0]:
+    - status [box=16,53,0,0]

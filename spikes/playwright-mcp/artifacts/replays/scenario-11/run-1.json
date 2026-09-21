@@ -1,0 +1,18 @@
+{
+  "scenario": 11,
+  "run": 1,
+  "locator": "getByRole('option', { name: 'High' })",
+  "route": "/scenario/11/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": null,
+    "tagName": "li",
+    "role": "option",
+    "accessibleName": "High"
+  },
+  "resultingState": {
+    "value": "High"
+  },
+  "actionOk": true
+}

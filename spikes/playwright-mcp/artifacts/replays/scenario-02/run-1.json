@@ -1,0 +1,18 @@
+{
+  "scenario": 2,
+  "run": 1,
+  "locator": "getByRole('link', { name: 'Settings' })",
+  "route": "/scenario/2/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "settings-link",
+    "tagName": "a",
+    "role": null,
+    "accessibleName": "Settings"
+  },
+  "resultingState": {
+    "urlPath": "/settings.html"
+  },
+  "actionOk": true
+}

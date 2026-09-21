@@ -1,0 +1,18 @@
+{
+  "scenario": 4,
+  "run": 2,
+  "locator": "getByLabel('Role', { exact: true })",
+  "route": "/scenario/4/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "role-select",
+    "tagName": "select",
+    "role": null,
+    "accessibleName": "AdminUserConfig"
+  },
+  "resultingState": {
+    "value": "User"
+  },
+  "actionOk": true
+}

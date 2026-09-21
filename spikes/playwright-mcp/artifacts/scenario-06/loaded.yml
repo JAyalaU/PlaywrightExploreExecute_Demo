@@ -1,0 +1,5 @@
+- main [ref=f6e2]:
+  - region "Dynamic content" [ref=f6e3]:
+    - button "Load next step" [active] [ref=f6e4]
+    - button "Continue" [ref=f6e6]
+    - status

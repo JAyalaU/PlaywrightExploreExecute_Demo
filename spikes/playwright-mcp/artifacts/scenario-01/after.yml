@@ -1,0 +1,4 @@
+- main [ref=e2]:
+  - region "Save area" [ref=e3]:
+    - button "Save" [active] [ref=e4]
+    - status [ref=e5]: Saved

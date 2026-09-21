@@ -1,0 +1,8 @@
+- generic [ref=f3e1]:
+  - banner "Application header" [ref=f3e2]:
+    - button "Account menu" [expanded] [ref=f3e3]: Menu
+  - menu "Account menu" [ref=f3e4]:
+    - menuitem "Admin" [active] [ref=f3e5]
+    - menuitem "Config" [ref=f3e6]
+  - main [ref=f3e7]:
+    - status [ref=f3e8]: Admin selected

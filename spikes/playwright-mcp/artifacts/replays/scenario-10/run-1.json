@@ -1,0 +1,18 @@
+{
+  "scenario": 10,
+  "run": 1,
+  "locator": "locator('iframe[title=\"payment frame\"]').contentFrame().getByRole('button', { name: 'Submit' })",
+  "route": "/scenario/10/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "payment-submit",
+    "tagName": "button",
+    "role": null,
+    "accessibleName": "Submit"
+  },
+  "resultingState": {
+    "frameResult": "Submitted"
+  },
+  "actionOk": true
+}

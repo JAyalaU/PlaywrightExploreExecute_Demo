@@ -1,0 +1,16 @@
+{
+  "scenario": 8,
+  "run": 1,
+  "locator": "getByText('☰')",
+  "route": "/scenario/8/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "unlabeled-menu-icon",
+    "tagName": "span",
+    "role": null,
+    "accessibleName": "☰"
+  },
+  "resultingState": {},
+  "actionOk": true
+}

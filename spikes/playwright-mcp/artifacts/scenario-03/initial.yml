@@ -1,0 +1,5 @@
+- generic [active] [ref=f3e1]:
+  - banner "Application header" [ref=f3e2]:
+    - button "Account menu" [ref=f3e3]: Menu
+  - main:
+    - status

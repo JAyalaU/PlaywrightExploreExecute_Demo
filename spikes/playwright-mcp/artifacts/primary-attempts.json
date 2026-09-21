@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "runStatus": "primary_attempts_complete",
+  "mcpToolInventory": ["browser_navigate", "browser_snapshot", "browser_find", "browser_click", "browser_select_option", "browser_wait_for", "browser_generate_locator", "browser_take_screenshot"],
+  "scenarios": [
+    {"id":1,"instruction":"Select Save.","status":"COMPLETE","classification":"A","observedTarget":"save-button","matchCount":1,"actionOk":true,"resultingState":{"saveState":"Saved"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":2,"instruction":"Open Settings.","status":"COMPLETE","classification":"A","observedTarget":"settings-link","matchCount":1,"actionOk":true,"resultingState":{"urlPath":"/settings.html"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":3,"instruction":"Open the top-right menu, then select Admin.","status":"COMPLETE","classification":"B","observedTarget":"admin-menu-item","matchCount":1,"actionOk":true,"resultingState":{"saveState":"Admin selected"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":4,"instruction":"Choose User in the Role dropdown.","status":"COMPLETE","classification":"A","observedTarget":"role-select","matchCount":1,"actionOk":true,"resultingState":{"value":"User"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":5,"instruction":"Open Edit profile; confirm Save appears in the dialog.","status":"COMPLETE","classification":"B","observedTarget":"dialog-save","matchCount":1,"actionOk":true,"resultingState":{"dialogOpen":true},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":6,"instruction":"After loading, select Continue.","status":"COMPLETE","classification":"B","observedTarget":"continue-button","matchCount":1,"actionOk":true,"resultingState":{"saveState":"Continued"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":7,"instruction":"Select the Search icon.","status":"COMPLETE","classification":"A","observedTarget":"search-button","matchCount":1,"actionOk":true,"resultingState":{},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":8,"instruction":"Select the top-right menu icon.","status":"COMPLETE","classification":"B","observedTarget":"unlabeled-menu-icon","matchCount":1,"actionOk":true,"resultingState":{},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":9,"instruction":"Select Edit for the Billing row.","status":"COMPLETE","classification":"B","observedTarget":"billing-edit","matchCount":1,"actionOk":true,"resultingState":{"editState":"Billing edit selected"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":10,"instruction":"Select Submit in the payment frame.","status":"COMPLETE","classification":"B","observedTarget":"payment-submit","matchCount":1,"actionOk":true,"resultingState":{"frameResult":"Submitted"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":11,"instruction":"Set Priority to High.","status":"COMPLETE","classification":"B","observedTarget":"priority-control","matchCount":1,"actionOk":true,"resultingState":{"value":"High"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"},
+    {"id":12,"instruction":"Select Apply inside the Preferences component.","status":"COMPLETE","classification":"A","observedTarget":"preferences-apply","matchCount":1,"actionOk":true,"resultingState":{"shadowResult":"Applied"},"cleanRuns":"NOT_RUN_NO_REPLAY_HARNESS"}
+  ]
+}

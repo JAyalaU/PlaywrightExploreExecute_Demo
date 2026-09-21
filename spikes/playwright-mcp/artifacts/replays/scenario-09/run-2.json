@@ -1,0 +1,18 @@
+{
+  "scenario": 9,
+  "run": 2,
+  "locator": "getByRole('row', { name: 'Billing row' }).getByRole('button', { name: 'Edit' })",
+  "route": "/scenario/9/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "billing-edit",
+    "tagName": "button",
+    "role": null,
+    "accessibleName": "Edit"
+  },
+  "resultingState": {
+    "editState": "Billing edit selected"
+  },
+  "actionOk": true
+}

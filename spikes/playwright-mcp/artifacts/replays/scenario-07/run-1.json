@@ -1,0 +1,16 @@
+{
+  "scenario": 7,
+  "run": 1,
+  "locator": "getByRole('button', { name: 'Search' })",
+  "route": "/scenario/7/",
+  "status": "PASS",
+  "matchCount": 1,
+  "observedTarget": {
+    "id": "search-button",
+    "tagName": "button",
+    "role": null,
+    "accessibleName": "Search"
+  },
+  "resultingState": {},
+  "actionOk": true
+}

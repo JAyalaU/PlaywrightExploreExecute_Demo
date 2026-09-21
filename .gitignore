@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Production Node/TypeScript toolchain
+node_modules/
+test-results/
+playwright-report/
+*.tsbuildinfo
+
+# Local production job artifacts
+jobs/
+
+# Local Playwright MCP diagnostics and page snapshots
+.playwright-mcp/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example

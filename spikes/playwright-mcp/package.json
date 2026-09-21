@@ -1,0 +1,12 @@
+{
+  "name": "playwright-mcp-feasibility-spike",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Isolated replay harness for recorded Playwright MCP locators.",
+  "devDependencies": {
+    "@playwright/test": "1.57.0"
+  },
+  "scripts": {
+    "replay": "playwright test -c replay.playwright.config.js"
+  }
+}

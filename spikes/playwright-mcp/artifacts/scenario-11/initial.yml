@@ -1,0 +1,4 @@
+- main [ref=f12e2]:
+  - region "Task priority" [ref=f12e3]:
+    - text: Priority
+    - button "Priority Low" [ref=f12e4]: Low

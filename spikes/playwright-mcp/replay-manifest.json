@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "source": "Exact locators recorded in docs/playwright-mcp-spike-results.md after primary MCP exploration.",
+  "baseURL": "http://127.0.0.1:4173",
+  "scenarios": [
+    {"id": 1, "route": "/scenario/1/", "expectedTarget": "save-button", "locator": "getByRole('button', { name: 'Save' })", "operation": "click", "expected": {"saveState": "Saved"}},
+    {"id": 2, "route": "/scenario/2/", "expectedTarget": "settings-link", "locator": "getByRole('link', { name: 'Settings' })", "operation": "click", "expected": {"urlPath": "/settings.html"}},
+    {"id": 3, "route": "/scenario/3/", "expectedTarget": "admin-menu-item", "locator": "getByRole('menuitem', { name: 'Admin' })", "prerequisite": "openTopRightMenu", "operation": "click", "expected": {"saveState": "Admin selected"}},
+    {"id": 4, "route": "/scenario/4/", "expectedTarget": "role-select", "locator": "getByLabel('Role', { exact: true })", "operation": "selectOption", "value": "User", "expected": {"value": "User"}},
+    {"id": 5, "route": "/scenario/5/", "expectedTarget": "dialog-save", "locator": "getByRole('dialog', { name: 'Edit profile dialog' }).getByRole('button', { name: 'Save' })", "prerequisite": "openEditProfile", "operation": "assertVisible", "expected": {"dialogOpen": true}},
+    {"id": 6, "route": "/scenario/6/", "expectedTarget": "continue-button", "locator": "getByRole('button', { name: 'Continue' })", "prerequisite": "waitForContinue", "operation": "click", "expected": {"saveState": "Continued"}},
+    {"id": 7, "route": "/scenario/7/", "expectedTarget": "search-button", "locator": "getByRole('button', { name: 'Search' })", "operation": "click", "expected": {}},
+    {"id": 8, "route": "/scenario/8/", "expectedTarget": "unlabeled-menu-icon", "locator": "getByText('☰')", "operation": "click", "expected": {}, "quality": "FAIL"},
+    {"id": 9, "route": "/scenario/9/", "expectedTarget": "billing-edit", "locator": "getByRole('row', { name: 'Billing row' }).getByRole('button', { name: 'Edit' })", "operation": "click", "expected": {"editState": "Billing edit selected"}},
+    {"id": 10, "route": "/scenario/10/", "expectedTarget": "payment-submit", "locator": "locator('iframe[title=\"payment frame\"]').contentFrame().getByRole('button', { name: 'Submit' })", "operation": "click", "expected": {"frameResult": "Submitted"}},
+    {"id": 11, "route": "/scenario/11/", "expectedTarget": "priority-control", "locator": "getByRole('option', { name: 'High' })", "prerequisite": "openPriority", "operation": "click", "expected": {"value": "High"}},
+    {"id": 12, "route": "/scenario/12/", "expectedTarget": "preferences-apply", "locator": "getByRole('button', { name: 'Apply' })", "operation": "click", "expected": {"shadowResult": "Applied"}}
+  ]
+}

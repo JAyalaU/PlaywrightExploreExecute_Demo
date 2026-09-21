@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "inputStatus": "primary_attempts_complete",
+  "mcpToolInventory": [
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_find",
+    "browser_click",
+    "browser_select_option",
+    "browser_wait_for",
+    "browser_generate_locator",
+    "browser_take_screenshot"
+  ],
+  "results": [
+    {
+      "id": 1,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 2,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 3,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 4,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 5,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 6,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 7,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 8,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 9,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 10,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 11,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    },
+    {
+      "id": 12,
+      "status": "SCORED",
+      "correctTarget": true,
+      "unique": true,
+      "actionOk": true,
+      "stateOk": true,
+      "resolutionObjectivePass": true,
+      "locatorRuns": "NOT_RUN_NO_REPLAY_HARNESS"
+    }
+  ],
+  "humanReviewRequiredFor": [
+    "A/B classification",
+    "C permitted-information boundary",
+    "non-obvious locator quality",
+    "ambiguous/disputed evidence"
+  ]
+}

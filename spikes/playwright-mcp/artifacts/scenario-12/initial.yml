@@ -1,0 +1,5 @@
+- main [ref=f13e2]:
+  - region "Preferences" [ref=f13e3]:
+    - generic [ref=f13e4]:
+      - button "Apply" [ref=f13e5]
+      - status
