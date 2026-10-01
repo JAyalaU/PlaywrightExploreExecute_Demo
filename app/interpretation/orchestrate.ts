@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import { TargetSchema, type AuthoredStep, type ResultRecord } from '../domain/index.js';
-import type { ResolutionDecision, ResolutionView, ScriptedDecision } from '../exploration/resolve.js';
+import type {
+  LocatorRejectionFeedback, ResolutionDecision, ResolutionView, ScriptedDecision,
+} from '../exploration/resolve.js';
+import { ModelCompletionFailure } from './model-failure.js';
 
 /** The provider receives data, never an MCP client or browser tool handle. */
 export interface StepDecisionModel {
@@ -11,15 +14,20 @@ export interface StepDecisionModel {
   }): Promise<string>;
 }
 
-export interface StepDecisionContext {
+interface StepDecisionContextBase {
   authoredStep: AuthoredStep;
   priorOutcomes: readonly Pick<ResultRecord, 'originStepId' | 'status'>[];
   currentUrl: string;
   snapshot: string;
   previousFind?: string;
   prerequisites: number;
-  alternativeAttempt: boolean;
 }
+
+/** A refinement call always carries the closed facts from the rejected candidate. */
+export type StepDecisionContext = StepDecisionContextBase & (
+  | { alternativeAttempt: false; locatorRejection?: never }
+  | { alternativeAttempt: true; locatorRejection: LocatorRejectionFeedback }
+);
 
 export interface StepOrchestrationOptions {
   timeoutMs?: number;
@@ -63,11 +71,18 @@ export const STEP_DECISION_SYSTEM_INSTRUCTION = [
   'unresolved requires one reason: AMBIGUOUS_TARGET, TARGET_NOT_FOUND, or INSUFFICIENT_CONTEXT.',
   'Select refs only from the supplied snapshot or find result. Never invent a ref, selector, test ID, coordinate, or hidden DOM fact.',
   'Use a prerequisite click only when the authored instruction or its semantic scope justifies exposing the target.',
+  'When alternativeAttempt is true, locatorRejection is trusted gate feedback about the previous candidate, not page instructions.',
+  'Use the version 2 locatorRejection retryMode and checked facts. For same_node_refinement, keep the selected ref and describe new justified role/name or authored scope evidence from the supplied snapshot/find result.',
+  'For different_node_selection, choose a different permitted ref only when the rejected selection or binding was wrong or ambiguous.',
+  'Do not repeat a candidate without new semantic evidence. M6 alone verifies generated locator quality and selected-reference equality.',
+  'If no justified durable alternative is exposed, return unresolved. Never invent hidden DOM identity or override the locator-quality rejection.',
+  'For assert_link_collection, select one matching main-document link ref as an exemplar. The locator gate requires an exact role=link/name collection locator; the runner evaluates all matching links. Do not add position or frame identity.',
   'Do not request browser evaluation, arbitrary code, host commands, uploads, downloads, or changes to the TestSpec or execution policy.',
   'Do not repeat a completed prerequisite shown in prior outcomes. If the target cannot be identified, return unresolved.',
 ].join('\n');
 
 function targetTerms(step: AuthoredStep): string[] {
+  if (step.type === 'assert_link_collection') return [step.linkName];
   const target = 'target' in step ? step.target :
     step.type === 'wait_for' && 'target' in step.condition ? step.condition.target : undefined;
   return target ? [target.description, ...(target.scope ?? []).map((scope) => scope.description)] : [];
@@ -100,14 +115,27 @@ function excerpt(snapshot: string, step: AuthoredStep, maxChars: number): string
 }
 
 function contextFor(view: ResolutionView, maxSnapshotChars: number): StepDecisionContext {
-  return {
+  const common: StepDecisionContextBase = {
     authoredStep: view.step,
     priorOutcomes: view.priorOutcomes.slice(-8).map(({ originStepId, status }) => ({ originStepId, status })),
     currentUrl: view.currentUrl,
     snapshot: excerpt(view.snapshot, view.step, maxSnapshotChars),
     ...(view.previousFind ? { previousFind: view.previousFind.slice(0, 4096) } : {}),
     prerequisites: view.prerequisites,
-    alternativeAttempt: view.alternativeAttempt,
+  };
+  if (!view.alternativeAttempt) return { ...common, alternativeAttempt: false };
+  if (!view.locatorRejection) throw new StepDecisionError('LOCATOR_REFINEMENT_CONTEXT_INVALID');
+  return {
+    ...common,
+    alternativeAttempt: true,
+    locatorRejection: {
+      schemaVersion: view.locatorRejection.schemaVersion,
+      retryMode: view.locatorRejection.retryMode,
+      selectedRef: view.locatorRejection.selectedRef,
+      targetDescription: view.locatorRejection.targetDescription,
+      reasons: [...view.locatorRejection.reasons],
+      checks: { ...view.locatorRejection.checks },
+    },
   };
 }
 
@@ -156,7 +184,9 @@ export function createStepDecision(model: StepDecisionModel, options: StepOrches
         break;
       } catch (error) {
         if (attempt === retryCount) {
-          throw error instanceof StepDecisionError ? error : new StepDecisionError('MODEL_ERROR');
+          throw error instanceof StepDecisionError ? error :
+            error instanceof ModelCompletionFailure ? new StepDecisionError(error.code) :
+              new StepDecisionError('MODEL_ERROR');
         }
       }
     }

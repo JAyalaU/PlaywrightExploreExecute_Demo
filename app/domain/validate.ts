@@ -1,5 +1,8 @@
 import {
   ResolvedTestSpecSchema,
+  SEMANTIC_ROW_LOCATOR_SCHEMA_VERSION,
+  SEMANTIC_ROLE_NAME_SCHEMA_VERSION,
+  STRUCTURED_ACTION_IDENTITY_SCHEMA_VERSION,
   ResultRecordSchema,
   TestSpecSchema,
   type AuthoredStep,
@@ -8,6 +11,9 @@ import {
   type ResultRecord,
   type TestSpec,
 } from './schema.js';
+import { reviewAuthoredRoleNameIdentity } from '../locator/quality.js';
+import { verificationGoalFidelity } from './verification-goal.js';
+import { actionTargetIntentFidelity } from './action-target-intent.js';
 
 export class ContractValidationError extends Error {
   constructor(message: string) {
@@ -27,11 +33,33 @@ function ensureUnique(values: readonly string[], label: string): void {
 export function parseTestSpec(input: unknown): TestSpec {
   const spec = TestSpecSchema.parse(input);
   ensureUnique(spec.steps.map((step) => step.id), 'authored step ID');
+  for (const [index, step] of spec.steps.entries()) {
+    if (step.type === 'verification_goal') {
+      const problem = verificationGoalFidelity(step, spec.sourceInstruction,
+        spec.steps.slice(0, index).map((prior) => prior.id));
+      if (problem) throw new ContractValidationError(`Verification goal ${step.id}: ${problem}`);
+    } else if (spec.schemaVersion === STRUCTURED_ACTION_IDENTITY_SCHEMA_VERSION &&
+        (step.type === 'click' || step.type === 'fill' || step.type === 'select_option')) {
+      const problem = actionTargetIntentFidelity(step, spec.sourceInstruction);
+      if (problem) throw new ContractValidationError(`Action target ${step.id}: ${problem}`);
+    }
+  }
   return spec;
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function describesLink(description: string, accessibleName: string): boolean {
+  const authored = description.trim().toLocaleLowerCase('en-US');
+  const name = accessibleName.trim().toLocaleLowerCase('en-US');
+  return authored === name || authored === `${name} link`;
+}
+
+function scopeIdentifiesCell(description: string, cellName: string): boolean {
+  const escaped = cellName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, 'i').test(description);
 }
 
 /** A revision may keep its ID only when its validated content is unchanged. */
@@ -64,6 +92,14 @@ function assertAuthoredOperationMatches(authored: AuthoredStep, execution: Execu
     case 'assert_url':
       if (execution.type !== 'assert_url' || execution.expectedUrl !== authored.expectedUrl || execution.match !== authored.match) throw new ContractValidationError(`Authored step ${authored.id} changed URL assertion`);
       break;
+    case 'assert_link_collection':
+      if (execution.type !== 'assert_link_collection' || execution.linkName !== authored.linkName ||
+          execution.expectedCount !== authored.expectedCount || execution.expectedHref !== authored.expectedHref ||
+          execution.locator.validatedForm.name !== authored.linkName ||
+          execution.locator.observed.accessibleName !== authored.linkName) {
+        throw new ContractValidationError(`Authored step ${authored.id} changed link collection assertion`);
+      }
+      break;
     case 'wait_for':
       if (execution.type !== 'wait_for' || execution.timeoutPolicyRef !== authored.timeoutPolicyRef || !sameJson(execution.condition, authored.condition)) throw new ContractValidationError(`Authored step ${authored.id} changed wait condition`);
       break;
@@ -87,6 +123,12 @@ export function parseResolvedTestSpec(input: unknown, sourceInput: unknown): Res
   if (!sameJson(resolved.executionProfileRef, source.executionProfileRef)) {
     throw new ContractValidationError('Resolved spec changed the execution profile reference');
   }
+  if (resolved.schemaVersion === SEMANTIC_ROW_LOCATOR_SCHEMA_VERSION ||
+      resolved.schemaVersion === SEMANTIC_ROLE_NAME_SCHEMA_VERSION
+    ? resolved.sourceSchemaVersion !== source.schemaVersion
+    : resolved.schemaVersion !== source.schemaVersion) {
+    throw new ContractValidationError('Resolved spec changed the TestSpec schema version');
+  }
   ensureUnique(resolved.executionSteps.map((step) => step.id), 'execution step ID');
   ensureUnique(resolved.executionSteps.flatMap((step) => 'locatorId' in step ? [step.locatorId] : []), 'locator ID');
 
@@ -95,6 +137,25 @@ export function parseResolvedTestSpec(input: unknown, sourceInput: unknown): Res
     const authored = source.steps[authoredIndex];
     if (!authored || execution.originStepId !== authored.id) {
       throw new ContractValidationError(`Execution step ${execution.id} has an absent or out-of-order origin`);
+    }
+    if ('locator' in execution && 'origin' in execution.locator && execution.locator.origin === 'semanticRowScope') {
+      const form = execution.locator.validatedForm;
+      if (execution.source !== 'authored' || execution.type !== 'click' || authored.type !== 'click' ||
+          authored.target.scope?.length !== 1 || authored.target.scope[0]?.kind !== 'row' ||
+          !scopeIdentifiesCell(authored.target.scope[0].description, form.scope.cellName) ||
+          !describesLink(authored.target.description, form.target.name)) {
+        throw new ContractValidationError('Semantic row locator does not match the authored row and link intent');
+      }
+    }
+    if ('locator' in execution && 'origin' in execution.locator &&
+        execution.locator.origin === 'verifiedRoleNameProjection') {
+      const target = authored.type === 'wait_for' && 'target' in authored.condition
+        ? authored.condition.target : 'target' in authored ? authored.target : undefined;
+      if (execution.source !== 'authored' || !target ||
+          !reviewAuthoredRoleNameIdentity(target, execution.locator.validatedForm,
+            execution.locator.observed)) {
+        throw new ContractValidationError('Verified role/name projection does not match authored target intent');
+      }
     }
     if (execution.source === 'authored') {
       assertAuthoredOperationMatches(authored, execution);

@@ -2,13 +2,23 @@ import { randomUUID } from 'node:crypto';
 import { errors, type Locator, type Page } from '@playwright/test';
 import {
   parseResolvedTestSpec, parseResultRecord, parseTestSpec,
-  type ExecutionStep, type ResolvedTestSpec, type ResultRecord, type TestSpec,
+  parseResolvedTestSpecV6,
+  parseResolvedTestSpecV7,
+  type CompiledExecutionStepV1, type CompilerAttemptV1, type ExecutionStep,
+  type CompilerAttemptV2, type ProtectedTraceObservationSourceV3,
+  type ExplorationAttemptV3, type ResolvedTestSpec, type ResolvedTestSpecV6,
+  type ResolvedTestSpecV7, type ResolvedTestSpecV8,
+  type ResultRecord, type SuccessfulExplorationTraceV1,
+  type SuccessfulExplorationTraceV2, type SuccessfulExplorationTraceV3,
+  type TestSpec,
 } from '../domain/index.js';
+import { AcceptedResolvedTestSpecV8 } from '../evidence/accepted-v8.js';
 import { bindingResultFromObservation, type BindingResult } from '../locator/index.js';
 import {
   type EffectiveProfile, type ProtectedBrowserSession, ProtectedContextFactory,
 } from '../profile/index.js';
-import { bindLocator, frameIdentity } from './locator.js';
+import { bindCompiledLocator, bindLocator, frameIdentity } from './locator.js';
+import { executeVerificationAssertionV7 } from './verification-v7.js';
 
 export const RUNNER_VERSION = '1';
 
@@ -39,8 +49,20 @@ export interface ExecutionRun {
 }
 
 type Outcome = Pick<ResultRecord, 'status' | 'reason' | 'expected' | 'actual' | 'retryable'>;
-const success = (status: 'OPERATION_SUCCEEDED' | 'QA_ASSERTION_PASSED'): Outcome => ({ status, retryable: false });
-const failure = (status: 'LOCATOR_BINDING_FAILED' | 'BROWSER_EXECUTION_FAILED' | 'QA_ASSERTION_FAILED' | 'TEST_BUILD_FAILED', reason: string, expected?: string, actual?: string): Outcome => ({
+type RunnerStep = ExecutionStep | CompiledExecutionStepV1;
+type ResolvedVerificationStepV7 = Extract<ResolvedTestSpecV7['executionSteps'][number],
+  { type: 'verification_goal' }>;
+type RunStep = RunnerStep | ResolvedVerificationStepV7;
+type RunnableSpec = ResolvedTestSpec | ResolvedTestSpecV6 | ResolvedTestSpecV7 | ResolvedTestSpecV8;
+type RunnerSource = Pick<TestSpec, 'testSpecId' | 'startState'>;
+const isCompiled = (step: RunnerStep): step is CompiledExecutionStepV1 =>
+  'traceRecordId' in step;
+const success = (status: 'OPERATION_SUCCEEDED' | 'QA_ASSERTION_PASSED', expected?: string, actual?: string): Outcome => ({
+  status, retryable: false,
+  ...(expected === undefined ? {} : { expected }),
+  ...(actual === undefined ? {} : { actual }),
+});
+const failure = (status: 'LOCATOR_BINDING_FAILED' | 'BROWSER_EXECUTION_FAILED' | 'QA_ASSERTION_FAILED' | 'TEST_BUILD_FAILED', reason: string, expected?: string | number, actual?: string | number): Outcome => ({
   status, reason, retryable: false,
   ...(expected === undefined ? {} : { expected }),
   ...(actual === undefined ? {} : { actual }),
@@ -70,15 +92,32 @@ function snapshotIdentityMatches(snapshot: unknown, observed: { role?: string | 
     (observed.accessibleName === undefined || node.name === observed.accessibleName);
 }
 
-async function inspectBinding(page: Page, step: Extract<ExecutionStep, { locatorId: string }>, timeoutMs: number): Promise<{ locator?: Locator; result: BindingResult }> {
+async function inspectBinding(page: Page, step: RunnerStep, timeoutMs: number,
+  strictScope = false): Promise<{ locator?: Locator; result: BindingResult }> {
   const deadline = Date.now() + timeoutMs;
   try {
-    const frame = frameIdentity(page, step.locator.validatedForm);
-    const locator = bindLocator(page, step.locator.validatedForm);
+    if (!('locator' in step) || !step.locator) return { result: { reason: 'UNSUPPORTED_FORM' } };
+    const compiled = isCompiled(step);
+    const frame = compiled ? undefined : frameIdentity(page, step.locator.validatedForm);
+    const bound = compiled ? bindCompiledLocator(page, step.locator) : undefined;
+    const locator = bound?.locator ?? bindLocator(page, step.locator.validatedForm);
     while (true) {
-      if (frame && await frame.count() !== 1) {
+      const frames = bound?.anchors ?? (frame ? [frame] : []);
+      let framesValid = true;
+      for (const anchor of frames) {
+        if (await anchor.count() !== 1) { framesValid = false; break; }
+      }
+      if (!framesValid) {
         if (Date.now() >= deadline) return { result: { reason: 'FRAME_RESOLUTION_FAILED' } };
       } else {
+        if (strictScope && bound) {
+          for (const scope of bound.scopes) {
+            const scopeCount = await scope.count();
+            if (scopeCount === 0) return { result: { reason: 'NO_MATCH', matchCount: 0 } };
+            if (scopeCount > 1) return { result: { reason: 'AMBIGUOUS_MATCH',
+              matchCount: scopeCount } };
+          }
+        }
         const count = await locator.count();
         if (count > 1) return { result: bindingResultFromObservation(count) };
         if (count === 1) {
@@ -102,9 +141,9 @@ async function inspectBinding(page: Page, step: Extract<ExecutionStep, { locator
   }
 }
 
-export function classifyBinding(step: ExecutionStep, binding: BindingResult): Outcome {
+export function classifyBinding(step: RunnerStep, binding: BindingResult): Outcome {
   const assertion = step.type === 'assert_visible' || step.type === 'assert_text' || step.type === 'assert_value';
-  if (binding.reason === 'NO_MATCH' && assertion) return failure('QA_ASSERTION_FAILED', 'NO_MATCH');
+  if (binding.reason === 'NO_MATCH' && assertion && !isCompiled(step)) return failure('QA_ASSERTION_FAILED', 'NO_MATCH');
   return failure('LOCATOR_BINDING_FAILED', binding.reason);
 }
 
@@ -117,7 +156,8 @@ async function dataValue(value: string | { kind: 'dataRef'; ref: string }, provi
   catch { throw new DataReferenceUnavailable(); }
 }
 
-async function executeStep(page: Page, step: ExecutionStep, profile: EffectiveProfile, provider?: DataValueProvider): Promise<Outcome> {
+async function executeStep(page: Page, step: RunnerStep, profile: EffectiveProfile,
+  provider?: DataValueProvider, strictScope = false): Promise<Outcome> {
   const { actionMs, navigationMs, waits } = profile.profile.timeoutPolicy;
   try {
     if (step.type === 'navigate') {
@@ -128,6 +168,29 @@ async function executeStep(page: Page, step: ExecutionStep, profile: EffectivePr
       return urlMatches(actual, step.expectedUrl, step.match)
         ? success('QA_ASSERTION_PASSED')
         : failure('QA_ASSERTION_FAILED', 'URL_MISMATCH', step.expectedUrl, actual);
+    }
+    if (step.type === 'assert_link_collection') {
+      try {
+        // Fixed runner code reads the browser-resolved href. No model-supplied
+        // script or selector is executed, and a role locator stays in the main frame.
+        const linkLocator = isCompiled(step) ? page.getByRole('link', { name: step.linkName, exact: true }) :
+          bindLocator(page, step.locator.validatedForm);
+        const links = await linkLocator.evaluateAll((elements) =>
+          elements.map((element) => element instanceof HTMLAnchorElement ? element.href : null));
+        const expectedHref = new URL(step.expectedHref).href;
+        const expected = JSON.stringify({ count: step.expectedCount, hrefs: [expectedHref, expectedHref] });
+        const actual = JSON.stringify({ count: links.length, hrefs: links });
+        if (links.length !== step.expectedCount) {
+          return failure('QA_ASSERTION_FAILED', 'LINK_COUNT_MISMATCH', expected, actual);
+        }
+        return links.every((href) => href === expectedHref)
+          ? success('QA_ASSERTION_PASSED', expected, actual)
+          : failure('QA_ASSERTION_FAILED', 'LINK_DESTINATION_MISMATCH', expected, actual);
+      } catch {
+        return page.isClosed()
+          ? failure('BROWSER_EXECUTION_FAILED', 'PAGE_CLOSED')
+          : failure('LOCATOR_BINDING_FAILED', 'EVALUATION_FAILED');
+      }
     }
     if (step.type === 'wait_for' && (step.condition.type === 'url_exact' || step.condition.type === 'url_pattern')) {
       const timeout = waits[step.timeoutPolicyRef];
@@ -144,7 +207,7 @@ async function executeStep(page: Page, step: ExecutionStep, profile: EffectivePr
     const waitTimeout = step.type === 'wait_for' ? waits[step.timeoutPolicyRef] : undefined;
     if (step.type === 'wait_for' && waitTimeout === undefined) return failure('TEST_BUILD_FAILED', 'UNKNOWN_TIMEOUT_POLICY');
     const waitStarted = Date.now();
-    const { locator, result } = await inspectBinding(page, step, waitTimeout ?? actionMs);
+    const { locator, result } = await inspectBinding(page, step, waitTimeout ?? actionMs, strictScope);
     if (result.reason !== 'BOUND' || !locator) return classifyBinding(step, result);
     switch (step.type) {
       case 'click': await locator.click({ timeout: actionMs }); return success('OPERATION_SUCCEEDED');
@@ -168,7 +231,7 @@ async function executeStep(page: Page, step: ExecutionStep, profile: EffectivePr
         while (Date.now() <= deadline) {
           const matched = step.condition.type === 'target_visible' ? await locator.isVisible() : await locator.inputValue({ timeout: Math.min(actionMs, timeout) }) === expected;
           if (matched) {
-            const renewed = await inspectBinding(page, step, 0);
+            const renewed = await inspectBinding(page, step, 0, strictScope);
             return renewed.result.reason === 'BOUND' ? success('OPERATION_SUCCEEDED') : classifyBinding(step, renewed.result);
           }
           await page.waitForTimeout(Math.min(50, Math.max(1, deadline - Date.now())));
@@ -181,7 +244,7 @@ async function executeStep(page: Page, step: ExecutionStep, profile: EffectivePr
     if (page.isClosed()) return failure('BROWSER_EXECUTION_FAILED', 'PAGE_CLOSED');
     if ('locatorId' in step) {
       try {
-        const rebound = await inspectBinding(page, step, 0);
+        const rebound = await inspectBinding(page, step, 0, strictScope);
         if (rebound.result.reason !== 'BOUND') return classifyBinding(step, rebound.result);
       } catch { return failure('BROWSER_EXECUTION_FAILED', 'PAGE_CLOSED'); }
     }
@@ -189,7 +252,7 @@ async function executeStep(page: Page, step: ExecutionStep, profile: EffectivePr
   }
 }
 
-function resultRecord(source: TestSpec, resolved: ResolvedTestSpec, runId: string, startedAt: string, step: ExecutionStep | undefined, outcome: Outcome): ResultRecord {
+function resultRecord(source: RunnerSource, resolved: RunnableSpec, runId: string, startedAt: string, step: RunStep | undefined, outcome: Outcome): ResultRecord {
   return parseResultRecord({
     phase: 'execution', ...outcome,
     testSpecId: source.testSpecId,
@@ -207,9 +270,57 @@ function resultRecord(source: TestSpec, resolved: ResolvedTestSpec, runId: strin
 export async function executeResolvedTestSpec(factory: ProtectedContextFactory, sourceInput: unknown, resolvedInput: unknown, options: RunnerOptions = {}): Promise<ExecutionRun> {
   const source = parseTestSpec(sourceInput);
   const resolved = parseResolvedTestSpec(resolvedInput, source);
+  return runParsed(factory, source, resolved, options);
+}
+
+/** V6 requires its immutable source, attempt, trace and accepted compiler record. */
+export async function executeResolvedTestSpecV6(factory: ProtectedContextFactory,
+  sourceInput: unknown, resolvedInput: unknown,
+  provenance: { attempt: ExplorationAttemptV3;
+    trace: SuccessfulExplorationTraceV1 | SuccessfulExplorationTraceV2;
+    compiler: CompilerAttemptV1 }, options: RunnerOptions = {}): Promise<ExecutionRun> {
+  const source = parseTestSpec(sourceInput);
+  const resolved = parseResolvedTestSpecV6(resolvedInput, source,
+    provenance.attempt, provenance.trace, provenance.compiler);
+  // Resolve the immutable catalog before launching a browser. The form input
+  // and stored artifact cannot select a different profile under the same ref.
+  if (factory.catalog.resolve(resolved.executionProfileRef).fingerprint !== resolved.profileFingerprint)
+    throw new Error('Resolved v6 profile fingerprint differs from approved profile');
+  return runParsed(factory, source, resolved, options);
+}
+
+/** V7 requires the accepted compiler and runtime-owned v3 observation source. */
+export async function executeResolvedTestSpecV7(factory: ProtectedContextFactory,
+  sourceInput: unknown, resolvedInput: unknown,
+  provenance: { attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV3;
+    protectedSource: ProtectedTraceObservationSourceV3; compiler: CompilerAttemptV2 },
+  options: RunnerOptions = {}): Promise<ExecutionRun> {
+  const source = parseTestSpec(sourceInput);
+  const resolved = parseResolvedTestSpecV7(resolvedInput, source, provenance.attempt,
+    provenance.trace, provenance.protectedSource, provenance.compiler);
+  if (factory.catalog.resolve(resolved.executionProfileRef).fingerprint !== resolved.profileFingerprint)
+    throw new Error('Resolved v7 profile fingerprint differs from approved profile');
+  return runParsed(factory, source, resolved, options);
+}
+
+/** V8 accepts only a runtime-authenticated immutable store readback, not raw source prose. */
+export async function executeResolvedTestSpecV8(factory: ProtectedContextFactory,
+  acceptedInput: unknown, options: RunnerOptions = {}): Promise<ExecutionRun> {
+  if (!(acceptedInput instanceof AcceptedResolvedTestSpecV8))
+    throw new Error('V8 runner requires accepted immutable-store readback');
+  // Access to the private runtime field rejects a forged prototype as well.
+  const { resolved, ...source } = acceptedInput.replayInput();
+  if (factory.catalog.resolve(resolved.executionProfileRef).fingerprint !== resolved.profileFingerprint)
+    throw new Error('Resolved v8 profile fingerprint differs from approved profile');
+  return runParsed(factory, source, resolved, options);
+}
+
+async function runParsed(factory: ProtectedContextFactory, source: RunnerSource,
+  resolved: RunnableSpec, options: RunnerOptions): Promise<ExecutionRun> {
   const runId = options.executionRunId ?? `run-${randomUUID()}`;
   const session = await factory.open(resolved.executionProfileRef, options.expectedProfile,
-    options.observer?.videoDir ? { videoDir: options.observer.videoDir } : undefined);
+    { ...(options.observer?.videoDir ? { videoDir: options.observer.videoDir } : {}),
+      observationOwner: { kind: 'run', id: runId } });
   const outcomes: ResultRecord[] = [];
   try {
     const page = await session.context.newPage();
@@ -234,7 +345,10 @@ export async function executeResolvedTestSpec(factory: ProtectedContextFactory, 
     for (const step of resolved.executionSteps) {
       const started = new Date().toISOString();
       const outcome = blocked ? { status: 'NOT_RUN', reason: 'DEPENDENCY_FAILED', retryable: false } as const
-        : await executeStep(page, step, session.effectiveProfile, options.dataValues);
+        : step.type === 'verification_goal' ?
+          await executeVerificationAssertionV7(page, step.assertion) :
+          await executeStep(page, step, session.effectiveProfile, options.dataValues,
+            resolved.schemaVersion === '8');
       await record(resultRecord(source, resolved, runId, started, step, outcome));
       if (outcome.status !== 'OPERATION_SUCCEEDED' && outcome.status !== 'QA_ASSERTION_PASSED') blocked = true;
     }
@@ -246,6 +360,7 @@ export async function executeResolvedTestSpec(factory: ProtectedContextFactory, 
       const result = outcomes[target]!;
       outcomes[target] = parseResultRecord({ ...result, evidenceRefs: [...result.evidenceRefs, ...finalRefs] });
     }
+    await factory.pauseForObservation(session).catch(() => undefined);
     return { executionRunId: runId, effectiveProfile: session.effectiveProfile, versions: session.versions, outcomes };
   } finally {
     await session.close();

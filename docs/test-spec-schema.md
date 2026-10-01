@@ -1,6 +1,16 @@
 # TestSpec and resolved-test contracts
 
+The opt-in TestSpec v5 `ActionTargetIntentV1` interpretation contract is documented in [structured action identity WP1](structured-action-identity-wp1.md). Existing TestSpec v2/v3/v4 production routes remain unchanged.
+
+## Goal-directed verification WP1: TestSpec version 4
+
+Version 4 adds an ordered `verification_goal` authored step for the agentic workflow. It preserves a stable `id`, the exact authored verification clause in `sourceText`, an `instruction` that must preserve that clause, and optional semantic `subject`, coarse `intent`, and `dependsOnStepId` hints. A subject can name a reviewed role, accessible name, and ordered menu/dialog/region/row/frame scope. Intent hints are limited to presence, property state, cardinality, relationship, or temporal transition; they are not executable assertions. Hints are optional and must be supported by the clause. In particular, `does not exist` cannot become positive presence or visibility, and `disappears` cannot become a final-absence hint. An ambiguous or transformed goal fails interpretation rather than gaining guessed semantics.
+
+The agentic provider uses the separately named `qa_agentic_interpretation_v2` structured-output format. The legacy `qa_interpretation_v1` format and existing TestSpec versions 2/3 remain readable and unchanged. WP1 does not provide trusted goal observations, successful verification-strategy traces, compilation, or deterministic replay for version 4. Until those later packages are implemented, a version 4 goal cannot yield an accepted resolved artifact or authoritative QA verdict.
+
 These are conceptual, versioned JSON contracts. This draft supersedes the earlier conceptual version 1 before implementation; no runtime migration is implied. Implementation publishes machine schemas, rejects unknown operations, fields, and executable content, and requires explicit migration for any later breaking schema change. IDs are immutable within their artifact; a material change creates a new revision or attempt.
+
+Version 2 remains accepted for its original operation vocabulary. Version 3 adds only the reviewed public-web link collection assertion below. A version 2 artifact cannot contain the new operation. Resolved version 4 is a narrow exception for an authored exact-cell row scope projected after MCP emits an unsupported positional or incomplete row/link expression. It records `sourceSchemaVersion` (`2` or `3`); earlier resolved versions retain the source TestSpec version exactly.
 
 ## TestSpec: interpreted user intent
 
@@ -30,7 +40,22 @@ These are conceptual, versioned JSON contracts. This draft supersedes the earlie
 | `assert_text` | assertion | `target`, `expectedText`, `match` (`exact` or `contains`) |
 | `assert_value` | assertion | `target`, `expectedValue` |
 | `assert_url` | assertion | `expectedUrl`, `match` (`exact` or approved pattern) |
+| `assert_link_collection` (version 3) | assertion | `linkName`, `expectedCount: 2`, `expectedHref` |
 | `wait_for` | synchronization | `condition`, `timeoutPolicyRef` |
+
+### Version 3 link collection assertion
+
+`assert_link_collection` is a closed operation for the reviewed claim: exactly two distinct links in the main document have an accessible name exactly equal to `linkName`, and each link's browser-resolved `href` equals the normalized absolute HTTP(S) `expectedHref`. It does not follow the links. Only the literal `expectedCount: 2` is accepted. A canonical authored step is:
+
+```json
+{"id":"s2","type":"assert_link_collection","sourceText":"Confirm that two hyperlinks that say Frank da Cruz take you to https://www.columbia.edu/~fdc/","linkName":"Frank da Cruz","expectedCount":2,"expectedHref":"https://www.columbia.edu/~fdc/"}
+```
+
+The resolved authored step adds `locatorId`, `targetDescription`, and an accepted collection locator. For a nonempty collection, `origin: "mcp"` retains the exact MCP-generated exemplar expression as provenance. MCP may identify one duplicate with a positional suffix such as `.first()`. A closed projection parses only a generated role=`link`/matching-name expression, discards that suffix, and persists `{ "type": "role", "role": "link", "name": "Frank da Cruz", "exact": true }`. The projection is recorded as `quality.projection: "exact-role-name-collection"`; it cannot introduce an arbitrary selector or make the positional suffix part of replay identity. Live quality validation verifies that the MCP-selected ref belongs to the resulting main-document collection and has the exact link role/name. Collection cardinality is an assertion result, so collection quality does not require one unique match. Other operations retain their unique-match gate.
+
+When MCP reports `TARGET_NOT_FOUND` and the exact main-document role/name collection has zero matches, there is no exemplar from which MCP can generate a locator. Only this closed assertion may persist `origin: "closedZeroMatch"` with the same exact role/name form, an observed count of zero, and `quality.projection: "closed-assertion-zero-match"`. It carries no `mcpGeneratedExpression` and is never presented as MCP output. A later fresh replay evaluates the zero count as a QA assertion failure. Other unresolved reasons and all other operations retain their existing resolution behavior.
+
+Replay evaluates the collection in one fresh protected context per run, checks the count and each anchor element's browser-resolved `href`, and records expected and actual count/URL values. Count zero, one, or three yields `QA_ASSERTION_FAILED` with `LINK_COUNT_MISMATCH`; two links with a wrong destination yield `QA_ASSERTION_FAILED` with `LINK_DESTINATION_MISMATCH`. Malformed or unevaluable persisted locator data remains `LOCATOR_BINDING_FAILED`. A version 3 ResolvedTestSpec cannot be paired with a version 2 source. No selected MCP ref is persisted.
 
 The schema uses a closed variant for each type: a `click` cannot carry assertion fields; a `navigate` cannot carry a locator; an assertion cannot carry a fill value. `fill`/`select_option` values are literals or approved data references, never expressions. `wait_for` is an explicit bounded state condition, not an arbitrary sleep. Its required `timeoutPolicyRef` names a bounded policy in the execution profile. A timeout-policy reference may appear only where allowed. URL and pattern forms have restricted validation.
 
@@ -63,6 +88,8 @@ Targets preserve user wording and ordered semantic scopes (`menu`, `dialog`, `re
 `executionProfileRef` identifies an immutable versioned profile shared by exploration, locator validation, and replay. The persisted profile metadata contains browser engine, viewport, locale, applicable timezone/color scheme/device emulation, relevant feature flags, timeout policy, network-policy reference, and a versioned auth/storage-state **reference**. Credentials and storage-state contents are held separately. A profile mismatch blocks a run; material changes require a new profile version and renewed validation.
 
 ## ResolvedTestSpec: accepted executable sequence
+
+The separate [agentic exploration domain contracts](agentic-exploration-contracts.md) define the private version 6 trace/compiler linkage. This section describes the legacy production versions 2–5. The explicitly selected agentic-v2 workflow uses the verified v6 artifact and separate v6 runner; its production cutover and two fresh authoritative replays have completed the release gate recorded in [agentic-v2-release-gate.md](agentic-v2-release-gate.md). The legacy runner continues to reject v6.
 
 ```json
 {
@@ -115,6 +142,10 @@ Every targeted operation, including a prerequisite, passes the same locator-gene
 | Frame-scoped | `type: frame`, `frame` (reviewed stable frame identity), `target` (ordinary or scoped form) | Resolve inside a specific iframe. |
 
 The frame identity grammar is narrow enough to represent the spike's `iframe[title="payment frame"]` followed by `contentFrame()`. It accepts a reviewed stable frame title or equivalent semantic/application identity and rejects incidental positional CSS/XPath. Frame-scoped and nested forms preserve ordering. The exact MCP expression is retained for provenance only; a strict parser creates the form and never executes the expression as JavaScript. Coordinates, arbitrary CSS/XPath, `nth`, transient IDs, and unsupported methods cannot enter the runner. The quality gate may reject a syntactically valid form, as it did for glyph text in Scenario 8.
+
+Resolved version 4 permits one additional closed scope node, `{ "type": "rowWithCell", "cellName": "Iuvaret1" }`, only inside an accepted `semanticRowScope` locator for an authored `click`. M6 derives `cellName` only when exactly one exact cell label from the current accessibility snapshot appears as a whole token in the authored single-row scope description. Its target is an exact role=`link` and accessible name from the selected MCP snapshot; the authored target description must equal that name or that name followed by ` link` (case insensitive). M6 may create the locator only when the snapshot contains exactly one row with that cell and exactly one matching link with the selected MCP ref. The same protected page/profile must then prove one row, one scoped link, and identity equality with that ref. Missing or ambiguous scope remains a typed resolution or quality failure. The unsupported MCP expression is retained verbatim as `mcpGeneratedExpression` and in derivation evidence with its rejection; the runner receives only the verified declarative form. This exception does not make `.nth(...)` valid in the generated-expression parser or general locator-quality gate. Version 4 preserves source version linkage via `sourceSchemaVersion` and requires at least one such locator; versions 2 and 3 reject it.
+
+Resolved version 5 permits `origin: "verifiedRoleNameProjection"` for an exact ordinary `{ "type": "role", "role": "link", "name": "200", "exact": true }` form when the generated MCP expression has only a `WEAK_IDENTITY` rejection. The raw expression remains `mcpGeneratedExpression`; `rawRejection` records that reason, one raw match, and equality with the selected MCP ref. The accepted locator records the exact derived form, observed role/name, one derived match, selected-ref equality, and `quality.identityBasis: "role-and-accessible-name"`. M6 derives this form only for unscoped authored target prose that unambiguously names the role and accessible name and agrees with the selected snapshot node. It independently checks one exact match and equality with the selected ref in the same protected page before acceptance. Authored scope cannot be discarded to use this form. Version 5 requires `sourceSchemaVersion` and at least one verified role/name projection; it can also contain the existing version 4 semantic row locator. Versions 2 through 4 remain readable under their existing rules.
 
 ## Outcomes and evidence correlation
 

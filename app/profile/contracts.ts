@@ -6,7 +6,7 @@ import { ExecutionProfileRefSchema } from '../domain/schema.js';
 const ref = ExecutionProfileRefSchema;
 const milliseconds = z.number().int().positive().max(120_000);
 
-export const ExecutionProfileSchema = z.strictObject({
+const executionProfileFields = {
   id: ref.shape.id,
   version: ref.shape.version,
   browser: z.literal('chromium'),
@@ -26,7 +26,39 @@ export const ExecutionProfileSchema = z.strictObject({
   }),
   networkPolicyRef: ref,
   authStateRef: ref.optional(),
+};
+
+/** Legacy profiles are headless at every existing ID/version and retain their serialized shape. */
+export const LegacyExecutionProfileSchema = z.strictObject(executionProfileFields);
+
+export const ExecutionProfileV2Schema = z.strictObject({
+  ...executionProfileFields,
+  profileSchemaVersion: z.literal('2'),
+  presentationMode: z.enum(['headless', 'headed']),
 });
+
+/** Public browser isolation is a new profile identity; existing fingerprints stay intact. */
+export const IsolatedExecutionProfileSchema = z.strictObject({
+  ...executionProfileFields,
+  profileSchemaVersion: z.literal('3'),
+  presentationMode: z.literal('headless'),
+  browserIsolation: z.literal('docker'),
+});
+
+/** A distinct approved identity for the disposable headed browser image. */
+export const IsolatedHeadedExecutionProfileSchema = z.strictObject({
+  ...executionProfileFields,
+  profileSchemaVersion: z.literal('4'),
+  presentationMode: z.literal('headed'),
+  browserIsolation: z.literal('docker'),
+});
+
+export const ExecutionProfileSchema = z.union([
+  IsolatedHeadedExecutionProfileSchema,
+  IsolatedExecutionProfileSchema,
+  ExecutionProfileV2Schema,
+  LegacyExecutionProfileSchema,
+]);
 
 const address = z.string().refine((value) => isIP(value) !== 0, 'Expected an IP literal');
 const host = z.string().min(1).refine((value) => {
@@ -57,6 +89,11 @@ export const NetworkPolicySchema = z.strictObject({
 });
 
 export type ExecutionProfile = z.infer<typeof ExecutionProfileSchema>;
+export type PresentationMode = z.infer<typeof ExecutionProfileV2Schema>['presentationMode'];
+
+export function profilePresentationMode(profile: ExecutionProfile): PresentationMode {
+  return 'profileSchemaVersion' in profile ? profile.presentationMode : 'headless';
+}
 export type NetworkPolicy = z.infer<typeof NetworkPolicySchema>;
 export type ProfileRef = z.infer<typeof ExecutionProfileRefSchema>;
 export type EffectiveProfile = Readonly<{ profile: ExecutionProfile; policy: NetworkPolicy; fingerprint: string }>;

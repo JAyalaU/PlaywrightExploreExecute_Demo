@@ -83,7 +83,7 @@ test('wait variants reject cross-variant fields, missing fields, and extra timeo
 
 test('versions, URLs, patterns, IDs, and references are checked', () => {
   const spec = makeTestSpec();
-  expect(() => parseTestSpec({ ...spec, schemaVersion: '3' })).toThrow();
+  expect(() => parseTestSpec({ ...spec, schemaVersion: '4' })).toThrow();
   expect(() => parseTestSpec({ ...spec, steps: [spec.steps[0], spec.steps[0]] })).toThrow('Duplicate authored step ID');
   expect(() => parseTestSpec({ ...spec, steps: [{ id: 's1', type: 'navigate', sourceText: 'Go', url: 'javascript:alert(1)' }] })).toThrow();
   expect(() => parseTestSpec({ ...spec, steps: [{ id: 's1', type: 'assert_url', sourceText: 'Check URL', expectedUrl: 'https://example.com/*/x', match: 'pattern' }] })).toThrow();
@@ -156,6 +156,65 @@ test('accepted resolved locators require one observed match and accepted quality
   expect(() => parseResolvedTestSpec(resolved, spec)).toThrow();
   Object.assign(click, { locator: { ...locator, quality: { status: 'rejected', identityBasis: 'glyph text' } } });
   expect(() => parseResolvedTestSpec(resolved, spec)).toThrow();
+});
+
+test('resolved version 4 binds semantic row scope to the authored click and source version', () => {
+  const source = parseTestSpec({ schemaVersion: '2', testSpecId: 'test-row',
+    sourceInstruction: 'Select edit in the row containing Iuvaret1',
+    executionProfileRef: { id: 'desktop', version: '1' }, startState: { url: 'about:blank' },
+    steps: [{ id: 's1', type: 'click', sourceText: 'Select edit in the row containing Iuvaret1',
+      target: { description: 'edit', scope: [{ kind: 'row', description: 'Iuvaret1' }] } }] });
+  const locator = { origin: 'semanticRowScope', mcpGeneratedExpression: "getByRole('link', { name: 'edit' }).nth(1)",
+    validatedForm: { type: 'within', scope: { type: 'rowWithCell', cellName: 'Iuvaret1' },
+      target: { type: 'role', role: 'link', name: 'edit', exact: true } },
+    observed: { role: 'link', accessibleName: 'edit', matchCount: 1 },
+    quality: { status: 'accepted', identityBasis: 'scoped-role-and-accessible-name' } };
+  const resolved = { schemaVersion: '4', sourceSchemaVersion: '2', resolvedSpecId: 'resolved-row',
+    testSpecId: source.testSpecId, explorationAttemptId: 'explore-row', executionProfileRef: source.executionProfileRef,
+    runtimeVersions: { playwright: '1.63.0', mcp: 'pinned', runner: '1' },
+    executionSteps: [{ id: 'x1', originStepId: 's1', source: 'authored', type: 'click',
+      derivationEvidenceRef: 'evidence/explore-row/x1.json', locatorId: 'loc-row', targetDescription: 'edit', locator }] };
+  expect(parseResolvedTestSpec(resolved, source).schemaVersion).toBe('4');
+  expect(() => parseResolvedTestSpec({ ...resolved, schemaVersion: '2', sourceSchemaVersion: undefined }, source)).toThrow();
+  expect(() => parseResolvedTestSpec({ ...resolved, sourceSchemaVersion: '3' }, source)).toThrow();
+  expect(() => parseResolvedTestSpec({ ...resolved, executionSteps: [{ ...resolved.executionSteps[0],
+    locator: { ...locator, validatedForm: { ...locator.validatedForm,
+      scope: { type: 'rowWithCell', cellName: 'Iuvaret2' } } } }] }, source)).toThrow();
+});
+
+test('resolved version 5 records verified exact role/name provenance and preserves older versions', () => {
+  const source = parseTestSpec({ schemaVersion: '2', testSpecId: 'test-role-name',
+    sourceInstruction: 'Click the link named 200',
+    executionProfileRef: { id: 'desktop', version: '1' }, startState: { url: 'about:blank' },
+    steps: [{ id: 's1', type: 'click', sourceText: 'Click the link named 200',
+      target: { description: 'link named "200"' } }] });
+  const locator = { origin: 'verifiedRoleNameProjection', mcpGeneratedExpression: "getByText('200')",
+    rawRejection: { reasons: ['WEAK_IDENTITY'], matchCount: 1, observedTargetMatches: true },
+    validatedForm: { type: 'role', role: 'link', name: '200', exact: true },
+    observed: { role: 'link', accessibleName: '200', matchCount: 1, observedTargetMatches: true },
+    quality: { status: 'accepted', identityBasis: 'role-and-accessible-name' } };
+  const resolved = { schemaVersion: '5', sourceSchemaVersion: '2', resolvedSpecId: 'resolved-role-name',
+    testSpecId: source.testSpecId, explorationAttemptId: 'explore-role-name',
+    executionProfileRef: source.executionProfileRef,
+    runtimeVersions: { playwright: '1.63.0', mcp: 'pinned', runner: '1' },
+    executionSteps: [{ id: 'x1', originStepId: 's1', source: 'authored', type: 'click',
+      derivationEvidenceRef: 'evidence/explore-role-name/x1.json', locatorId: 'loc-role-name',
+      targetDescription: 'link named "200"', locator }] };
+  expect(parseResolvedTestSpec(resolved, source).schemaVersion).toBe('5');
+  expect(() => parseResolvedTestSpec({ ...resolved, schemaVersion: '4' }, source)).toThrow();
+  expect(() => parseResolvedTestSpec({ ...resolved, sourceSchemaVersion: '3' }, source)).toThrow();
+  expect(() => parseResolvedTestSpec({ ...resolved, executionSteps: [{ ...resolved.executionSteps[0],
+    locator: { ...locator, observed: { ...locator.observed, observedTargetMatches: false } } }] }, source)).toThrow();
+  expect(() => parseResolvedTestSpec({ ...resolved, executionSteps: [{ ...resolved.executionSteps[0],
+    locator: { ...locator, validatedForm: { ...locator.validatedForm, name: '301' } } }] }, source)).toThrow();
+  expect(() => parseResolvedTestSpec({ ...resolved, executionSteps: [{ ...resolved.executionSteps[0],
+    locator: { ...locator, rawRejection: { ...locator.rawRejection, reasons: ['NON_UNIQUE_MATCH'] } } }] }, source)).toThrow();
+  const ambiguousSource = { ...source, steps: [{ ...source.steps[0],
+    target: { description: 'link named "200" or "301"' } }] };
+  expect(() => parseResolvedTestSpec(resolved, ambiguousSource)).toThrow();
+  const scopedSource = { ...source, steps: [{ ...source.steps[0],
+    target: { description: 'link named "200"', scope: [{ kind: 'row', description: 'Status Codes' }] } }] };
+  expect(() => parseResolvedTestSpec(resolved, scopedSource)).toThrow();
 });
 
 test('typed result records require immutable run or attempt correlation and JSON values', () => {

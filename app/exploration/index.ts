@@ -1,2 +1,12 @@
 export * from './mcp.js';
 export * from './resolve.js';
+export * from './current-state.js';
+export * from './trusted-observation.js';
+export * from './trace-assembly.js';
+export * from './trace-assembly-v3.js';
+export * from './trace-assembly-v4.js';
+export * from './trace-compiler.js';
+export * from './trace-compiler-v3.js';
+export { compileSuccessfulTraceV4, GoalDirectedCompilationEnvironmentError } from './trace-compiler-v4.js';
+export * from './action-candidate-grounding.js';
+export * from './trace-assembly-v5.js';

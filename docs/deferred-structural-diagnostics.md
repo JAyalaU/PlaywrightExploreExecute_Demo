@@ -1,0 +1,11 @@
+# Deferred interpretation structural diagnostics
+
+The `deferred-action-v1` interpretation path now records one closed, payload-free `interpretationStructural` diagnostic when primary extraction, independent extraction, or semantic-admission structural validation rejects. This is an optional field in authenticated `DeferredWorkflowPrivateAccountingV1`; older records remain readable. It is not copied to `ResultRecordV2`, Python, UI, or the stakeholder projection.
+
+The record identifies the phase, component, stable issue category, optional exact allowlisted validator rule code, and a bounded structural path (step index/type, field, and item index when available). Wire failures are captured at the adapter normalization boundary. TestSpec/source/accounting failures are captured at the existing validator boundary. The independent call still receives only original source; no extraction, admission, timeout, or routing policy changed. The existing timing record remains separate and can coexist with the structural diagnostic.
+
+The diagnostic never stores Zod messages, exception text, model response fragments, source text, URLs, literals, target names, DOM values, browser facts, credentials, or private reasoning. Unknown rules fall back to `OTHER_STRUCTURAL`; unknown wire fields are reported as `UNKNOWN_FIELD` without their names. Some structural checks only identify a field or step rather than an individual obligation, because the validator throws a reason code without an item index. This conservative attribution cannot grant semantic admission or browser authority.
+
+This instrumentation is prospective. The earlier live `INVALID_SOURCE_REPRESENTATION` record has no structural diagnostic and cannot be retroactively resolved from its timing-only accounting. A future similar stop can be inspected through authenticated private accounting without opening provider payloads.
+
+Validation on the implementation tree: 77 focused interpretation, native-source, deadline, diagnostic, and WP5A production compatibility tests passed, including authenticated private-accounting tamper detection and blocked-import projection restart. Typecheck and build passed. No credentialed provider workflow was run.

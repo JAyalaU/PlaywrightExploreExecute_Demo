@@ -25,3 +25,20 @@ jobs/
 .env
 .env.*
 !.env.example
+
+.uv-cache-p3e/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Test/runtime artifacts
+test-results*/
+debug.log
+jobs/
+artifacts/
+
+# Python
+__pycache__/
+*.pyc

@@ -4,8 +4,10 @@ import { once } from 'node:events';
 import { isIP } from 'node:net';
 import { chromium, type Browser, type BrowserContext } from '@playwright/test';
 import type { EffectiveProfile, ProfileRef } from './contracts.js';
-import { ProfileCatalog, assertEquivalentEffectiveProfile } from './contracts.js';
+import { ProfileCatalog, assertEquivalentEffectiveProfile, profilePresentationMode } from './contracts.js';
 import { ProtectedProxy } from './network.js';
+import { restrictedBrowserEnvironment } from './browser-environment.js';
+import { IsolatedBrowser } from './isolated-browser.js';
 
 type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
 
@@ -19,7 +21,7 @@ export interface ExternalTargetGate {
   authorize(effective: EffectiveProfile): Promise<void>;
 }
 
-function requiresExternalReview(effective: EffectiveProfile): boolean {
+export function requiresExternalReview(effective: EffectiveProfile): boolean {
   return effective.policy.destinations.some((destination) => destination.addresses.some((address) => {
     if (isIP(address) === 4) return !address.startsWith('127.');
     if (isIP(address) === 6) return address !== '::1';
@@ -31,6 +33,17 @@ export interface BrowserVersions {
   node: string;
   playwright: string;
   browser: string;
+}
+
+/** Correlation metadata only; it cannot change browser launch or policy. */
+export interface ProtectedSessionOptions {
+  videoDir?: string;
+  observationOwner?: { kind: 'attempt' | 'run'; id: string };
+}
+
+/** Cleanup completed, but the trusted final read before teardown failed. */
+export class ProtectedFinalCheckError extends Error {
+  constructor(readonly checkError: unknown) { super('Protected final read failed'); }
 }
 
 const require = createRequire(import.meta.url);
@@ -72,24 +85,66 @@ export class ProtectedBrowserSession {
   readonly versions: BrowserVersions;
   readonly #browser: Browser;
   readonly #proxy: ProtectedProxy;
-  #closed = false;
+  readonly #isolated: IsolatedBrowser | undefined;
+  readonly #closingObservers = new Set<() => void>();
+  #closePromise: Promise<void> | undefined;
 
-  constructor(browser: Browser, context: BrowserContext, proxy: ProtectedProxy, effectiveProfile: EffectiveProfile) {
+  constructor(browser: Browser, context: BrowserContext, proxy: ProtectedProxy, effectiveProfile: EffectiveProfile,
+    isolated?: IsolatedBrowser) {
     this.#browser = browser;
     this.context = context;
     this.#proxy = proxy;
+    this.#isolated = isolated;
     this.effectiveProfile = effectiveProfile;
     this.versions = { node: process.version, playwright: playwrightVersion, browser: browser.version() };
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
+  /** Used only by restricted runtime proofs; never part of persisted TestSpec data. */
+  get isolationContainerId(): string | undefined { return this.#isolated?.containerId; }
+  /** Private viewer bridge requires a separately approved headed session. */
+  openRfbBridge(): ReturnType<IsolatedBrowser['openRfbBridge']> {
+    if (this.isClosed || profilePresentationMode(this.effectiveProfile.profile) !== 'headed' || !this.#isolated) {
+      throw new Error('Headed RFB session unavailable');
+    }
+    return this.#isolated.openRfbBridge();
+  }
+  get isClosed(): boolean { return this.#closePromise !== undefined; }
+
+  /** Observation-only lifecycle hook; callbacks cannot alter protected cleanup. */
+  onClosing(observer: () => void): () => void {
+    if (this.#closePromise) { observer(); return () => undefined; }
+    this.#closingObservers.add(observer);
+    return () => this.#closingObservers.delete(observer);
+  }
+
+  close(): Promise<void> {
+    // Publish the in-flight promise before invoking closing observers. A
+    // concurrent cancellation or reentrant close must await the same cleanup.
+    return this.#closePromise ??= Promise.resolve().then(() => this.#close());
+  }
+
+  /** Read-only final proof after closing observers; teardown always runs. No new actions. */
+  closeWithFinalCheck(check: () => Promise<void>): Promise<void> {
+    if (this.#closePromise) return this.#closePromise.then(() => { throw new ProtectedFinalCheckError(new Error('Final check missed closing boundary')); });
+    return this.#closePromise = Promise.resolve().then(() => this.#close(check));
+  }
+
+  async #close(finalCheck?: () => Promise<void>): Promise<void> {
+    for (const observer of this.#closingObservers) {
+      try { observer(); } catch { /* Observation cannot change browser cleanup. */ }
+    }
+    this.#closingObservers.clear();
+    let checkFailed = false, checkError: unknown;
+    if (finalCheck) try { await finalCheck(); } catch (error) { checkFailed = true; checkError = error; }
     const errors: unknown[] = [];
     try { await this.context.close(); } catch (error) { errors.push(error); }
-    try { await this.#browser.close(); } catch (error) { errors.push(error); }
+    try {
+      if (this.#isolated) await this.#isolated.close();
+      else await this.#browser.close();
+    } catch (error) { errors.push(error); }
     try { await this.#proxy.close(); } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, 'Protected browser session cleanup failed');
+    if (checkFailed) throw new ProtectedFinalCheckError(checkError);
   }
 }
 
@@ -97,8 +152,11 @@ export class ProtectedContextFactory {
   constructor(readonly catalog: ProfileCatalog, readonly authProvider?: AuthStateProvider,
     readonly externalTargetGate?: ExternalTargetGate) {}
 
+  /** Optional bounded presentation pause; ordinary and headless factories do nothing. */
+  async pauseForObservation(_session: ProtectedBrowserSession): Promise<void> {}
+
   /** The caller must close the returned session, including after test failure. */
-  async open(reference: ProfileRef, expected?: EffectiveProfile, recording?: { videoDir: string }): Promise<ProtectedBrowserSession> {
+  async open(reference: ProfileRef, expected?: EffectiveProfile, options?: ProtectedSessionOptions): Promise<ProtectedBrowserSession> {
     const effective = this.catalog.resolve(reference);
     if (expected) assertEquivalentEffectiveProfile(expected, effective);
     if (requiresExternalReview(effective)) {
@@ -109,9 +167,18 @@ export class ProtectedContextFactory {
 
     const proxy = await ProtectedProxy.start(effective.policy);
     let browser: Browser | undefined;
+    let isolated: IsolatedBrowser | undefined;
     try {
-      browser = await chromium.launch({
-        headless: true,
+      const external = requiresExternalReview(effective);
+      if (external && !('browserIsolation' in effective.profile && effective.profile.browserIsolation === 'docker')) {
+        throw new Error('External target requires an isolated public browser profile');
+      }
+      if ('browserIsolation' in effective.profile && effective.profile.browserIsolation === 'docker') {
+        isolated = await IsolatedBrowser.open(proxy, profilePresentationMode(effective.profile));
+        browser = isolated.browser;
+      } else browser = await chromium.launch({
+        headless: profilePresentationMode(effective.profile) === 'headless',
+        ...(requiresExternalReview(effective) ? { env: restrictedBrowserEnvironment(process.env) } : {}),
         proxy: { server: proxy.url, bypass: '<-loopback>' },
         args: [
           '--proxy-bypass-list=<-loopback>',
@@ -142,13 +209,16 @@ export class ProtectedContextFactory {
         serviceWorkers: 'block',
         acceptDownloads: false,
         permissions: [],
-        ...(recording ? { recordVideo: { dir: recording.videoDir } } : {}),
+        ...(options?.videoDir ? { recordVideo: { dir: options.videoDir } } : {}),
       });
       context.setDefaultTimeout(profile.timeoutPolicy.actionMs);
       context.setDefaultNavigationTimeout(profile.timeoutPolicy.navigationMs);
-      return new ProtectedBrowserSession(browser, context, proxy, effective);
+      return new ProtectedBrowserSession(browser, context, proxy, effective, isolated);
     } catch (error) {
-      try { await browser?.close(); } finally { await proxy.close(); }
+      try {
+        if (isolated) await isolated.close();
+        else await browser?.close();
+      } finally { await proxy.close(); }
       throw error;
     }
   }

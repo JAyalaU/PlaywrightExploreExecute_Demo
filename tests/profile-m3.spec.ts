@@ -139,6 +139,24 @@ test('M3-B CONNECT tunnels require an approved address and port', async () => {
   } finally { await proxy.close(); await allowed.close(); }
 });
 
+test('M3-B accepts an explicit default HTTPS CONNECT port without widening authority', async () => {
+  const proxy = await ProtectedProxy.start(NetworkPolicySchema.parse(policy(443)));
+  try {
+    const connect = (authority: string) => new Promise<number>((resolve, reject) => {
+      const request = http.request({ host: '127.0.0.1', port: Number(new URL(proxy.url).port),
+        method: 'CONNECT', path: authority });
+      request.on('connect', (response, socket) => { socket.destroy(); resolve(response.statusCode ?? 0); });
+      request.on('error', reject);
+      request.end();
+    });
+    // A local listener on 443 yields 200; otherwise the authorized socket
+    // attempt yields 502. Neither is an authority/policy rejection.
+    expect([200, 502]).toContain(await connect('127.0.0.1:443'));
+    expect(await connect('127.0.0.1:0443')).toBe(403);
+    expect(await connect('127.0.0.1:444')).toBe(403);
+  } finally { await proxy.close(); }
+});
+
 test('M3-C creates isolated disposable contexts and keeps auth contents external', async () => {
   const server = await fixtureServer((req, res) => { res.setHeader('content-type', 'text/html'); res.end(`<body>${req.headers.cookie ?? ''}</body>`); });
   const definition = profile(server.port, { authStateRef: { id: 'fixture-user', version: '1' } });

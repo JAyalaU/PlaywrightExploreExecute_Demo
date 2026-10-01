@@ -40,7 +40,9 @@ export async function resolveApprovedAddress(
   if (!resolved.length || resolved.some((address) => !allowed.has(normalizeAddress(address)))) {
     throw new NetworkPolicyError(`Destination address denied: ${host}:${port}`);
   }
-  return normalizeAddress(resolved[0]!);
+  // Keep checking every DNS answer, but prefer an approved IPv4 route when a
+  // dual-stack host resolves AAAA first and the trusted host has no IPv6 route.
+  return normalizeAddress(resolved.find((address) => net.isIP(address) === 4) ?? resolved[0]!);
 }
 
 function errorStatus(error: unknown): number { return error instanceof NetworkPolicyError ? 403 : 502; }
@@ -64,8 +66,18 @@ function absoluteUrl(request: IncomingMessage): URL {
 
 function tunnelUrl(authority: string | undefined): URL {
   if (!authority || /[/@?#]/.test(authority)) throw new NetworkPolicyError('Invalid CONNECT authority');
+  const separator = authority.lastIndexOf(':');
+  const host = authority.slice(0, separator);
+  const declaredPort = authority.slice(separator + 1);
+  if (!host || !/^[1-9]\d{0,4}$/.test(declaredPort) || Number(declaredPort) > 65535) {
+    throw new NetworkPolicyError('Invalid CONNECT authority');
+  }
   const url = new URL(`https://${authority}/`);
-  if (!url.port || authority.toLowerCase() !== url.host.toLowerCase()) throw new NetworkPolicyError('Invalid CONNECT authority');
+  // URL normalizes an explicit default HTTPS :443 to an empty .port.
+  if (host.toLowerCase() !== url.hostname.toLowerCase() ||
+      Number(url.port || 443) !== Number(declaredPort)) {
+    throw new NetworkPolicyError('Invalid CONNECT authority');
+  }
   return url;
 }
 
@@ -100,6 +112,9 @@ export class ProtectedProxy {
   #track(socket: Duplex): void {
     this.#sockets.add(socket);
     socket.once('close', () => this.#sockets.delete(socket));
+    // A remote browser compartment can reset a proxy connection during
+    // startup or disposal. Treat that as connection-local failure.
+    socket.on('error', () => socket.destroy());
   }
 
   async #forward(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -127,7 +142,7 @@ export class ProtectedProxy {
     try {
       const url = tunnelUrl(request.url);
       const address = await resolveApprovedAddress(url, this.#policy);
-      const upstream = net.connect({ host: address, port: Number(url.port) });
+      const upstream = net.connect({ host: address, port: Number(url.port || 443) });
       this.#track(upstream);
       upstream.setTimeout(UPSTREAM_TIMEOUT_MS, () => upstream.destroy(new Error('Tunnel timed out')));
       let connected = false;

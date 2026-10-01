@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ const requiredTools = [
   'browser_click', 'browser_fill_form', 'browser_select_option', 'browser_wait_for',
 ] as const;
 type ToolName = typeof requiredTools[number];
+export type McpCallObserver = (event: { callId: string; tool: ToolName; state: 'started' | 'completed' | 'failed' }) => void;
 type McpBrowserContext = Awaited<ReturnType<NonNullable<Parameters<typeof createConnection>[1]>>>;
 
 export interface McpCallRecord {
@@ -43,20 +45,35 @@ export class McpExplorationSession {
   readonly #outputDir: string;
   readonly toolInventory: readonly string[];
   readonly calls: McpCallRecord[] = [];
+  readonly #observeCall: McpCallObserver | undefined;
   #closed = false;
+  #groundingRevision = 0;
+  #activeCalls = 0;
+  #groundingLocked = false;
+
+  /** Additive private runtime coordination; old tool names and wire schemas are unchanged. */
+  get groundingRevision(): number { return this.#groundingRevision; }
+  async withExclusiveGrounding<T>(consume: () => Promise<T>): Promise<T> {
+    if (this.#closed || this.#activeCalls || this.#groundingLocked)
+      throw new McpToolError('grounding', 'SESSION_BUSY_OR_CLOSED');
+    this.#groundingLocked = true;
+    try { return await consume(); } finally { this.#groundingLocked = false; }
+  }
 
   private constructor(client: Client, server: Awaited<ReturnType<typeof createConnection>>,
-    browserSession: ProtectedBrowserSession, toolInventory: string[], outputDir: string) {
+    browserSession: ProtectedBrowserSession, toolInventory: string[], outputDir: string, observeCall?: McpCallObserver) {
     this.#client = client;
     this.#server = server;
     this.browserSession = browserSession;
     this.toolInventory = toolInventory;
     this.#outputDir = outputDir;
+    this.#observeCall = observeCall;
   }
 
   static async open(factory: ProtectedContextFactory, profileRef: { id: string; version: string },
-    expectedProfile: EffectiveProfile): Promise<McpExplorationSession> {
-    const browserSession = await factory.open(profileRef, expectedProfile);
+    expectedProfile: EffectiveProfile, attemptId?: string, observeCall?: McpCallObserver): Promise<McpExplorationSession> {
+    const browserSession = await factory.open(profileRef, expectedProfile,
+      attemptId ? { observationOwner: { kind: 'attempt', id: attemptId } } : undefined);
     let outputDir: string | undefined;
     let server: Awaited<ReturnType<typeof createConnection>> | undefined;
     let client: Client | undefined;
@@ -82,7 +99,7 @@ export class McpExplorationSession {
       await client.connect(clientTransport);
       const inventory = (await client.listTools()).tools.map((tool) => tool.name);
       assertMcpCapabilities(inventory);
-      return new McpExplorationSession(client, server, browserSession, inventory, outputDir);
+      return new McpExplorationSession(client, server, browserSession, inventory, outputDir, observeCall);
     } catch (error) {
       await client?.close().catch(() => {});
       await server?.close().catch(() => {});
@@ -94,7 +111,12 @@ export class McpExplorationSession {
 
   async #call(name: ToolName, args: Record<string, unknown>): Promise<string> {
     if (this.#closed) throw new McpToolError(name, 'Exploration session is closed');
+    if (this.#groundingLocked) throw new McpToolError(name, 'SESSION_GROUNDING_LOCKED');
     if (!this.toolInventory.includes(name)) throw new McpToolError(name, 'Capability unavailable');
+    this.#groundingRevision++;
+    this.#activeCalls++;
+    const callId = `mcp-${randomUUID()}`;
+    try { this.#observeCall?.({ callId, tool: name, state: 'started' }); } catch { /* Observation is non-authoritative. */ }
     const mainFrameDenials: Promise<boolean>[] = [];
     const onResponse = (response: import('@playwright/test').Response): void => {
       if (response.status() !== 403 || !response.request().isNavigationRequest()) return;
@@ -118,12 +140,16 @@ export class McpExplorationSession {
       this.calls.push({ name, arguments: args, response });
       if (result.isError) throw new McpToolError(name, response || 'Tool returned an error');
       if ((await Promise.all(mainFrameDenials)).some(Boolean)) throw new McpToolError(name, 'NETWORK_POLICY_DENIED');
+      try { this.#observeCall?.({ callId, tool: name, state: 'completed' }); } catch { /* Observation is non-authoritative. */ }
       return response;
     } catch (error) {
+      try { this.#observeCall?.({ callId, tool: name, state: 'failed' }); } catch { /* Observation is non-authoritative. */ }
       if (error instanceof McpToolError) throw error;
       throw new McpToolError(name, error instanceof Error ? error.message : String(error));
     } finally {
       this.browserSession.context.off('response', onResponse);
+      this.#activeCalls--;
+      this.#groundingRevision++;
     }
   }
 

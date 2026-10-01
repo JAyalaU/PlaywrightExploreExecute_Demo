@@ -7,10 +7,14 @@ authors = [
     { name = "Jorge Ayala", email = "jorgeayalaur@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pillow>=11,<13",
+    "streamlit>=1.48,<2",
+]
 
 [project.scripts]
 playwright-demo = "playwright_demo:main"
+playwright-demo-ui = "playwright_demo.ui_launcher:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]

@@ -2,11 +2,13 @@
 
 This runbook describes the implemented M1–M8-B system and the optional viewing
 boundary from M8-C. It is intended for developers integrating the library and
-operators running the browser workflow in a controlled environment.
+operators running the browser workflow in a controlled environment. Phase 3
+also provides a separate local Streamlit PoC; see the [Phase 3 operator guide](phase-3-operator-guide.md).
 
-The repository currently exposes a TypeScript library, not a command-line
-service or product UI. Callers provide a validated profile catalog, an artifact
-store, and the bounded interpretation/step models used by M7.
+The repository exposes a TypeScript library, a local developer command, and a
+loopback-only Streamlit UI. It does not expose a hosted service. Library callers
+provide a validated profile catalog, an artifact store, and the bounded
+interpretation/step models used by M7.
 
 ## 1. Prerequisites and setup
 
@@ -167,9 +169,11 @@ attempt keeps the previous artifacts available for comparison and audit.
 
 ## 6. Optional browser viewing
 
-The current implementation runs Chromium headlessly and has no built-in noVNC
-server or viewer endpoint. Headless execution is the supported path and is
-independent of any viewer.
+The current implementation supports profile-controlled Chromium execution in
+both headless and headed modes through the protected Playwright session. It has
+no built-in noVNC server or viewer endpoint. Headed execution is observational
+with unverified input provenance and is never autonomous-eligible; a separate
+fresh headless run is the authoritative autonomous path.
 
 If a deployment adds noVNC later, it must attach as an observation layer to the
 already isolated browser session created by `ProtectedContextFactory`. It must
@@ -232,6 +236,232 @@ must continue to pass before a release. The headless suite is also the viewer
 independence check: noVNC is absent from the runner, profile factory, resolver,
 and evidence contracts.
 
+### Phase 2 OpenAI provider release gate
+
+The ordinary test suite is credential-free. The P2-1 real-provider proof is a
+separate, opt-in local-fixture test. Set its credentials in the invoking shell,
+never in a TestSpec, artifact root, or checked-in file:
+
+```powershell
+$env:OPENAI_API_KEY = '<your API key>'
+$env:P2_1_OPENAI_LIVE = '1'
+npm run test:p2-1-live
+```
+
+The test uses the default `gpt-5.6-terra` model at `medium` reasoning effort,
+with the Responses API Structured Outputs path, `store: false`, and no model
+tools. It proves an end-to-end task against a private local fixture: model
+interpretation, bounded MCP resolution of a menu prerequisite, locator-quality
+acceptance, two fresh protected replays, and immutable evidence IDs. The test
+is skipped unless the explicit gate is set; a skipped run is **not** a verified
+provider release gate.
+
+Provider access, latency, rate limits, usage cost, and nondeterministic model
+behavior remain external dependencies. A successful local proof does not
+establish public-web support, headed observation, Python hosting, or Playwright
+source export; those are separate Phase 2 work.
+
+### Phase 2 local developer command
+
+Build the project, start a local site on port 4173, and create a trusted JSON
+configuration file outside the task input. For example, save this as
+`jobs/trusted-local.json` (the `jobs/` directory is ignored by Git):
+
+```json
+{
+  "profiles": [
+    {
+      "id": "desktop-headless", "version": "2", "profileSchemaVersion": "2",
+      "presentationMode": "headless", "browser": "chromium",
+      "viewport": { "width": 1280, "height": 800 }, "locale": "en-US",
+      "timeoutPolicy": { "actionMs": 5000, "navigationMs": 5000, "waits": { "default": 3000 } },
+      "networkPolicyRef": { "id": "local-site", "version": "1" }
+    },
+    {
+      "id": "desktop-headed", "version": "2", "profileSchemaVersion": "2",
+      "presentationMode": "headed", "browser": "chromium",
+      "viewport": { "width": 1280, "height": 800 }, "locale": "en-US",
+      "timeoutPolicy": { "actionMs": 5000, "navigationMs": 5000, "waits": { "default": 3000 } },
+      "networkPolicyRef": { "id": "local-site", "version": "1" }
+    }
+  ],
+  "networkPolicies": [{
+    "id": "local-site", "version": "1",
+    "destinations": [{ "host": "127.0.0.1", "ports": [4173], "addresses": ["127.0.0.1"] }]
+  }],
+  "evidencePolicy": {
+    "finalScreenshot": false, "failureScreenshot": false,
+    "failureTrace": false, "failureVideo": false,
+    "sensitiveBinaryApproved": false
+  },
+  "artifactRoot": "jobs/local-demo", "retentionDays": 7
+}
+```
+
+Run the same task with either explicitly versioned profile:
+
+```powershell
+npm run build
+$env:OPENAI_API_KEY = '<your API key>'
+npm run local -- --config jobs/trusted-local.json --profile desktop-headed@2 --mode headed --url http://127.0.0.1:4173/ --task 'Select Save.'
+npm run local -- --config jobs/trusted-local.json --profile desktop-headless@2 --mode headless --url http://127.0.0.1:4173/ --task 'Select Save.'
+```
+
+`--mode` checks the selected profile; it never changes browser launch mode.
+The URL must fit the trusted policy. The local command has no external-target
+approval provider, so non-loopback targets remain denied. It prints typed
+statuses, IDs, observational provenance, and the stored job directory without
+printing task text, page content, or evidence bytes. A headed run is always
+`autonomousEligible=false`; a separate fresh headless run supplies autonomous
+proof. Exit codes are 0 for successful replay, 1 for a QA assertion failure,
+2 for a typed automation/configuration stop, 64 for command misuse, and 130
+for cancellation. The command is human-facing; it is not the P2-3 subprocess
+protocol.
+
+### Phase 2 local release gate
+
+P2-2E covers credential-free regression tests and one opt-in credentialed
+headed proof. The ordinary checks remain:
+
+```powershell
+npm run typecheck
+npm test
+npm run build
+```
+
+The credentialed proof is run manually because it needs a display and a real
+OpenAI key held by the operator:
+
+```powershell
+$env:OPENAI_API_KEY = '<your API key>'
+$env:P2_2_HEADED_LIVE = '1'
+$env:P2_2_KEEP_ARTIFACTS = '1'  # optional; retain the temporary artifact root
+npm run test:p2-2-live
+```
+
+Do not put the key in a trusted JSON file, TestSpec, artifact directory, or
+source file. A skipped test is not a release result. The live proof must use
+the local command, show a protected headed workflow, report typed success,
+and retain observational provenance with `autonomousEligible=false`. Its
+stored report must contain the exploration attempt, resolved spec, and two
+fresh execution-run records with accepted locators and passing QA outcomes.
+
+The P2-2E manual run supplied for this repository passed all three scenarios
+in 25.2 seconds with a successful process exit. The result confirms the
+headed/headless semantics and the real OpenAI headed local-command proof;
+credentials and raw evidence are not recorded in this documentation. If
+artifacts are retained, use only the safe IDs and fingerprint from the test
+attachment when correlating a report. Do not paste snapshots, provider
+responses, screenshots, traces, videos, cookies, or keys into tickets or
+documentation.
+
+P2-2 does not establish public-web support, Python hosting, noVNC viewing, or
+`.spec.ts` export. Those remain deferred Phase 2 work.
+
+### Phase 2 Python host integration
+
+P2-3 provides a thin Python host API around the built Node subprocess entry. It
+does not add a service, HTTP endpoint, second runner, or Python implementation
+of TestSpec, Playwright, MCP, network policy, locator binding, or QA
+classification. Python owns process invocation, bounded supervision, and
+validation of the returned envelope. Node remains the owner of the workflow and
+Node-owned artifacts.
+
+Use Python 3.12 or newer (the repository declares `requires-python = ">=3.12"`)
+and build the Node entry:
+
+```powershell
+npm ci
+npm run build
+```
+
+The Python caller is imported from `src/playwright_demo`. It is an API for a
+host application; the scaffold's `playwright-demo` console entry is not the
+machine protocol. A minimal call is:
+
+```python
+from playwright_demo import call_node
+
+result = call_node(
+    {
+        "protocolVersion": "1",
+        "request": {
+            "taskText": "Select Save.",
+            "targetUrl": "http://127.0.0.1:4173/",
+            "executionProfileRef": {"id": "desktop-headless", "version": "2"},
+        },
+    },
+    node_entry="dist/subprocess/cli.js",
+    config_path="jobs/trusted-local.json",
+)
+```
+
+The executable, Node entry, trusted configuration path, environment, and host
+deadline are host-controlled inputs. The JSON request contains only task text,
+an absolute HTTP(S) target URL, and a profile reference. It cannot choose a
+model, credentials, browser mode, timeout, network policy, artifact root, or
+injected implementation. The target URL must already be allowed by the trusted
+profile's browser-wide network policy.
+
+The child accepts one UTF-8 JSON request on stdin and emits exactly one protocol
+v1 JSON response on stdout. Logs and prompts must not be written to stdout.
+Python drains stdout and stderr concurrently, bounds retained diagnostics, and
+validates both the response and its exit code. The versioned result is one of:
+
+- `success`: both deterministic replays completed without QA or automation failure.
+- `typed_stop` with `stopKind: qa_failure`: an assertion was evaluated and failed.
+- `typed_stop` with `stopKind: automation_stop`: interpretation, exploration,
+  locator, browser, or another typed automation stop occurred.
+- `bridge_error`: Node could not produce a trustworthy workflow result, such as
+  invalid configuration, denied destination, or cancellation.
+
+If no trustworthy Node response exists, Python returns `process_failure` for
+launch, malformed/missing/multiple response, output-limit, unexpected-exit,
+cancellation, or deadline failures. A forced termination always reports
+`cleanup: "unverified"`; a destination or configuration rejection before work
+starts reports `cleanup: "not_started"`. Python keeps only a bounded sanitized
+stderr summary and does not reinterpret it as a QA result.
+
+The response includes safe correlation data such as the TestSpec ID, profile
+reference and fingerprint, exploration/resolved/run IDs, and report
+availability. The report reference points to Node-owned protected artifacts; it
+does not grant Python access to screenshots, traces, videos, page text,
+storage state, provider responses, or evidence bytes. Credentials must remain in
+the child environment and outside requests, TestSpecs, reports, and ordinary
+evidence.
+
+Headed responses remain observational with unverified input provenance and
+`autonomousEligible: false`. A fresh headless run is the authoritative
+autonomous proof path. Detected input observations remain evidence and never
+become replay steps.
+
+### P2-3 cross-process release gate
+
+The credential-free gate uses a test-only child harness with the same protocol
+adapter and trusted model-injection seam. It does not add a production mock
+provider switch. The production proof uses the real Node entry and an
+operator-held `OPENAI_API_KEY`:
+
+```powershell
+$env:OPENAI_API_KEY = '<your API key>'
+$env:P2_3_LIVE = '1'
+npm run test:p2-3-live
+```
+
+The key is never placed in JSON, source, artifacts, or documentation. The final
+recorded P2-3D proof passed four Python-to-Node tests in 41.861 seconds with a
+successful process exit. It included safe TestSpec/profile/exploration/resolved
+spec/execution-run correlation data, an available report reference, and a
+report-reconstructed `hasDiscoveredPrerequisite: true` assertion for the
+Account-menu task. The credential-free matrix also passed, including typed QA
+and automation outcomes, headed provenance, cancellation, invalid requests,
+profile lookup, and destination denial with `cleanup: "not_started"`.
+
+P2-3 does not establish public-web acceptance, HTTP/service hosting, noVNC, or
+`.spec.ts` export. Those remain separate deferred work. The intermittent headed
+`ECONNRESET` from P2-2 remains a non-blocking stability follow-up unless it
+reproduces in this gate or corrupts protocol results/evidence.
+
 ## Source behavior
 
 This runbook is based on the implemented contracts and modules in:
@@ -250,3 +480,12 @@ This runbook is based on the implemented contracts and modules in:
 
 The documented noVNC boundary is architectural guidance; no viewer adapter is
 implemented in this repository.
+
+## Phase 3 local Streamlit PoC
+
+Phase 3 adds a guarded, loopback-only, single-operator UI over the existing
+Python-to-Node workflow. For setup, public URL approval, credential handling,
+typed results, projection limits, cleanup, and the recorded live proof, see the
+[Phase 3 operator guide](phase-3-operator-guide.md). The detailed guide is based
+on the implemented launcher and host wiring; it does not change the Phase 2
+execution or evidence contracts.

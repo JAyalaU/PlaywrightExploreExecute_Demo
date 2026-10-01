@@ -9,3 +9,11 @@ M8-B enforces expiry on reads and provides an explicit `pruneExpired()` sweep fo
 Text/JSON evidence is redacted for named secret literals, bearer values, sensitive keys, and common secret URL parameters. Executable TestSpec and ResolvedTestSpec contracts are rejected if they would require redaction, so their meaning never changes silently. Screenshots, traces, and videos cannot be reliably scrubbed as bytes. They require explicit `sensitiveBinaryApproved` capture policy, are marked `restricted`, and receive owner-only filesystem permissions where supported. Keep the artifact root outside public serving and protect it at the OS/deployment boundary. Traces and videos are retained only on failed runs when enabled; final screenshots are captured when enabled. The runner remains responsible for step semantics and the M3 factory remains responsible for browser policy and cleanup.
 
 `executeAndStoreRun` is the M5 adapter: it reads accepted artifacts, passes observation callbacks to the M4 runner, captures permitted evidence, and persists the typed outcome. It does not resolve targets, modify locators, or perform MCP exploration.
+
+M7 decision diagnostics are private developer artifacts under each job's
+`developer-diagnostics/<explorationAttemptId>/decision-<callOrdinal>.json`.
+`M7DecisionDiagnosticSchema` accepts only bounded IDs, the snapshot SHA-256,
+closed retry/rejection and decision/result codes, and a same/different/absent
+reference relation. The store validates this closed schema before writing.
+These records have no evidence descriptor or report reference and are never
+published through the P4 live event stream or normal stakeholder UI.

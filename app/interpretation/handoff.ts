@@ -5,6 +5,7 @@ import { ProtectedContextFactory } from '../profile/index.js';
 import type { ExecutionRun } from '../runner/index.js';
 import { interpretTask, type InterpretationModel, type InterpretationRequest } from './interpret.js';
 import { createStepDecision, type StepDecisionModel, type StepOrchestrationOptions } from './orchestrate.js';
+import type { LiveEventProducer } from '../observability/live-events.js';
 
 const metadataOnlyEvidence: EvidenceCapturePolicy = {
   finalScreenshot: false, failureScreenshot: false, failureTrace: false,
@@ -20,6 +21,7 @@ export interface HandoffOptions {
   interpretation?: { timeoutMs?: number; maxResponseChars?: number };
   steps?: StepOrchestrationOptions;
   evidencePolicy?: EvidenceCapturePolicy;
+  events?: LiveEventProducer;
 }
 
 /** Connect one validated interpretation to M6's accepted-spec and M4 replay path. */
@@ -28,7 +30,11 @@ export async function handoffTask(
   interpretationModel: InterpretationModel, stepModel: StepDecisionModel,
   options: HandoffOptions = {},
 ): Promise<HandoffOutcome> {
+  options.events?.emit('interpretation_started', {});
   const interpretation = await interpretTask(request, interpretationModel, options.interpretation);
+  options.events?.emit('interpretation_finished', {
+    outcome: interpretation.kind === 'accepted' ? 'accepted' : 'stopped',
+  });
   const recordBase = {
     schemaVersion: SCHEMA_VERSION, testSpecId: request.testSpecId,
     sourceInstruction: request.sourceInstruction,
@@ -58,6 +64,7 @@ export async function handoffTask(
   const resolved = await resolveAndReplay(
     factory, store, interpretation.testSpec, decide,
     options.evidencePolicy ?? metadataOnlyEvidence,
+    options.events,
   );
   if (resolved.status === 'unresolved') {
     const attempt = await store.readAttempt(request.testSpecId, resolved.attemptId);

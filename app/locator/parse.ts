@@ -1,4 +1,4 @@
-import { LocatorFormSchema, type LocatorForm, type OrdinaryLocator, type PageLocator } from '../domain/index.js';
+import { LocatorFormSchema, type LocatorForm, type OrdinaryLocator, type PageLocator } from '../domain/schema.js';
 
 /** The generated expression is untrusted text. This parser never evaluates it. */
 export class LocatorSyntaxError extends Error {

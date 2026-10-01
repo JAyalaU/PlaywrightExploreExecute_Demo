@@ -1,0 +1,48 @@
+{
+  "profiles": [
+    {
+      "id": "challenging-dom-public-headless",
+      "version": "1",
+      "profileSchemaVersion": "3",
+      "presentationMode": "headless",
+      "browserIsolation": "docker",
+      "browser": "chromium",
+      "viewport": { "width": 1280, "height": 800 },
+      "locale": "en-US",
+      "timeoutPolicy": {
+        "actionMs": 10000,
+        "navigationMs": 30000,
+        "waits": { "default": 10000 }
+      },
+      "networkPolicyRef": { "id": "challenging-dom-public-egress", "version": "1" }
+    }
+  ],
+  "networkPolicies": [
+    {
+      "id": "challenging-dom-public-egress",
+      "version": "1",
+      "destinations": [
+        {
+          "host": "the-internet.herokuapp.com",
+          "ports": [443],
+          "addresses": ["3.209.172.72", "23.22.130.173", "54.243.238.66", "107.22.57.98"]
+        }
+      ]
+    }
+  ],
+  "publicTargetApproval": {
+    "approvalVersion": "3",
+    "targetUrl": "https://the-internet.herokuapp.com/challenging_dom",
+    "executionProfileRef": { "id": "challenging-dom-public-headless", "version": "1" },
+    "profileFingerprint": "d3e82850b7aed8ad0825de676b52f983658edb7d0ec3b4bf4852812d1c5b3a42"
+  },
+  "evidencePolicy": {
+    "finalScreenshot": false,
+    "failureScreenshot": false,
+    "failureTrace": false,
+    "failureVideo": false,
+    "sensitiveBinaryApproved": false
+  },
+  "artifactRoot": "jobs/public-challenging-dom",
+  "retentionDays": 7
+}

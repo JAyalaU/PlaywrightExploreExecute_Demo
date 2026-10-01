@@ -4,8 +4,11 @@ import path from 'node:path';
 import type { Page } from '@playwright/test';
 import type { ResultRecord } from '../domain/index.js';
 import type { ProtectedBrowserSession, ProtectedContextFactory } from '../profile/index.js';
-import { executeResolvedTestSpec, type ExecutionRun, type RunObserver, type RunnerOptions } from '../runner/index.js';
+import { executeResolvedTestSpec, executeResolvedTestSpecV6, executeResolvedTestSpecV7,
+  executeResolvedTestSpecV8,
+  type ExecutionRun, type RunObserver, type RunnerOptions } from '../runner/index.js';
 import { LocalArtifactStore } from './store.js';
+import { AcceptedResolvedTestSpecV8 } from './accepted-v8.js';
 
 export interface EvidenceCapturePolicy {
   finalScreenshot: boolean;
@@ -111,6 +114,77 @@ export async function executeAndStoreRun(
       ...options, executionRunId: runId, observer,
     });
     await store.writeRun(testSpecId, resolvedSpecId, run);
+    return run;
+  } finally {
+    if (videoDir) await rm(videoDir, { recursive: true, force: true });
+  }
+}
+
+/** The v6 capture path requires the accepted compiler provenance and keeps the same evidence policy. */
+export async function executeAndStoreAgenticRunV6(
+  factory: ProtectedContextFactory, store: LocalArtifactStore, testSpecId: string,
+  attemptId: string, compilerId: string, runId: string, policy: EvidenceCapturePolicy,
+  options: Pick<RunnerOptions, 'dataValues' | 'expectedProfile'> = {},
+): Promise<ExecutionRun> {
+  const { source } = await store.readJob(testSpecId);
+  const { attempt, trace } = await store.readSuccessfulExploration(testSpecId, attemptId);
+  const { compiler, resolved } = await store.readCompiledExplorationV6(testSpecId, attemptId, compilerId);
+  if (!policy.sensitiveBinaryApproved &&
+    (policy.finalScreenshot || policy.failureScreenshot || policy.failureTrace || policy.failureVideo))
+    throw new Error('Browser binary capture requires sensitive-capture approval');
+  const videoDir = policy.failureVideo ? await mkdtemp(path.join(tmpdir(), 'qa-recording-')) : undefined;
+  try {
+    const observer = new RunCapture(store, testSpecId, runId, policy, videoDir);
+    const run = await executeResolvedTestSpecV6(factory, source, resolved,
+      { attempt, trace, compiler }, { ...options, executionRunId: runId, observer });
+    await store.writeAgenticRunV6(testSpecId, attemptId, compilerId, run);
+    return run;
+  } finally {
+    if (videoDir) await rm(videoDir, { recursive: true, force: true });
+  }
+}
+
+/** Separate v7 capture path; each invocation owns a fresh protected session. */
+export async function executeAndStoreAgenticRunV7(
+  factory: ProtectedContextFactory, store: LocalArtifactStore, testSpecId: string,
+  attemptId: string, compilerId: string, runId: string, policy: EvidenceCapturePolicy,
+  options: Pick<RunnerOptions, 'dataValues' | 'expectedProfile'> = {},
+): Promise<ExecutionRun> {
+  const { source } = await store.readJob(testSpecId);
+  const { attempt, trace } = await store.readSuccessfulExplorationV3(testSpecId, attemptId);
+  const protectedSource = await store.readSuccessfulExplorationV3Proof(testSpecId, attemptId);
+  const { compiler, resolved } = await store.readCompiledExplorationV7(testSpecId, attemptId, compilerId);
+  if (!policy.sensitiveBinaryApproved &&
+    (policy.finalScreenshot || policy.failureScreenshot || policy.failureTrace || policy.failureVideo))
+    throw new Error('Browser binary capture requires sensitive-capture approval');
+  const videoDir = policy.failureVideo ? await mkdtemp(path.join(tmpdir(), 'qa-recording-')) : undefined;
+  try {
+    const observer = new RunCapture(store, testSpecId, runId, policy, videoDir);
+    const run = await executeResolvedTestSpecV7(factory, source, resolved,
+      { attempt, trace, protectedSource, compiler }, { ...options, executionRunId: runId, observer });
+    await store.writeAgenticRunV7(testSpecId, attemptId, compilerId, run);
+    return run;
+  } finally {
+    if (videoDir) await rm(videoDir, { recursive: true, force: true });
+  }
+}
+
+/** V8 capture accepts only immutable structured-artifact readback per fresh run. */
+export async function executeAndStoreAgenticRunV8(
+  factory: ProtectedContextFactory, store: LocalArtifactStore, testSpecId: string,
+  attemptId: string, compilerId: string, runId: string, policy: EvidenceCapturePolicy,
+  options: Pick<RunnerOptions, 'dataValues' | 'expectedProfile'> = {},
+): Promise<ExecutionRun> {
+  const accepted = await AcceptedResolvedTestSpecV8.fromStore(store, testSpecId, attemptId, compilerId);
+  if (!policy.sensitiveBinaryApproved &&
+    (policy.finalScreenshot || policy.failureScreenshot || policy.failureTrace || policy.failureVideo))
+    throw new Error('Browser binary capture requires sensitive-capture approval');
+  const videoDir = policy.failureVideo ? await mkdtemp(path.join(tmpdir(), 'qa-recording-')) : undefined;
+  try {
+    const observer = new RunCapture(store, testSpecId, runId, policy, videoDir);
+    const run = await executeResolvedTestSpecV8(factory, accepted,
+      { ...options, executionRunId: runId, observer });
+    await store.writeAgenticRunV8(testSpecId, attemptId, compilerId, run);
     return run;
   } finally {
     if (videoDir) await rm(videoDir, { recursive: true, force: true });

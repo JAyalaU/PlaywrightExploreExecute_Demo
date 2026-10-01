@@ -5,10 +5,34 @@ import { z } from 'zod';
 import {
   SCHEMA_VERSION, ExecutionProfileRefSchema, TestSpecSchema, parseResultRecord, parseResolvedTestSpec,
   parseTestSpec, type ResolvedTestSpec, type ResultRecord, type TestSpec,
+  parseCompilerAttemptV1, parseExplorationAttemptV3, parseExplorationBranchDiagnosticV1,
+  parseSuccessfulExplorationTraceV1, parseSuccessfulExplorationTraceV2,
+  parseSuccessfulExplorationTraceV3,
+  parseSuccessfulExplorationTraceV4,
+  SuccessfulExplorationTraceV4Schema,
+  parseCompilerAttemptV2, parseResolvedTestSpecV7,
+  parseCompilerAttemptV3, parseResolvedTestSpecV8,
+  ExplorationBranchDiagnosticV1Schema,
+  parseResolvedTestSpecV6,
+  type CompilerAttemptV1, type ExplorationAttemptV3,
+  type ExplorationBranchDiagnosticV1, type SuccessfulExplorationTraceV1,
+  type SuccessfulExplorationTraceV2, type ResolvedTestSpecV6,
+  type SuccessfulExplorationTraceV3,
+  type SuccessfulExplorationTraceV4,
+  type CompilerAttemptV2, type ResolvedTestSpecV7,
+  type CompilerAttemptV3, type ResolvedTestSpecV8,
+  type ProtectedTraceObservationSourceV3,
+  type ProtectedTraceActionIdentitySourceV4,
+  parseResultRecordV2, type ResultRecordV2,
 } from '../domain/index.js';
 import { ExecutionProfileSchema, NetworkPolicySchema, ProfileCatalog, assertEquivalentEffectiveProfile, type EffectiveProfile } from '../profile/index.js';
 import type { ExecutionRun } from '../runner/index.js';
 import { EvidenceRedactor } from './redact.js';
+import { M7DecisionDiagnosticSchema, type M7DecisionDiagnostic } from './m7-diagnostic.js';
+import { AssembledSuccessfulTraceV3, parseProtectedTraceCaptureBundleV3,
+  ProtectedTraceCaptureBundleV3Schema } from '../exploration/trace-assembly-v3.js';
+import { AssembledSuccessfulTraceV4, parseProtectedTraceCaptureBundleV4,
+  ProtectedTraceCaptureBundleV4Schema } from '../exploration/trace-assembly-v4.js';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
 const time = z.iso.datetime();
@@ -99,6 +123,9 @@ async function atomicCreate(file: string, content: Uint8Array): Promise<void> {
 }
 
 function bytes(value: unknown): Uint8Array { return Buffer.from(JSON.stringify(value, null, 2), 'utf8'); }
+function hashJson(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
 async function readJson(file: string): Promise<unknown> { return JSON.parse(await readFile(file, 'utf8')) as unknown; }
 function same(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 
@@ -196,6 +223,526 @@ export class LocalArtifactStore {
     const effective = new ProfileCatalog([profile], [policy]).resolve(source.executionProfileRef);
     if (effective.fingerprint !== manifest.profileFingerprint) throw new Error('Stored profile fingerprint mismatch');
     return { source, profile: effective };
+  }
+
+  /** One atomic record keeps the v3 attempt and its successful trace inseparable. */
+  async writeSuccessfulExploration(input: { attempt: unknown; trace: unknown }): Promise<{
+    attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV1 | SuccessfulExplorationTraceV2;
+  }> {
+    const candidate = input.attempt as { testSpecId?: string };
+    const { source, profile } = await this.readJob(id.parse(candidate.testSpecId));
+    const attempt = parseExplorationAttemptV3(input.attempt, source);
+    const trace = (input.trace as { traceVersion?: unknown })?.traceVersion === '2' ?
+      parseSuccessfulExplorationTraceV2(input.trace, source, attempt) :
+      parseSuccessfulExplorationTraceV1(input.trace, source, attempt);
+    if (attempt.status !== 'path_established' ||
+      attempt.profileFingerprint !== profile.fingerprint || trace.profileFingerprint !== profile.fingerprint)
+      throw new Error('Successful trace effective profile mismatch');
+    if (trace.traceVersion === '2' && trace.bindings.some((binding) =>
+      binding.frameOwnership.kind === 'unproven'))
+      throw new Error('Successful v2 trace has unproven required frame ownership');
+    this.#redactor.assertSafeContract(trace);
+    for (const record of trace.successfulPath) {
+      for (const ref of record.evidenceRefs ?? []) {
+        const descriptor = await this.readEvidence(source.testSpecId, ref);
+        if (descriptor.owner.kind !== 'attempt' || descriptor.owner.id !== attempt.explorationAttemptId ||
+          descriptor.originStepId !== record.originStepId)
+          throw new Error('Successful trace evidence correlation failure');
+      }
+    }
+    const branchDirectory = this.#file(source.testSpecId, 'developer-diagnostics', attempt.explorationAttemptId);
+    let branchNames: string[] = [];
+    try { branchNames = await readdir(branchDirectory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    for (const name of branchNames.filter((entry) => /^branch-[1-9][0-9]*\.json$/.test(entry))) {
+      const branch = parseExplorationBranchDiagnosticV1(await readJson(path.join(branchDirectory, name)), source, attempt);
+      // A recovery branch may originate in a disposed protected session. It
+      // must point to a record reconstructed in the final successful session.
+      if ((branch.sessionId !== trace.sessionId && !branch.recoveredToRecordId) ||
+        (branch.recoveredToRecordId && !trace.successfulPath.some((record) => record.recordId === branch.recoveredToRecordId)))
+        throw new Error('Exploration branch linkage mismatch');
+    }
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-explorations',
+      `${attempt.explorationAttemptId}.json`), { attempt, trace });
+    return { attempt, trace };
+  }
+
+  async readSuccessfulExploration(testSpecId: string, attemptId: string): Promise<{
+    attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV1 | SuccessfulExplorationTraceV2;
+  }> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-explorations', `${id.parse(attemptId)}.json`)) as
+      { attempt?: unknown; trace?: unknown };
+    const attempt = parseExplorationAttemptV3(raw.attempt, source);
+    const trace = (raw.trace as { traceVersion?: unknown })?.traceVersion === '2' ?
+      parseSuccessfulExplorationTraceV2(raw.trace, source, attempt) :
+      parseSuccessfulExplorationTraceV1(raw.trace, source, attempt);
+    if (attempt.explorationAttemptId !== attemptId || attempt.status !== 'path_established' ||
+      attempt.profileFingerprint !== profile.fingerprint || trace.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored successful trace correlation failure');
+    if (trace.traceVersion === '2' && trace.bindings.some((binding) =>
+      binding.frameOwnership.kind === 'unproven'))
+      throw new Error('Stored successful v2 trace has unproven required frame ownership');
+    for (const record of trace.successfulPath) {
+      for (const ref of record.evidenceRefs ?? []) {
+        const descriptor = await this.readEvidence(testSpecId, ref);
+        if (descriptor.owner.kind !== 'attempt' || descriptor.owner.id !== attemptId ||
+          descriptor.originStepId !== record.originStepId)
+          throw new Error('Stored successful trace evidence correlation failure');
+      }
+    }
+    return { attempt, trace };
+  }
+
+  /** V3 uses a separate immutable namespace and a protected runtime capture bundle. */
+  async writeSuccessfulExplorationV3(assembled: AssembledSuccessfulTraceV3): Promise<{
+    attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV3;
+  }> {
+    if (!(assembled instanceof AssembledSuccessfulTraceV3))
+      throw new Error('V3 write requires protected assembler output');
+    const artifact = assembled.protectedArtifact();
+    const { source, profile } = await this.readJob(artifact.attempt.testSpecId);
+    const attempt = parseExplorationAttemptV3(artifact.attempt, source);
+    const capture = ProtectedTraceCaptureBundleV3Schema.parse(artifact.capture);
+    const rawTrace = artifact.trace;
+    const proof = parseProtectedTraceCaptureBundleV3(capture, rawTrace);
+    const trace = parseSuccessfulExplorationTraceV3(rawTrace, source, attempt, proof.source);
+    if (attempt.status !== 'path_established' ||
+        attempt.profileFingerprint !== profile.fingerprint ||
+        trace.profileFingerprint !== profile.fingerprint)
+      throw new Error('V3 effective profile mismatch');
+    this.#redactor.assertSafeContract(trace);
+    this.#redactor.assertSafeContract(capture);
+    for (const record of trace.successfulPath) {
+      if (record.type === 'verification_goal') continue;
+      for (const ref of record.evidenceRefs ?? []) {
+        const descriptor = await this.readEvidence(source.testSpecId, ref);
+        if (descriptor.owner.kind !== 'attempt' ||
+            descriptor.owner.id !== attempt.explorationAttemptId ||
+            descriptor.originStepId !== record.originStepId)
+          throw new Error('V3 evidence correlation failure');
+      }
+    }
+    const branchDirectory = this.#file(source.testSpecId, 'developer-diagnostics',
+      attempt.explorationAttemptId);
+    let branchNames: string[] = [];
+    try { branchNames = await readdir(branchDirectory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    for (const name of branchNames.filter((entry) => /^branch-[1-9][0-9]*\.json$/.test(entry))) {
+      const branch = parseExplorationBranchDiagnosticV1(
+        await readJson(path.join(branchDirectory, name)), source, attempt);
+      if ((branch.sessionId !== trace.sessionId && !branch.recoveredToRecordId) ||
+          (branch.recoveredToRecordId && !trace.successfulPath.some((record) =>
+            record.recordId === branch.recoveredToRecordId)))
+        throw new Error('V3 branch linkage mismatch');
+    }
+    const envelope = { attempt, trace, capture,
+      sourceDigest: hashJson(source), attemptDigest: hashJson(attempt),
+      traceDigest: hashJson(trace), captureDigest: hashJson(capture) };
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-explorations-v3',
+      `${attempt.explorationAttemptId}.json`), envelope);
+    return { attempt, trace };
+  }
+
+  async readSuccessfulExplorationV3(testSpecId: string, attemptId: string): Promise<{
+    attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV3;
+  }> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-explorations-v3',
+      `${id.parse(attemptId)}.json`)) as Record<string, unknown>;
+    if (raw.sourceDigest !== hashJson(source) ||
+        raw.attemptDigest !== hashJson(raw.attempt) ||
+        raw.traceDigest !== hashJson(raw.trace) ||
+        raw.captureDigest !== hashJson(raw.capture))
+      throw new Error('Stored v3 artifact digest mismatch');
+    const attempt = parseExplorationAttemptV3(raw.attempt, source);
+    const traceInput = raw.trace as SuccessfulExplorationTraceV3;
+    const proof = parseProtectedTraceCaptureBundleV3(raw.capture, traceInput);
+    const trace = parseSuccessfulExplorationTraceV3(traceInput, source, attempt, proof.source);
+    if (attempt.explorationAttemptId !== attemptId ||
+        attempt.status !== 'path_established' ||
+        attempt.profileFingerprint !== profile.fingerprint ||
+        trace.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored v3 artifact ownership mismatch');
+    for (const record of trace.successfulPath) {
+      if (record.type === 'verification_goal') continue;
+      for (const ref of record.evidenceRefs ?? []) {
+        const descriptor = await this.readEvidence(testSpecId, ref);
+        if (descriptor.owner.kind !== 'attempt' || descriptor.owner.id !== attemptId ||
+            descriptor.originStepId !== record.originStepId)
+          throw new Error('Stored v3 evidence correlation failure');
+      }
+    }
+    return { attempt, trace };
+  }
+
+  /** V5 actions enter only the separate immutable trace-v4 namespace. */
+  async writeSuccessfulExplorationV4(assembled: AssembledSuccessfulTraceV4): Promise<{
+    attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV4;
+  }> {
+    if (!(assembled instanceof AssembledSuccessfulTraceV4))
+      throw new Error('V4 write requires protected assembler output');
+    const artifact = assembled.protectedArtifact();
+    const { source, profile } = await this.readJob(artifact.attempt.testSpecId);
+    if (source.schemaVersion !== '5') throw new Error('V4 trace requires TestSpec v5');
+    const attempt = parseExplorationAttemptV3(artifact.attempt, source);
+    const capture = ProtectedTraceCaptureBundleV4Schema.parse(artifact.capture);
+    const proof = parseProtectedTraceCaptureBundleV4(capture, artifact.trace);
+    const trace = parseSuccessfulExplorationTraceV4(artifact.trace, source, attempt, proof.source);
+    if (attempt.status !== 'path_established' ||
+        attempt.profileFingerprint !== profile.fingerprint ||
+        trace.profileFingerprint !== profile.fingerprint)
+      throw new Error('V4 effective profile mismatch');
+    this.#redactor.assertSafeContract(trace);
+    this.#redactor.assertSafeContract(capture);
+    for (const record of trace.successfulPath) {
+      if (record.type === 'verification_goal') continue;
+      for (const ref of record.evidenceRefs ?? []) {
+        const descriptor = await this.readEvidence(source.testSpecId, ref);
+        if (descriptor.owner.kind !== 'attempt' || descriptor.owner.id !== attempt.explorationAttemptId ||
+            descriptor.originStepId !== record.originStepId)
+          throw new Error('V4 evidence correlation failure');
+      }
+    }
+    const branchDirectory = this.#file(source.testSpecId, 'developer-diagnostics',
+      attempt.explorationAttemptId);
+    let branchNames: string[] = [];
+    try { branchNames = await readdir(branchDirectory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    for (const name of branchNames.filter((entry) => /^branch-[1-9][0-9]*\.json$/.test(entry))) {
+      const branch = parseExplorationBranchDiagnosticV1(
+        await readJson(path.join(branchDirectory, name)), source, attempt);
+      if ((branch.sessionId !== trace.sessionId && !branch.recoveredToRecordId) ||
+          (branch.recoveredToRecordId && !trace.successfulPath.some((record) =>
+            record.recordId === branch.recoveredToRecordId)))
+        throw new Error('V4 branch linkage mismatch');
+    }
+    const envelope = { attempt, trace, capture, sourceDigest: hashJson(source),
+      attemptDigest: hashJson(attempt), traceDigest: hashJson(trace), captureDigest: hashJson(capture) };
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-explorations-v4',
+      `${attempt.explorationAttemptId}.json`), envelope);
+    return this.readSuccessfulExplorationV4(source.testSpecId, attempt.explorationAttemptId);
+  }
+
+  async readSuccessfulExplorationV4(testSpecId: string, attemptId: string): Promise<{
+    attempt: ExplorationAttemptV3; trace: SuccessfulExplorationTraceV4;
+  }> {
+    const { source, profile } = await this.readJob(testSpecId);
+    if (source.schemaVersion !== '5') throw new Error('V4 trace requires TestSpec v5');
+    const raw = await readJson(this.#file(testSpecId, 'agentic-explorations-v4',
+      `${id.parse(attemptId)}.json`)) as Record<string, unknown>;
+    if (raw.sourceDigest !== hashJson(source) || raw.attemptDigest !== hashJson(raw.attempt) ||
+        raw.traceDigest !== hashJson(raw.trace) || raw.captureDigest !== hashJson(raw.capture))
+      throw new Error('Stored v4 artifact digest mismatch');
+    const attempt = parseExplorationAttemptV3(raw.attempt, source);
+    const traceInput = SuccessfulExplorationTraceV4Schema.parse(raw.trace);
+    const proof = parseProtectedTraceCaptureBundleV4(raw.capture, traceInput);
+    const trace = parseSuccessfulExplorationTraceV4(traceInput, source, attempt, proof.source);
+    if (attempt.explorationAttemptId !== attemptId || attempt.status !== 'path_established' ||
+        attempt.profileFingerprint !== profile.fingerprint || trace.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored v4 artifact ownership mismatch');
+    for (const record of trace.successfulPath) {
+      if (record.type === 'verification_goal') continue;
+      for (const ref of record.evidenceRefs ?? []) {
+        const descriptor = await this.readEvidence(testSpecId, ref);
+        if (descriptor.owner.kind !== 'attempt' || descriptor.owner.id !== attemptId ||
+            descriptor.originStepId !== record.originStepId)
+          throw new Error('Stored v4 evidence correlation failure');
+      }
+    }
+    return { attempt, trace };
+  }
+
+  /** Compiler handoff reads only validated protected v4 capture, never model output. */
+  async readSuccessfulExplorationV4Proof(testSpecId: string, attemptId: string):
+    Promise<ProtectedTraceActionIdentitySourceV4> {
+    const { trace } = await this.readSuccessfulExplorationV4(testSpecId, attemptId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-explorations-v4',
+      `${id.parse(attemptId)}.json`)) as { capture: unknown };
+    return parseProtectedTraceCaptureBundleV4(raw.capture, trace).source;
+  }
+
+  /** V5/v4 compiler artifacts are isolated from the phrase-based v4/v3/v7 route. */
+  async writeCompilerAttemptV3(input: unknown): Promise<CompilerAttemptV3> {
+    const candidate = input as { testSpecId?: string; explorationAttemptId?: string };
+    const { source, profile } = await this.readJob(id.parse(candidate.testSpecId));
+    const attemptId = id.parse(candidate.explorationAttemptId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV4(source.testSpecId, attemptId);
+    const proof = await this.readSuccessfulExplorationV4Proof(source.testSpecId, attemptId);
+    const compiler = parseCompilerAttemptV3(input, source, attempt, trace, proof);
+    if (compiler.result.status !== 'rejected' || compiler.profileFingerprint !== profile.fingerprint)
+      throw new Error('Standalone compiler v3 must be a same-profile rejection');
+    this.#redactor.assertSafeContract(compiler);
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-compiler-attempts-v3',
+      trace.successfulTraceId, `${compiler.compilerAttemptId}.json`), compiler);
+    return this.readCompilerAttemptV3(source.testSpecId, attemptId, compiler.compilerAttemptId);
+  }
+
+  async readCompilerAttemptV3(testSpecId: string, attemptId: string,
+    compilerId: string): Promise<CompilerAttemptV3> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV4(testSpecId, attemptId);
+    const proof = await this.readSuccessfulExplorationV4Proof(testSpecId, attemptId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-compiler-attempts-v3',
+      trace.successfulTraceId, `${id.parse(compilerId)}.json`)) as { compiler?: unknown; resolved?: unknown };
+    const compiler = parseCompilerAttemptV3(raw.compiler ?? raw, source, attempt, trace, proof);
+    if (compiler.compilerAttemptId !== compilerId || compiler.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored compiler v3 linkage mismatch');
+    if (compiler.result.status === 'accepted') {
+      if (!raw.resolved) throw new Error('Accepted compiler v3 lacks v8 artifact');
+      parseResolvedTestSpecV8(raw.resolved, source, attempt, trace, proof, compiler);
+    } else if (raw.resolved) throw new Error('Rejected compiler v3 cannot carry v8');
+    return compiler;
+  }
+
+  async writeCompiledExplorationV8(input: { compiler: unknown; resolved: unknown }): Promise<{
+    compiler: CompilerAttemptV3; resolved: ResolvedTestSpecV8;
+  }> {
+    const candidate = input.compiler as { testSpecId?: string; explorationAttemptId?: string };
+    const { source, profile } = await this.readJob(id.parse(candidate.testSpecId));
+    const attemptId = id.parse(candidate.explorationAttemptId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV4(source.testSpecId, attemptId);
+    const proof = await this.readSuccessfulExplorationV4Proof(source.testSpecId, attemptId);
+    const compiler = parseCompilerAttemptV3(input.compiler, source, attempt, trace, proof);
+    const resolved = parseResolvedTestSpecV8(input.resolved, source, attempt, trace, proof, compiler);
+    if (compiler.result.status !== 'accepted' || compiler.profileFingerprint !== profile.fingerprint ||
+        resolved.profileFingerprint !== profile.fingerprint)
+      throw new Error('Compiled v8 profile mismatch');
+    this.#redactor.assertSafeContract(compiler);
+    this.#redactor.assertSafeContract(resolved);
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-compiler-attempts-v3',
+      trace.successfulTraceId, `${compiler.compilerAttemptId}.json`), { compiler, resolved });
+    return this.readCompiledExplorationV8(source.testSpecId, attemptId, compiler.compilerAttemptId);
+  }
+
+  async readCompiledExplorationV8(testSpecId: string, attemptId: string,
+    compilerId: string): Promise<{ compiler: CompilerAttemptV3; resolved: ResolvedTestSpecV8 }> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV4(testSpecId, attemptId);
+    const proof = await this.readSuccessfulExplorationV4Proof(testSpecId, attemptId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-compiler-attempts-v3',
+      trace.successfulTraceId, `${id.parse(compilerId)}.json`)) as { compiler: unknown; resolved: unknown };
+    const compiler = parseCompilerAttemptV3(raw.compiler, source, attempt, trace, proof);
+    const resolved = parseResolvedTestSpecV8(raw.resolved, source, attempt, trace, proof, compiler);
+    if (compiler.compilerAttemptId !== compilerId || compiler.profileFingerprint !== profile.fingerprint ||
+        resolved.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored compiled v8 linkage mismatch');
+    return { compiler, resolved };
+  }
+
+  /** Private compiler proof lookup, reconstructed only after immutable v3 readback. */
+  async readSuccessfulExplorationV3Proof(testSpecId: string, attemptId: string):
+    Promise<ProtectedTraceObservationSourceV3> {
+    const { trace } = await this.readSuccessfulExplorationV3(testSpecId, attemptId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-explorations-v3',
+      `${id.parse(attemptId)}.json`)) as { capture: unknown };
+    return parseProtectedTraceCaptureBundleV3(raw.capture, trace).source;
+  }
+
+  /** Rejections and accepted v7 artifacts live outside the released v1/v6 compiler namespace. */
+  async writeCompilerAttemptV2(input: unknown): Promise<CompilerAttemptV2> {
+    const candidate = input as { testSpecId?: string; explorationAttemptId?: string };
+    const { source, profile } = await this.readJob(id.parse(candidate.testSpecId));
+    const attemptId = id.parse(candidate.explorationAttemptId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV3(source.testSpecId, attemptId);
+    const raw = await readJson(this.#file(source.testSpecId, 'agentic-explorations-v3', `${attemptId}.json`)) as
+      { capture: unknown };
+    const proof = parseProtectedTraceCaptureBundleV3(raw.capture, trace);
+    const compiler = parseCompilerAttemptV2(input, source, attempt, trace, proof.source);
+    if (compiler.result.status !== 'rejected' || compiler.profileFingerprint !== profile.fingerprint)
+      throw new Error('Standalone v2 compiler attempt must be a same-profile rejection');
+    this.#redactor.assertSafeContract(compiler);
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-compiler-attempts-v2',
+      trace.successfulTraceId, `${compiler.compilerAttemptId}.json`), compiler);
+    return compiler;
+  }
+
+  async readCompilerAttemptV2(testSpecId: string, attemptId: string,
+    compilerId: string): Promise<CompilerAttemptV2> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV3(testSpecId, attemptId);
+    const proof = await this.readSuccessfulExplorationV3Proof(testSpecId, attemptId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-compiler-attempts-v2',
+      trace.successfulTraceId, `${id.parse(compilerId)}.json`)) as
+      { compiler?: unknown; resolved?: unknown };
+    const compiler = parseCompilerAttemptV2(raw.compiler ?? raw, source, attempt, trace, proof);
+    if (compiler.compilerAttemptId !== compilerId || compiler.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored compiler v2 correlation failure');
+    if (compiler.result.status === 'accepted') {
+      if (!raw.resolved) throw new Error('Accepted compiler v2 lacks resolved v7 artifact');
+      parseResolvedTestSpecV7(raw.resolved, source, attempt, trace, proof, compiler);
+    } else if (raw.resolved) throw new Error('Rejected compiler v2 cannot carry resolved v7 artifact');
+    return compiler;
+  }
+
+  async writeCompiledExplorationV7(input: { compiler: unknown; resolved: unknown }): Promise<{
+    compiler: CompilerAttemptV2; resolved: ResolvedTestSpecV7;
+  }> {
+    const candidate = input.compiler as { testSpecId?: string; explorationAttemptId?: string };
+    const { source, profile } = await this.readJob(id.parse(candidate.testSpecId));
+    const attemptId = id.parse(candidate.explorationAttemptId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV3(source.testSpecId, attemptId);
+    const raw = await readJson(this.#file(source.testSpecId, 'agentic-explorations-v3', `${attemptId}.json`)) as
+      { capture: unknown };
+    const proof = parseProtectedTraceCaptureBundleV3(raw.capture, trace);
+    const compiler = parseCompilerAttemptV2(input.compiler, source, attempt, trace, proof.source);
+    const resolved = parseResolvedTestSpecV7(input.resolved, source, attempt, trace, proof.source, compiler);
+    if (compiler.result.status !== 'accepted' || compiler.profileFingerprint !== profile.fingerprint ||
+        resolved.profileFingerprint !== profile.fingerprint)
+      throw new Error('Compiled v7 effective profile mismatch');
+    this.#redactor.assertSafeContract(compiler);
+    this.#redactor.assertSafeContract(resolved);
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-compiler-attempts-v2',
+      trace.successfulTraceId, `${compiler.compilerAttemptId}.json`), { compiler, resolved });
+    return { compiler, resolved };
+  }
+
+  async readCompiledExplorationV7(testSpecId: string, attemptId: string, compilerId: string): Promise<{
+    compiler: CompilerAttemptV2; resolved: ResolvedTestSpecV7;
+  }> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExplorationV3(testSpecId, attemptId);
+    const rawTrace = await readJson(this.#file(testSpecId, 'agentic-explorations-v3', `${id.parse(attemptId)}.json`)) as
+      { capture: unknown };
+    const proof = parseProtectedTraceCaptureBundleV3(rawTrace.capture, trace);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-compiler-attempts-v2',
+      trace.successfulTraceId, `${id.parse(compilerId)}.json`)) as { compiler?: unknown; resolved?: unknown };
+    const compiler = parseCompilerAttemptV2(raw.compiler, source, attempt, trace, proof.source);
+    const resolved = parseResolvedTestSpecV7(raw.resolved, source, attempt, trace, proof.source, compiler);
+    if (compiler.compilerAttemptId !== compilerId || compiler.profileFingerprint !== profile.fingerprint ||
+        resolved.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored compiled v7 correlation failure');
+    return { compiler, resolved };
+  }
+
+  /** Closed branch records are private diagnostics, never path records or evidence refs. */
+  async writeExplorationBranchDiagnostic(input: unknown): Promise<ExplorationBranchDiagnosticV1> {
+    const diagnostic = ExplorationBranchDiagnosticV1Schema.parse(input);
+    const { source, profile } = await this.readJob(diagnostic.testSpecId);
+    if (diagnostic.profileFingerprint !== profile.fingerprint ||
+      !same(diagnostic.executionProfileRef, source.executionProfileRef) ||
+      !source.steps.some((step) => step.id === diagnostic.originStepId))
+      throw new Error('Exploration branch diagnostic owner or goal mismatch');
+    let established: SuccessfulExplorationTraceV1 | SuccessfulExplorationTraceV2 | undefined;
+    try {
+      established = (await this.readSuccessfulExploration(source.testSpecId, diagnostic.explorationAttemptId)).trace;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    let establishedV3 = false;
+    try {
+      await this.readSuccessfulExplorationV3(source.testSpecId, diagnostic.explorationAttemptId);
+      establishedV3 = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (established || establishedV3)
+      throw new Error('Exploration branch diagnostics closed after trace finalization');
+    this.#redactor.assertSafeContract(diagnostic);
+    const file = this.#file(source.testSpecId, 'developer-diagnostics', diagnostic.explorationAttemptId,
+      `branch-${diagnostic.branchOrdinal}.json`);
+    await this.#createJson(file, diagnostic);
+    return diagnostic;
+  }
+
+  async readExplorationBranchDiagnostics(testSpecId: string, attemptId: string): Promise<ExplorationBranchDiagnosticV1[]> {
+    const { source } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExploration(testSpecId, attemptId);
+    const directory = this.#file(testSpecId, 'developer-diagnostics', id.parse(attemptId));
+    let names: string[];
+    try { names = await readdir(directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    const records = await Promise.all(names.filter((name) => /^branch-[1-9][0-9]*\.json$/.test(name))
+      .map(async (name) => parseExplorationBranchDiagnosticV1(await readJson(path.join(directory, name)), source, attempt)));
+    if (records.some((record) => record.sessionId !== trace.sessionId &&
+      (!record.recoveredToRecordId || !trace.successfulPath.some((step) => step.recordId === record.recoveredToRecordId))))
+      throw new Error('Exploration branch session mismatch');
+    return records.sort((a, b) => a.branchOrdinal - b.branchOrdinal);
+  }
+
+  async writeCompilerAttemptV1(input: unknown): Promise<CompilerAttemptV1> {
+    const candidate = input as { testSpecId?: string; explorationAttemptId?: string };
+    const { source } = await this.readJob(id.parse(candidate.testSpecId));
+    const { attempt, trace } = await this.readSuccessfulExploration(source.testSpecId,
+      id.parse(candidate.explorationAttemptId));
+    const compiler = parseCompilerAttemptV1(input, trace, source, attempt);
+    this.#redactor.assertSafeContract(compiler);
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-compiler-attempts',
+      trace.successfulTraceId, `${compiler.compilerAttemptId}.json`), compiler);
+    return compiler;
+  }
+
+  async readCompilerAttemptV1(testSpecId: string, attemptId: string, compilerId: string): Promise<CompilerAttemptV1> {
+    const { source } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExploration(testSpecId, attemptId);
+    const raw = await readJson(this.#file(testSpecId, 'agentic-compiler-attempts',
+      trace.successfulTraceId, `${id.parse(compilerId)}.json`)) as Record<string, unknown>;
+    return parseCompilerAttemptV1(raw.compiler ?? raw, trace, source, attempt);
+  }
+
+  /** The accepted attempt and v6 artifact are atomically created together. */
+  async writeCompiledExplorationV6(input: { compiler: unknown; resolved: unknown }): Promise<{
+    compiler: CompilerAttemptV1; resolved: ResolvedTestSpecV6;
+  }> {
+    const candidate = input.compiler as { testSpecId?: string; explorationAttemptId?: string };
+    const { source, profile } = await this.readJob(id.parse(candidate.testSpecId));
+    const { attempt, trace } = await this.readSuccessfulExploration(source.testSpecId,
+      id.parse(candidate.explorationAttemptId));
+    if (trace.traceVersion === '1' && trace.bindings.length > 0)
+      throw new Error('Targeted v1 trace lacks durable frame-owner provenance');
+    const compiler = parseCompilerAttemptV1(input.compiler, trace, source, attempt);
+    const resolved = parseResolvedTestSpecV6(input.resolved, source, attempt, trace, compiler);
+    if (compiler.result.status !== 'accepted' ||
+      compiler.profileFingerprint !== profile.fingerprint || resolved.profileFingerprint !== profile.fingerprint)
+      throw new Error('Compiled v6 effective profile mismatch');
+    this.#redactor.assertSafeContract(compiler);
+    this.#redactor.assertSafeContract(resolved);
+    await this.#createJson(this.#file(source.testSpecId, 'agentic-compiler-attempts',
+      trace.successfulTraceId, `${compiler.compilerAttemptId}.json`), { compiler, resolved });
+    return { compiler, resolved };
+  }
+
+  async readCompiledExplorationV6(testSpecId: string, attemptId: string, compilerId: string): Promise<{
+    compiler: CompilerAttemptV1; resolved: ResolvedTestSpecV6;
+  }> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const { attempt, trace } = await this.readSuccessfulExploration(testSpecId, attemptId);
+    if (trace.traceVersion === '1' && trace.bindings.length > 0)
+      throw new Error('Targeted v1 trace lacks durable frame-owner provenance');
+    const raw = await readJson(this.#file(testSpecId, 'agentic-compiler-attempts',
+      trace.successfulTraceId, `${id.parse(compilerId)}.json`)) as { compiler?: unknown; resolved?: unknown };
+    const compiler = parseCompilerAttemptV1(raw.compiler, trace, source, attempt);
+    const resolved = parseResolvedTestSpecV6(raw.resolved, source, attempt, trace, compiler);
+    if (compiler.profileFingerprint !== profile.fingerprint || resolved.profileFingerprint !== profile.fingerprint)
+      throw new Error('Stored compiled v6 effective profile mismatch');
+    return { compiler, resolved };
+  }
+
+  /** Internal, private decision trace. It is intentionally outside evidence refs and report projection. */
+  async writeM7DecisionDiagnostic(testSpecId: string, input: unknown): Promise<M7DecisionDiagnostic> {
+    const diagnostic = M7DecisionDiagnosticSchema.parse(input);
+    await this.readJob(testSpecId);
+    const directory = this.#file(testSpecId, 'developer-diagnostics', diagnostic.explorationAttemptId);
+    await this.#createJson(path.join(directory, `decision-${diagnostic.callOrdinal}.json`), diagnostic);
+    return diagnostic;
+  }
+
+  async readM7DecisionDiagnostics(testSpecId: string, attemptId: string): Promise<M7DecisionDiagnostic[]> {
+    await this.readJob(testSpecId);
+    const directory = this.#file(testSpecId, 'developer-diagnostics', id.parse(attemptId));
+    let names: string[];
+    try { names = await readdir(directory); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    const records = await Promise.all(names.filter((name) => /^decision-[1-9][0-9]*\.json$/.test(name))
+      .map(async (name) => M7DecisionDiagnosticSchema.parse(await readJson(path.join(directory, name)))));
+    if (records.some((record) => record.explorationAttemptId !== attemptId)) throw new Error('M7 diagnostic attempt mismatch');
+    return records.sort((a, b) => a.callOrdinal - b.callOrdinal);
   }
 
   async writeEvidence(testSpecId: string, input: {
@@ -343,6 +890,33 @@ export class LocalArtifactStore {
 
   async writeRun(testSpecId: string, resolvedSpecId: string, run: ExecutionRun): Promise<StoredRun> {
     const resolved = await this.readResolved(testSpecId, resolvedSpecId);
+    return this.#writeRunForResolved(testSpecId, resolved, run);
+  }
+
+  /** V6 runs are linked to the immutable accepted compiler record, never to a legacy resolved file. */
+  async writeAgenticRunV6(testSpecId: string, attemptId: string, compilerId: string,
+    run: ExecutionRun): Promise<StoredRun> {
+    const { resolved } = await this.readCompiledExplorationV6(testSpecId, attemptId, compilerId);
+    return this.#writeRunForResolved(testSpecId, resolved, run);
+  }
+
+  /** V7 runs are accepted only through the v3/compiler-v2 namespace. */
+  async writeAgenticRunV7(testSpecId: string, attemptId: string, compilerId: string,
+    run: ExecutionRun): Promise<StoredRun> {
+    const { resolved } = await this.readCompiledExplorationV7(testSpecId, attemptId, compilerId);
+    return this.#writeRunForResolved(testSpecId, resolved, run);
+  }
+
+  /** V8 runs are accepted only through the v4/compiler-v3 namespace. */
+  async writeAgenticRunV8(testSpecId: string, attemptId: string, compilerId: string,
+    run: ExecutionRun): Promise<StoredRun> {
+    const { resolved } = await this.readCompiledExplorationV8(testSpecId, attemptId, compilerId);
+    return this.#writeRunForResolved(testSpecId, resolved, run);
+  }
+
+  async #writeRunForResolved(testSpecId: string, resolved: ResolvedTestSpec | ResolvedTestSpecV6 | ResolvedTestSpecV7 | ResolvedTestSpecV8,
+    run: ExecutionRun): Promise<StoredRun> {
+    const resolvedSpecId = resolved.resolvedSpecId;
     const { source, profile } = await this.readJob(testSpecId);
     assertEquivalentEffectiveProfile(profile, run.effectiveProfile);
     if (profile.fingerprint !== run.effectiveProfile.fingerprint ||
@@ -397,6 +971,29 @@ export class LocalArtifactStore {
     return { ...raw, outcomes: raw.outcomes.map(parseResultRecord) };
   }
 
+  /** A terminal summary is immutable and separate from legacy step results. */
+  async writeAgenticTerminalV2(input: unknown): Promise<ResultRecordV2> {
+    const terminal = parseResultRecordV2(input);
+    if (terminal.workflowVersion === 'deferred-action-v1') throw new Error('Deferred results require authenticated replay-v9 storage');
+    const { source, profile } = await this.readJob(terminal.testSpecId);
+    if (!same(source.executionProfileRef, terminal.executionProfileRef) ||
+      profile.fingerprint !== terminal.profileFingerprint)
+      throw new Error('Agentic terminal source/profile mismatch');
+    this.#redactor.assertSafeContract(terminal);
+    await this.#createJson(this.#file(terminal.testSpecId, 'agentic-terminal-v2.json'), terminal);
+    return terminal;
+  }
+
+  async readAgenticTerminalV2(testSpecId: string): Promise<ResultRecordV2> {
+    const { source, profile } = await this.readJob(testSpecId);
+    const terminal = parseResultRecordV2(await readJson(this.#file(testSpecId, 'agentic-terminal-v2.json')));
+    if (terminal.workflowVersion === 'deferred-action-v1') throw new Error('Deferred results require authenticated replay-v9 storage');
+    if (terminal.testSpecId !== testSpecId || !same(terminal.executionProfileRef, source.executionProfileRef) ||
+      terminal.profileFingerprint !== profile.fingerprint)
+      throw new Error('Agentic terminal source/profile mismatch');
+    return terminal;
+  }
+
   async #fileIds(testSpecId: string, type: 'attempts' | 'resolved' | 'runs'): Promise<string[]> {
     const directory = this.#file(testSpecId, type);
     try {
@@ -423,6 +1020,30 @@ export class LocalArtifactStore {
       return id.parse(raw.resolvedSpecId);
     }));
     return resolvedIds.sort();
+  }
+
+  /** Bound all bytes the report reader may touch before reconstructing a UI projection. */
+  async assertProjectionReadBudget(testSpecId: string, maxBytes: number, maxFiles: number): Promise<void> {
+    await this.#privateRoot();
+    const job = this.#job(id.parse(testSpecId));
+    let files = 0;
+    let bytes = 0;
+    const scan = async (target: string): Promise<void> => {
+      const info = await lstat(target);
+      if (info.isSymbolicLink()) throw new Error('Unsafe projection artifact link');
+      if (info.isFile()) {
+        files += 1;
+        bytes += info.size;
+        if (files > maxFiles || bytes > maxBytes) throw new Error('Projection artifact budget exceeded');
+        return;
+      }
+      if (!info.isDirectory()) throw new Error('Unsafe projection artifact type');
+      for (const name of await readdir(target)) await scan(path.join(target, name));
+    };
+    await scan(job);
+    const interpretation = path.join(this.#root, '.interpretations', `${testSpecId}.json`);
+    try { await scan(interpretation); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
 
   /** Explicit operator sweep. Only expired artifacts created inside this private root are removed. */
