@@ -161,11 +161,22 @@ test('authored ambiguity requires matching independently grounded reason and sou
 });
 
 test('agreed unsupported operations and exclusions preserve distinct non-QA stops', async () => {
-  const unsupported = spec(activate('Tap')); const g = unsupported.steps[0] as ActionGoalV2;
+  const unsupported = spec(activate('Drag')); const g = unsupported.steps[0] as ActionGoalV2;
   g.obligations.push({ id: 'u', kind: 'unsupported_operation', sourceSegmentIds: ['p0'] }); g.sourceAccounting[0]!.obligationIds.push('u');
   expect((await run(unsupported)).result).toMatchObject({ kind: 'rejected', stop: { code: 'UNSUPPORTED_AUTHORED_OPERATION', category: 'unsupported_operation' } });
   const negative = spec(activate()); const n = (negative.steps[0] as ActionGoalV2).obligations.find((item) => item.kind === 'constraint')!; n.polarity = 'negative';
   expect((await run(negative)).result).toMatchObject({ kind: 'rejected', stop: { code: 'UNSUPPORTED_AUTHORED_CONSTRAINT', category: 'unsupported_constraint' } });
+});
+
+test('both active prompts distinguish state verification from mutation without phrase dispatch', () => {
+  for (const instruction of [ACTION_V2_PRIMARY_SYSTEM_INSTRUCTION, ACTION_V2_INDEPENDENT_SYSTEM_INSTRUCTION]) {
+    expect(instruction).toContain('ActionGoals request a mutation or intervention');
+    expect(instruction).toContain('VerificationGoals request an observation or assertion');
+    expect(instruction).toContain('Checking resulting URL/location after navigation or activation');
+    expect(instruction).toContain('unsupported_operation for genuinely requested unsupported mutations');
+    expect(instruction).toContain('trusted neutral framing');
+    expect(instruction.length).toBeLessThanOrEqual(12_288);
+  }
 });
 
 test('Unicode, quoted literals, repeated occurrences and multistage references use exact bytes and source links', async () => {

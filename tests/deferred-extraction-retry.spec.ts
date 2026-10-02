@@ -79,8 +79,9 @@ test('valid JSON with malformed closed wire schema does not retry', async () => 
 });
 
 test('valid JSON with wrong source accounting does not retry', async () => {
-  const wrong = structuredClone(unspannedWire(draft, 'primary')) as { response: { instructionAccounting: { authoredText: string }[] } };
-  wrong.response.instructionAccounting[0]!.authoredText += 'fabricated';
+  const wrong = structuredClone(unspannedWire(draft, 'primary')) as { response: {
+    steps: { sourceAccounting: { authoredText: string }[] }[] } };
+  wrong.response.steps[0]!.sourceAccounting[0]!.authoredText += 'fabricated';
   const { configured, sent } = models([body(JSON.stringify(wrong))]);
   const result = await interpretDeferredActionTaskV2(request, configured);
   expect(result).toMatchObject({ kind: 'rejected', stop: { stage: 'primary', category: 'structural' },

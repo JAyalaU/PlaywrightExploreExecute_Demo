@@ -54,7 +54,8 @@ export function parseProtectedTraceCaptureBundleV5(input: unknown, traceInput: u
     'V5 missing/abandoned protected facts');
   for (const record of actionRecords) {
     const captured = capture.actions.find((a) => a.recordId === record.recordId);
-    const witness = parseActionGroundingWitnessV1(record.witness);
+    const witness = parseActionGroundingWitnessV1(record.witness,
+      {source:preliminary.source,semanticAdmission:preliminary.semanticAdmission});
     requireFact(!!captured && same(captured.witness, witness) && same(captured.finalCheck, witness.finalCheck) &&
       same(captured.execution, witness.execution) && same(captured.postEffect, witness.postEffect) &&
       same(captured.retirement, record.retirement) &&

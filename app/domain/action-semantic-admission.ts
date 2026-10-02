@@ -17,8 +17,20 @@ export const SemanticAdmissionVersionsV2Schema = z.strictObject({
   primaryPromptVersion: identifier, independentPromptVersion: identifier,
 });
 export type SemanticAdmissionVersionsV2 = z.infer<typeof SemanticAdmissionVersionsV2Schema>;
-/** Native verification first appears in this reviewed extraction/prompt tuple. Older tuples retain their meaning. */
+/** Active extraction/prompt tuple; prior authenticated native tuples retain their own identities. */
 export const NATIVE_OPTION_ADMISSION_VERSIONS_V2 = Object.freeze({ goalContractVersion: '2' as const,
+  primaryExtractionVersion: 'qa_deferred_action_interpretation_v10', independentExtractionVersion: 'qa_deferred_action_source_first_v6',
+  primaryPromptVersion: 'action_v2_primary_p7', independentPromptVersion: 'action_v2_source_first_p7' });
+/** Active PoC: primary semantic extraction plus a fresh fidelity review, not two source extractions. */
+export const POC_SEMANTIC_ADMISSION_VERSIONS_V2 = Object.freeze({ goalContractVersion: '2' as const,
+  primaryExtractionVersion: 'qa_deferred_semantic_poc_primary_v1', independentExtractionVersion: 'qa_deferred_semantic_poc_fidelity_v1',
+  primaryPromptVersion: 'deferred_semantic_poc_primary_p1', independentPromptVersion: 'deferred_semantic_poc_fidelity_p1' });
+/** Previously issued p6 records remain readable, but are not an active provider fallback. */
+export const PREVIOUS_NATIVE_OPTION_P6_ADMISSION_VERSIONS_V2 = Object.freeze({ goalContractVersion: '2' as const,
+  primaryExtractionVersion: 'qa_deferred_action_interpretation_v9', independentExtractionVersion: 'qa_deferred_action_source_first_v5',
+  primaryPromptVersion: 'action_v2_primary_p6', independentPromptVersion: 'action_v2_source_first_p6' });
+/** Previously issued records retain their original prompt identity on authenticated readback. */
+export const PREVIOUS_NATIVE_OPTION_P5_ADMISSION_VERSIONS_V2 = Object.freeze({ goalContractVersion: '2' as const,
   primaryExtractionVersion: 'qa_deferred_action_interpretation_v9', independentExtractionVersion: 'qa_deferred_action_source_first_v5',
   primaryPromptVersion: 'action_v2_primary_p5', independentPromptVersion: 'action_v2_source_first_p5' });
 const PREVIOUS_CANONICAL_NATIVE_OPTION_ADMISSION_VERSIONS_V2 = Object.freeze({ goalContractVersion: '2' as const,
@@ -53,7 +65,10 @@ function stable(value: unknown): string {
 const hash = (value: unknown) => createHash('sha256').update(stable(value)).digest('hex');
 function requireNativeAdmissionVersions(spec: TestSpecV6V2, versions: SemanticAdmissionVersionsV2): void {
   if (spec.steps.some((step) => step.type === 'verification_goal' && 'verificationVersion' in step) &&
+      stable(versions) !== stable(POC_SEMANTIC_ADMISSION_VERSIONS_V2) &&
       stable(versions) !== stable(NATIVE_OPTION_ADMISSION_VERSIONS_V2) &&
+      stable(versions) !== stable(PREVIOUS_NATIVE_OPTION_P6_ADMISSION_VERSIONS_V2) &&
+      stable(versions) !== stable(PREVIOUS_NATIVE_OPTION_P5_ADMISSION_VERSIONS_V2) &&
       stable(versions) !== stable(PREVIOUS_CANONICAL_NATIVE_OPTION_ADMISSION_VERSIONS_V2) &&
       stable(versions) !== stable(PREVIOUS_OFFSETLESS_NATIVE_OPTION_ADMISSION_VERSIONS_V2) &&
       stable(versions) !== stable(PREVIOUS_NATIVE_OPTION_ADMISSION_VERSIONS_V2))
@@ -118,6 +133,7 @@ function goalProjection(goal: ActionGoalV2, stepIndices: ReadonlyMap<string, num
 export function canonicalSemanticProjectionV2(spec: TestSpecV6V2): unknown {
   const stepIndices = new Map(spec.steps.map((step, index) => [step.id, index]));
   return { schemaVersion: spec.schemaVersion, sourceContractVersion: spec.sourceContractVersion,
+    ...(spec.semanticMode ? { semanticMode: spec.semanticMode } : {}),
     sourceInstruction: spec.sourceInstruction,
     steps: spec.steps.map((step) => {
       if (step.type === 'action_goal') return goalProjection(step, stepIndices);
@@ -140,6 +156,35 @@ function validatedExtraction(input: unknown, trustedSource: TrustedSemanticSourc
   } catch { throw new SemanticAdmissionError('INVALID_SOURCE_REPRESENTATION'); }
 }
 
+/** A separate issuer prevents a reviewer verdict from masquerading as an independent extraction. */
+export function admitPocSemanticFidelityV2(trustedInput: TrustedSemanticSourceV2, primaryInput: unknown,
+  reviewerInput: unknown): TrustedSemanticAdmissionV2 {
+  const trustedSource = TrustedSemanticSourceV2Schema.parse(trustedInput);
+  const primary = validatedExtraction(primaryInput, trustedSource);
+  if (primary.semanticMode !== 'poc_v1') throw new SemanticAdmissionError('INVALID_SOURCE_REPRESENTATION');
+  const reviewer = z.strictObject({ verdict: z.enum(['faithful', 'not_faithful']), issues: z.array(z.strictObject({
+    kind: z.enum(['missing_requirement', 'changed_literal', 'changed_polarity', 'changed_order',
+      'invented_requirement', 'unsupported_meaning']),
+    sourceStep: z.number().int().min(1).max(100).nullable(), summary: z.string().min(1).max(160),
+  })).max(8) }).parse(reviewerInput);
+  if (reviewer.verdict !== 'faithful' || reviewer.issues.length)
+    throw new SemanticAdmissionError('SEMANTIC_FIDELITY_MISMATCH');
+  if (primary.steps.some((step) => step.type === 'action_goal' && step.obligations.some((item) => item.kind === 'unsupported_operation')))
+    throw new SemanticAdmissionError('UNSUPPORTED_AUTHORED_OPERATION');
+  if (primary.steps.some((step) => step.type === 'action_goal' && step.obligations.some((item) =>
+    item.kind === 'contrast' || 'polarity' in item && item.polarity === 'negative')))
+    throw new SemanticAdmissionError('UNSUPPORTED_AUTHORED_CONSTRAINT');
+  const projection = canonicalSemanticProjectionV2(primary);
+  const record: SemanticAdmissionRecordV2 = { admissionVersion: '2',
+    sourceDigest: hash(trustedSource.sourceInstruction), trustedMetadataDigest: hash(trustedSource),
+    primaryExtractionDigest: hash(primary), independentExtractionDigest: hash(reviewer),
+    acceptedAccountingObligationDigest: hash(projection), acceptedTestSpecDigest: hash(primary),
+    versions: POC_SEMANTIC_ADMISSION_VERSIONS_V2 };
+  const admission: TrustedSemanticAdmissionV2 = freeze({ [admissionAuthority]: true as const, spec: primary, record });
+  admitted.add(admission);
+  return admission;
+}
+
 /** Pure deterministic gate for two already-produced extractions. No provider call or orchestration. */
 export function admitActionSemanticsV2(trustedInput: TrustedSemanticSourceV2, primaryInput: unknown,
   independentInput: unknown, versionsInput: SemanticAdmissionVersionsV2): TrustedSemanticAdmissionV2 {
@@ -147,6 +192,7 @@ export function admitActionSemanticsV2(trustedInput: TrustedSemanticSourceV2, pr
   const versions = SemanticAdmissionVersionsV2Schema.parse(versionsInput);
   const primary = validatedExtraction(primaryInput, trustedSource);
   const independent = validatedExtraction(independentInput, trustedSource);
+  if (primary.semanticMode || independent.semanticMode) throw new SemanticAdmissionError('INVALID_SOURCE_REPRESENTATION');
   requireNativeAdmissionVersions(primary, versions);
   requireNativeAdmissionVersions(independent, versions);
   const residual = (spec: TestSpecV6V2) => spec.instructionAccounting.some((segment) => segment.classification === 'unresolved') ||
@@ -180,6 +226,33 @@ export function requireTrustedSemanticAdmissionV2(value: TrustedSemanticAdmissio
   if (typeof value !== 'object' || value === null || !admitted.has(value)) invalidSource('UNTRUSTED_SEMANTIC_ADMISSION');
 }
 
+export type PocSemanticValidationContextV2 = TrustedSemanticAdmissionV2 | {
+  source: unknown; semanticAdmission: unknown;
+};
+/** Integrity context for tagged semantic clauses; direct standalone goals have no such context. */
+export function requirePocSemanticGoalContextV2(context: PocSemanticValidationContextV2 | undefined,
+  goal: ActionGoalV2, sourceInstruction: string, admissionDigest: string): void {
+  if (!context) invalidSource('UNTRUSTED_SEMANTIC_SOURCE_MODE');
+  let source: TestSpecV6V2, record: SemanticAdmissionRecordV2;
+  if (admitted.has(context)) {
+    const authority = context as TrustedSemanticAdmissionV2;
+    source = parseTestSpecV6V2(authority.spec);
+    record = SemanticAdmissionRecordV2Schema.parse(authority.record);
+  } else {
+    const candidate = context as { source: unknown; semanticAdmission: unknown };
+    source = parseTestSpecV6V2(candidate.source);
+    record = SemanticAdmissionRecordV2Schema.parse(candidate.semanticAdmission);
+  }
+  if (source.semanticMode !== 'poc_v1' || stable(record.versions) !== stable(POC_SEMANTIC_ADMISSION_VERSIONS_V2) ||
+      source.sourceInstruction !== sourceInstruction || record.sourceDigest !== hash(sourceInstruction) ||
+      record.acceptedTestSpecDigest !== hash(source) || record.trustedMetadataDigest !== hash({
+        testSpecId: source.testSpecId, sourceInstruction: source.sourceInstruction,
+        executionProfileRef: source.executionProfileRef, startState: source.startState }) ||
+      admissionDigest !== hash(record) ||
+      hash(source.steps.find((step) => step.id === goal.id)) !== hash(goal))
+    invalidSource('SEMANTIC_SOURCE_CONTEXT_MISMATCH');
+}
+
 /** Readback needs an existing trusted admission; storage/digest validity alone grants no authority. */
 export function validateSemanticAdmissionReadbackV2(recordInput: unknown, specInput: unknown,
   authority: TrustedSemanticAdmissionV2): TrustedSemanticAdmissionV2 {
@@ -187,6 +260,8 @@ export function validateSemanticAdmissionReadbackV2(recordInput: unknown, specIn
   const record = SemanticAdmissionRecordV2Schema.parse(recordInput);
   const spec = parseTestSpecV6V2(specInput);
   requireNativeAdmissionVersions(spec, record.versions);
+  if ((spec.semanticMode === 'poc_v1') !== (stable(record.versions) === stable(POC_SEMANTIC_ADMISSION_VERSIONS_V2)))
+    invalidSource('SEMANTIC_ADMISSION_MODE_MISMATCH');
   if (stable(record) !== stable(authority.record) || hash(spec) !== authority.record.acceptedTestSpecDigest)
     invalidSource('SEMANTIC_ADMISSION_READBACK_MISMATCH');
   return authority;

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { ProtectedContextFactory, type ProfileCatalog, type ProfileRef, type EffectiveProfile,
   type ProtectedBrowserSession, type ProtectedSessionOptions, type ExternalTargetGate } from '../profile/index.js';
 import { runDeferredActionProductionV1, type DeferredProductionModelsV1 } from '../interpretation/deferred-action-production.js';
-import { createOpenAIActionSemanticExtractionModelsV2 } from '../interpretation/deferred-action-v2-adapters.js';
+import { createOpenAIPocSemanticModels } from '../interpretation/deferred-action-poc-adapters.js';
 import { createOpenAIActionGroundingModelsV1 } from '../interpretation/action-grounding-adapters.js';
 import { createOpenAIVerificationDecisionModel } from '../interpretation/openai-adapters.js';
 import {createOpenAINativeOptionVerificationModelV6} from '../interpretation/native-option-verification-controller.js';
@@ -23,7 +23,7 @@ export async function runDeferredLocalWorkflowV1(request: LocalWorkflowRequest, 
   try {
     if (!options.deferredModels && !dependencies.provider.apiKey()?.trim()) throw new Error('Credential unavailable');
     const mapping = options.deferredModels ? undefined : createOpenAIActionGroundingModelsV1(dependencies.provider);
-    models = options.deferredModels ?? { extraction: createOpenAIActionSemanticExtractionModelsV2(dependencies.provider),
+    models = options.deferredModels ?? { extraction: createOpenAIPocSemanticModels(dependencies.provider),
       grounding: mapping!.primary, independentGrounding: mapping!.independent,
       verification: createOpenAIVerificationDecisionModel(dependencies.provider),nativeVerification:createOpenAINativeOptionVerificationModelV6(dependencies.provider) };
   } catch { throw new LocalWorkflowError('PROVIDER_CONFIGURATION_ERROR'); }

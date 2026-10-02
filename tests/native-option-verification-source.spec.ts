@@ -4,7 +4,9 @@ import { NativeOptionVerificationGoalV2Schema, validateNativeOptionVerificationG
   type NativeOptionVerificationGoalV2 } from '../app/domain/native-option-verification-goal.js';
 import { type TestSpecV6V2, parseTestSpecV6V2 } from '../app/domain/test-spec-v6-v2.js';
 import { VerificationGoalSchema } from '../app/domain/verification-goal.js';
-import { canonicalSemanticProjectionV2, admitActionSemanticsV2, validateSemanticAdmissionReadbackV2 } from '../app/domain/action-semantic-admission.js';
+import { canonicalSemanticProjectionV2, admitActionSemanticsV2, validateSemanticAdmissionReadbackV2,
+  PREVIOUS_NATIVE_OPTION_P5_ADMISSION_VERSIONS_V2,
+  PREVIOUS_NATIVE_OPTION_P6_ADMISSION_VERSIONS_V2 } from '../app/domain/action-semantic-admission.js';
 import { createOpenAIActionSemanticExtractionModelsV2 } from '../app/interpretation/deferred-action-v2-adapters.js';
 import { interpretDeferredActionTaskV2, ACTION_V2_ADMISSION_VERSIONS } from '../app/interpretation/deferred-action-v2-interpret.js';
 import { LegacyPrimaryActionExtractionV2WireSchema, ACTION_V2_PRIMARY_RESPONSE_FORMAT,
@@ -47,7 +49,7 @@ for (const g of [goal(), goal('Verify that Option 2 is selected.', 'Option 2'),
       (independent.instructionAccounting[0]!.stepId = 'other');
     const { outcome, bodies } = await run(spec(g), independent);
     expect(outcome.kind).toBe('accepted'); expect(bodies).toHaveLength(2);
-    expect(bodies.map((body) => body.text.format.name)).toEqual(['qa_deferred_action_interpretation_v9', 'qa_deferred_action_source_first_v5']);
+    expect(bodies.map((body) => body.text.format.name)).toEqual(['qa_deferred_action_interpretation_v10', 'qa_deferred_action_source_first_v6']);
     expect(bodies[1]!.input).toBe(g.sourceText); expect(bodies[1]!.input).not.toContain('claim');
     if (outcome.kind === 'accepted') expect(outcome.admission.record.versions).toEqual(ACTION_V2_ADMISSION_VERSIONS);
   });
@@ -163,6 +165,12 @@ test('native admission and readback reject relabeling the capability with older 
     expect(() => admitActionSemanticsV2(trusted, draft, draft, versions)).toThrow('INVALID_SOURCE_REPRESENTATION');
   }
   const { outcome } = await run(draft); if (outcome.kind !== 'accepted') throw new Error('Expected actual admission');
+  for (const versions of [PREVIOUS_NATIVE_OPTION_P5_ADMISSION_VERSIONS_V2,
+    PREVIOUS_NATIVE_OPTION_P6_ADMISSION_VERSIONS_V2]) {
+    const previous = admitActionSemanticsV2(trusted, draft, structuredClone(draft), versions);
+    expect(validateSemanticAdmissionReadbackV2(previous.record, draft, previous)).toBe(previous);
+  }
+  expect(outcome.admission.record.versions.primaryPromptVersion).toBe('action_v2_primary_p7');
   const record = { ...structuredClone(outcome.admission.record), versions: oldVersions };
   expect(() => validateSemanticAdmissionReadbackV2(record, draft, outcome.admission)).toThrow('INVALID_SOURCE_REPRESENTATION');
   expect(validateSemanticAdmissionReadbackV2(outcome.admission.record, draft, outcome.admission)).toBe(outcome.admission);

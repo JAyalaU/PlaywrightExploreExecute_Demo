@@ -4,7 +4,7 @@ import { candidateGroundingDigest as hash } from '../domain/action-candidate-gro
 import { buildActionObligationHandoffV2 } from '../domain/action-semantic-admission.js';
 import { safeDeferredWorkflowStopCode, type DeferredWorkflowStageV1 } from '../domain/deferred-workflow.js';
 import type { InterpretationRequest } from './interpret.js';
-import { interpretDeferredActionTaskV2, type ActionSemanticExtractionModelsV2 } from './deferred-action-v2-interpret.js';
+import { interpretDeferredActionTaskPoc, type PocSemanticModels } from './deferred-action-poc-interpret.js';
 import type { ActionGroundingModelV5, IndependentGroundingModelV1 } from './action-grounding-controller.js';
 import { executeActionGoalGroundingV1 } from './action-grounding-execution-controller.js';
 import { GoalDirectedVerificationControllerV1, type AgenticVerificationModelV4 } from './verification-strategy.js';
@@ -28,7 +28,7 @@ import {NativeOptionObservationSessionV2} from '../exploration/native-option-obs
 import {NativeOptionVerificationControllerV2,type NativeOptionVerificationModelV6} from './native-option-verification-controller.js';
 
 export interface DeferredProductionModelsV1 {
-  extraction: ActionSemanticExtractionModelsV2;
+  extraction: PocSemanticModels;
   grounding: ActionGroundingModelV5;
   independentGrounding: IndependentGroundingModelV1;
   verification: AgenticVerificationModelV4;
@@ -99,7 +99,7 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
   };
   try {
     cancelled();
-    const interpreted = await interpretDeferredActionTaskV2(request, models.extraction, options);
+    const interpreted = await interpretDeferredActionTaskPoc(request, models.extraction, options);
     cancelled();
     if (interpreted.timing) accounting.interpretationTiming = interpreted.timing;
     if (interpreted.kind !== 'accepted') {

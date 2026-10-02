@@ -38,6 +38,7 @@ test-results*/
 debug.log
 jobs/
 artifacts/
+artifacts/live-debug/
 
 # Python
 __pycache__/

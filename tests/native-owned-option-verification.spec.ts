@@ -68,12 +68,12 @@ async function fixture(html: string, authored: TestSpecV6V2['steps'] = [choose()
   const fetchImpl: typeof fetch = async (_url, init) => {
     const body = JSON.parse(String(init!.body)), format = body.text.format.name as string;
     if(nativeProviderFailure&&format==='agentic_native_option_verification_decision_v6')return new Response(JSON.stringify({error:{message:'PRIVATE_PROVIDER_FAILURE'}}),{status:500});
-    calls.push({ format, input: format.includes('interpretation') || format === 'qa_deferred_action_source_first_v5' ? body.input : JSON.parse(body.input) });
+    calls.push({ format, input: format.includes('interpretation') || format === 'qa_deferred_action_source_first_v6' ? body.input : JSON.parse(body.input) });
     let response: unknown;
-    if (format === 'qa_deferred_action_interpretation_v9' || format === 'qa_deferred_action_source_first_v5') {
+    if (format === 'qa_deferred_action_interpretation_v10' || format === 'qa_deferred_action_source_first_v6') {
       const wire = steps.map(unspannedStep);
       const accounting = forwardInstructionAccounting(instructionAccounting);
-      response = format === 'qa_deferred_action_interpretation_v9' ? { kind: 'extraction', steps: wire, instructionAccounting: accounting } :
+      response = format === 'qa_deferred_action_interpretation_v10' ? { kind: 'extraction', steps: wire, instructionAccounting: accounting } :
         { kind: 'source_extraction', clauses: wire, instructionAccounting: accounting };
       if (overrideExtraction) response = overrideExtraction(response);
     } else if (format === 'qa_action_grounding_v5' || format === 'qa_action_grounding_source_first_v1') {
@@ -138,7 +138,7 @@ test('exact authored public live-gate source completes through a protected loopb
   const result=await f.run();expect(result.kind,JSON.stringify(result)).toBe('success');if(result.kind==='bridge_error')throw Error('bridge');
   expect(result.context.result.terminal.status).toBe('QA_ASSERTION_PASSED');
   expect(result.context.result.executionRunIds).toHaveLength(2);
-  expect(f.calls.slice(0,2).map(call=>call.format)).toEqual(['qa_deferred_action_interpretation_v9','qa_deferred_action_source_first_v5']);
+  expect(f.calls.slice(0,2).map(call=>call.format)).toEqual(['qa_deferred_action_interpretation_v10','qa_deferred_action_source_first_v6']);
   expect(f.calls.slice(0,2).map(call=>call.input)).toEqual([task,task]);
   const trace=await new SuccessfulTraceV5Store(f.root).readSuccessfulExplorationV5(result.context.result.testSpecId,result.context.result.explorationAttemptId!),data=trace.protectedArtifact().trace;
   expect(data.source.sourceInstruction).toBe(task);

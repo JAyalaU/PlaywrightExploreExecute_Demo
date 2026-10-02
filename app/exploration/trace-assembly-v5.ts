@@ -118,7 +118,7 @@ export class SuccessfulTraceAssemblerV5 {
     return step!;
   }
   appendActionGroundingWitness(input: unknown): void {
-    this.#active(); const witness = parseActionGroundingWitnessV1(input);
+    this.#active(); const witness = parseActionGroundingWitnessV1(input, this.#admission);
     this.#step('action_goal', witness.preparation.goalId);
     const runtime = this.#runtime, journal = ActionCandidateGroundingSessionV1.prototype;
     const selected = journal.protectedSuccessfulGroundingWitnesses.call(runtime)[this.#actions.length];

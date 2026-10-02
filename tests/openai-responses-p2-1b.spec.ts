@@ -8,6 +8,11 @@ import {
 import type { OpenAIResponseDiagnostic } from '../app/interpretation/openai-responses.js';
 import { AGENTIC_INTERPRETATION_RESPONSE_FORMAT } from '../app/interpretation/openai-wire.js';
 import { AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT } from '../app/interpretation/verification-wire.js';
+import { POC_FIDELITY_RESPONSE_FORMAT, POC_PRIMARY_RESPONSE_FORMAT } from '../app/interpretation/deferred-action-poc-wire.js';
+import { createOpenAIPocSemanticModels } from '../app/interpretation/deferred-action-poc-adapters.js';
+import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 
 const wireOutput = JSON.stringify({ response: { kind: 'ambiguous', reason: 'unclear' } });
 const completed = (text = wireOutput): Response => new Response(JSON.stringify({
@@ -196,4 +201,142 @@ test('provider diagnostics do not emit on a successful structured response', asy
     fetchImpl: (async () => completed()) as typeof fetch });
   expect((await client.complete(request())).kind).toBe('completed');
   expect(events).toEqual([]);
+});
+
+const liveDebugRoot = resolve('artifacts', 'live-debug');
+
+async function withLiveDebugFlags<T>(live: string | undefined, debug: string | undefined,
+  run: () => Promise<T>): Promise<T> {
+  const previousLive = process.env.PLAYWRIGHT_DEMO_LIVE_LLM_TESTS;
+  const previousDebug = process.env.PLAYWRIGHT_DEMO_LIVE_LLM_DEBUG;
+  if (live === undefined) delete process.env.PLAYWRIGHT_DEMO_LIVE_LLM_TESTS;
+  else process.env.PLAYWRIGHT_DEMO_LIVE_LLM_TESTS = live;
+  if (debug === undefined) delete process.env.PLAYWRIGHT_DEMO_LIVE_LLM_DEBUG;
+  else process.env.PLAYWRIGHT_DEMO_LIVE_LLM_DEBUG = debug;
+  try { return await run(); }
+  finally {
+    if (previousLive === undefined) delete process.env.PLAYWRIGHT_DEMO_LIVE_LLM_TESTS;
+    else process.env.PLAYWRIGHT_DEMO_LIVE_LLM_TESTS = previousLive;
+    if (previousDebug === undefined) delete process.env.PLAYWRIGHT_DEMO_LIVE_LLM_DEBUG;
+    else process.env.PLAYWRIGHT_DEMO_LIVE_LLM_DEBUG = previousDebug;
+  }
+}
+
+function ownedProviderErrorArtifacts(model: string): string[] {
+  if (!existsSync(liveDebugRoot)) return [];
+  return readdirSync(liveDebugRoot).map((name) => resolve(liveDebugRoot, name)).filter((path) => {
+    if (!path.startsWith(`${liveDebugRoot}${sep}`) || !existsSync(resolve(path, 'provider-error.json'))) return false;
+    try { return JSON.parse(readFileSync(resolve(path, 'provider-error.json'), 'utf8')).model === model; }
+    catch { return false; }
+  });
+}
+
+function cleanupOwnedProviderErrorArtifacts(model: string): void {
+  for (const path of ownedProviderErrorArtifacts(model)) {
+    if (path.startsWith(`${liveDebugRoot}${sep}`)) rmSync(path, { recursive: true, force: true });
+  }
+}
+
+test('live provider HTTP errors record only bounded known envelope fields with both explicit gates', async () => {
+  const model = `debug-${randomUUID()}`;
+  const secret = 'test-api-key-never-persist';
+  const cases = [
+    { status: 400, format: POC_PRIMARY_RESPONSE_FORMAT, error: { type: 'invalid_request_error', code: 'invalid_schema',
+      param: 'text.format', message: 'Invalid JSON schema' } },
+    { status: 401, format: POC_FIDELITY_RESPONSE_FORMAT, error: { type: 'authentication_error', code: 'invalid_api_key',
+      param: null, message: `Authorization: Bearer ${secret}` } },
+    { status: 429, format: POC_FIDELITY_RESPONSE_FORMAT, error: { type: 'rate_limit_error', code: 'rate_limit_exceeded',
+      param: null, message: 'Rate limit reached' } },
+  ] as const;
+  try {
+    for (const [live, debug] of [[undefined, undefined], ['1', undefined], [undefined, '1']] as const) {
+      const client = createOpenAIResponsesClient({ apiKey: () => secret, model,
+        fetchImpl: (async () => new Response(JSON.stringify({ error: cases[0]!.error }),
+          { status: 400, headers: { 'Set-Cookie': `private=${secret}` } })) as typeof fetch });
+      expect(await withLiveDebugFlags(live, debug, () => client.complete(request(POC_PRIMARY_RESPONSE_FORMAT))))
+        .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+      expect(ownedProviderErrorArtifacts(model)).toEqual([]);
+    }
+    await withLiveDebugFlags('1', '1', async () => {
+      for (const sample of cases) {
+        const events: OpenAIResponseDiagnostic[] = [];
+        const client = createOpenAIResponsesClient({ apiKey: () => secret, model,
+          diagnostic: (event) => events.push(event),
+          fetchImpl: (async () => new Response(JSON.stringify({ error: sample.error,
+            private_body: secret }), { status: sample.status,
+            headers: { Authorization: `Bearer ${secret}`, Cookie: 'private-cookie' } })) as typeof fetch });
+        expect(await client.complete(request(sample.format)))
+          .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+        expect(events).toMatchObject([{ kind: 'provider_failure', source: 'http_status',
+          code: 'PROVIDER_ERROR', httpStatus: sample.status }]);
+        expect(JSON.stringify(events)).not.toContain('invalid_schema');
+      }
+    });
+    const artifacts = ownedProviderErrorArtifacts(model);
+    expect(artifacts).toHaveLength(3);
+    const diagnostics = artifacts.map((path) => JSON.parse(readFileSync(resolve(path, 'provider-error.json'), 'utf8')));
+    for (const sample of cases) {
+      const diagnostic = diagnostics.find((item) => item.httpStatus === sample.status);
+      expect(diagnostic).toMatchObject({ source: 'http_status', responseFormat: sample.format.name,
+        model, httpStatus: sample.status, providerResponseState: 'unavailable' });
+      expect(typeof diagnostic.elapsedMs).toBe('number');
+      expect(diagnostic.error?.type).toBe(sample.error.type);
+      expect(diagnostic.error?.code).toBe(sample.error.code);
+    }
+    expect(diagnostics.find((item) => item.httpStatus === 400)?.error).toMatchObject({
+      param: 'text.format', message: 'Invalid JSON schema' });
+    expect(diagnostics.find((item) => item.httpStatus === 401)?.error).not.toHaveProperty('message');
+    const persisted = artifacts.map((path) => readFileSync(resolve(path, 'provider-error.json'), 'utf8')).join('\n');
+    expect(persisted).not.toContain(secret);
+    expect(persisted).not.toContain('Authorization');
+    expect(persisted).not.toContain('Bearer');
+    expect(persisted).not.toContain('Cookie');
+    expect(persisted).not.toContain('private_body');
+  } finally { cleanupOwnedProviderErrorArtifacts(model); }
+});
+
+test('non-JSON 5xx body is never persisted and PoC public failure mapping remains unchanged', async () => {
+  const model = `debug-${randomUUID()}`;
+  const secret = 'test-api-key-never-persist';
+  try {
+    await withLiveDebugFlags('1', '1', async () => {
+      const config = { apiKey: () => secret, model,
+        fetchImpl: (async () => new Response(`private raw body ${secret}`, { status: 503 })) as typeof fetch };
+      const client = createOpenAIResponsesClient(config);
+      expect(await client.complete(request(POC_PRIMARY_RESPONSE_FORMAT)))
+        .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+      const adapter = createOpenAIPocSemanticModels(config);
+      await expect(adapter.primary.complete({ systemInstruction: 'Test instruction',
+        userInstruction: 'Select Save.', signal: new AbortController().signal }))
+        .rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
+    });
+    const artifacts = ownedProviderErrorArtifacts(model);
+    expect(artifacts).toHaveLength(2);
+    for (const path of artifacts) {
+      const diagnostic = JSON.parse(readFileSync(resolve(path, 'provider-error.json'), 'utf8'));
+      expect(diagnostic).toMatchObject({ source: 'http_status', httpStatus: 503,
+        responseFormat: POC_PRIMARY_RESPONSE_FORMAT.name, model, providerResponseState: 'unavailable' });
+      expect(diagnostic).not.toHaveProperty('error');
+      expect(JSON.stringify(diagnostic)).not.toContain(secret);
+      expect(JSON.stringify(diagnostic)).not.toContain('private raw body');
+    }
+  } finally { cleanupOwnedProviderErrorArtifacts(model); }
+});
+
+test('completed HTTP response with provider error records its closed state without changing public code', async () => {
+  const model = `debug-${randomUUID()}`;
+  try {
+    const client = createOpenAIResponsesClient({ apiKey: () => 'test-secret', model,
+      fetchImpl: (async () => new Response(JSON.stringify({ status: 'failed',
+        error: { type: 'server_error', code: 'model_error', param: null, message: 'Generation failed' },
+        output: [] }), { status: 200 })) as typeof fetch });
+    expect(await withLiveDebugFlags('1', '1', () => client.complete(request(POC_PRIMARY_RESPONSE_FORMAT))))
+      .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+    const [path] = ownedProviderErrorArtifacts(model);
+    expect(path).toBeTruthy();
+    expect(JSON.parse(readFileSync(resolve(path!, 'provider-error.json'), 'utf8'))).toMatchObject({
+      source: 'provider_response', httpStatus: 200, providerResponseState: 'unavailable',
+      error: { type: 'server_error', code: 'model_error', message: 'Generation failed' },
+    });
+  } finally { cleanupOwnedProviderErrorArtifacts(model); }
 });

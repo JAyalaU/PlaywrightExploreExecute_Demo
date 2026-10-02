@@ -22,9 +22,28 @@ import { parseResultRecordV2 } from '../app/domain/agentic-result-v2.js';
 import { ACTION_GROUNDING_RESPONSE_FORMAT, ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT } from '../app/interpretation/action-grounding-wire.js';
 import { Readable } from 'node:stream';
 import { choose } from './helpers/action-v2-fixtures.js';
-import { forwardInstructionAccounting, unspannedStep } from './helpers/deferred-v3-wire.js';
 import { fill, check, select, correspondence } from './helpers/deferred-v9-fixtures.js';
 import type { ActionGoalV2, TestSpecV6V2 } from '../app/domain/index.js';
+
+function pocStep(step: TestSpecV6V2['steps'][number]): unknown {
+  if (step.type === 'navigate') return { id: step.id, type: step.type, url: step.url };
+  if (step.type === 'verification_goal') return 'verificationVersion' in step ?
+    { id: step.id, type: step.type, verificationVersion: '2', optionLabel: step.claim.optionLabel,
+      expectedSelected: step.claim.expectedSelected,
+      controlConstraints: step.claim.controlConstraints.map(({ kind, text }) => ({ kind, text })),
+      dependsOnStepId: step.dependsOnStepId ?? null } :
+    { id: step.id, type: step.type, verificationVersion: null, instruction: step.instruction,
+      subject: step.subject ?? null, intent: step.intent ?? null, dependsOnStepId: step.dependsOnStepId ?? null };
+  const effect = step.obligations.find((o) => o.kind === 'effect');
+  const operation = step.obligations.find((o) => o.kind === 'operation');
+  const argument = step.obligations.find((o) => o.kind === 'argument');
+  return { id: step.id, type: step.type, effect: effect?.kind === 'effect' ? effect.effect : 'activate',
+    explicitOperation: operation?.kind === 'operation' ? operation.operation : null,
+    argument: argument?.kind === 'argument' ? { purpose: argument.purpose, value: argument.authoredText } : null,
+    targetConstraints: step.obligations.flatMap((o) => o.kind === 'constraint' && o.subject.kind === 'target' ?
+      [{ kind: o.constraint, value: o.constraint === 'context' ? 'Country' : o.authoredText,
+        polarity: o.polarity }] : []), dependsOnStepId: null };
+}
 
 test.describe.configure({ mode: 'serial' });
 const gate = 'PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE';
@@ -56,14 +75,12 @@ async function fixture(html: string, authored: TestSpecV6V2['steps'] = [choose()
   let malformedPrimaryOnce = false;
   const fetchImpl: typeof fetch = async (_url, init) => {
     const body = JSON.parse(String(init!.body)), format = body.text.format.name as string;
-    calls.push({ format, input: format.includes('interpretation') || format === 'qa_deferred_action_source_first_v5' ? body.input : JSON.parse(body.input) });
+    calls.push({ format, input: format === 'qa_deferred_semantic_poc_primary_v1' ? body.input : JSON.parse(body.input) });
     let response: unknown;
-    if (format === 'qa_deferred_action_interpretation_v9' || format === 'qa_deferred_action_source_first_v5') {
-      const wire = steps.map(unspannedStep);
-      const accounting = forwardInstructionAccounting(instructionAccounting);
-      response = format === 'qa_deferred_action_interpretation_v9' ? { kind: 'extraction', steps: wire, instructionAccounting: accounting } :
-        { kind: 'source_extraction', clauses: wire, instructionAccounting: accounting };
-      if (overrideExtraction) response = overrideExtraction(response);
+    if (format === 'qa_deferred_semantic_poc_primary_v1' || format === 'qa_deferred_semantic_poc_fidelity_v1') {
+      response = format === 'qa_deferred_semantic_poc_primary_v1' ?
+        { kind: 'extraction', steps: steps.map(pocStep) } : { verdict: 'faithful', issues: [] };
+      if (overrideExtraction && format === 'qa_deferred_semantic_poc_primary_v1') response = overrideExtraction(response);
     } else if (format === 'qa_action_grounding_v5' || format === 'qa_action_grounding_source_first_v1') {
       const context = JSON.parse(body.input), goal = context.goal as ActionGoalV2;
       if (format === 'qa_action_grounding_source_first_v1') { expect(context).not.toHaveProperty('priorCandidate'); expect(context).not.toHaveProperty('lastReason'); expect(context).not.toHaveProperty('decision'); }
@@ -77,7 +94,7 @@ async function fixture(html: string, authored: TestSpecV6V2['steps'] = [choose()
         comparison: { kind: 'count', operator: 'equal', observationId: observation.observationId, expected: 1 } } :
         { decisionVersion: '4', kind: 'observe', request: { kind: 'semantic_query', query: { role: 'dialog', name: 'Notice', within: null, frame: { kind: 'main' } } } };
     } else throw new Error('Unexpected legacy provider format');
-    const modelText = malformedPrimaryOnce && format === 'qa_deferred_action_interpretation_v9' &&
+    const modelText = malformedPrimaryOnce && format === 'qa_deferred_semantic_poc_primary_v1' &&
       calls.filter(call => call.format === format).length === 1 ? '{' : JSON.stringify({ response });
     return new Response(JSON.stringify({ status: 'completed', output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: modelText }] }] }), { status: 200 });
   };
@@ -104,8 +121,9 @@ for (const kind of ['choice', 'country', 'fill', 'checkbox', 'radio'] as const) 
     const response = await f.run(); expect(response.kind, JSON.stringify(response)).toBe('typed_stop'); if (response.kind === 'bridge_error') throw new Error('Bridge');
     expect(response.context.result.terminal.status).toBe('EXECUTION_REPRODUCED'); expect(response.context.result.deferredReplay?.runnerVersion).toBe('9');
     expect(response.context.result.executionRunIds).toHaveLength(2); expect(response.context.result.deferredReplay?.executionSessionIds).toHaveLength(2);
-    expect(f.calls.slice(0, 2).map(c => c.format)).toEqual(['qa_deferred_action_interpretation_v9', 'qa_deferred_action_source_first_v5']);
-    expect(f.calls.slice(0, 2).map(c => c.input)).toEqual([f.request.taskText, f.request.taskText]);
+    expect(f.calls.slice(0, 2).map(c => c.format)).toEqual(['qa_deferred_semantic_poc_primary_v1', 'qa_deferred_semantic_poc_fidelity_v1']);
+    expect(f.calls[0]!.input).toBe(f.request.taskText);
+    expect(f.calls[1]!.input).toMatchObject({ originalInstruction: f.request.taskText, testSpec: { steps: expect.any(Array) } });
     const projection = await projectStoredWorkflowReportV2({ reportProjectionVersion: '2', result: response }, f.config);
     expect(projection.kind).toBe('available'); expect(projection).not.toHaveProperty('authoritativeQa');
     for (const secret of ['Option 1', 'runtime-1', 'exact text', 'PRIVATE_BROWSER_TEXT', 'sourceInstruction', 'predicate', 'actual', 'expected']) expect(JSON.stringify(projection)).not.toContain(secret);
@@ -119,8 +137,8 @@ test('successful malformed-primary retry persists authenticated private attempts
     if (response.kind === 'bridge_error') throw new Error('Bridge');
     expect(response.context.result.terminal.status).toBe('EXECUTION_REPRODUCED');
     expect(f.calls.slice(0, 3).map(call => call.format)).toEqual([
-      'qa_deferred_action_interpretation_v9', 'qa_deferred_action_interpretation_v9',
-      'qa_deferred_action_source_first_v5']);
+      'qa_deferred_semantic_poc_primary_v1', 'qa_deferred_semantic_poc_primary_v1',
+      'qa_deferred_semantic_poc_fidelity_v1']);
     expect(f.calls[1]!.input).toBe(f.calls[0]!.input);
     const file = path.join(f.root, 'deferred-interpretation-attempt-v1',
       response.context.result.testSpecId, 'attempts.json');
@@ -178,7 +196,7 @@ test('two eligible dropdowns stop NON_UNIQUE before mutation or compile', async 
   } finally { ProtectedContextFactory.prototype.open = original; await f.close(); }
 });
 test('malformed extraction is durably rejected before browser creation and cannot forge stop authority', async () => {
-  const f = await fixture(select); f.extractionOverride(() => ({ kind: 'extraction', steps: [], instructionAccounting: [] }));
+  const f = await fixture(select); f.extractionOverride(() => ({ kind: 'extraction', steps: [] }));
   try {
     const response = await f.run(); if (response.kind === 'bridge_error') throw new Error('Bridge');
     expect(response.context.result.deferredStage?.category).toBe('structural'); expect(response.context.result.cleanup).toBe('not_started'); expect(response.context.result).not.toHaveProperty('explorationAttemptId');

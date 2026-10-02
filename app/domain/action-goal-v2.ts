@@ -40,6 +40,8 @@ export type ActionSourceSegmentV2 = z.infer<typeof ActionSourceSegmentV2Schema>;
 
 export const ActionGoalV2Schema = z.strictObject({
   id: identifier, type: z.literal('action_goal'), goalVersion: z.literal('2'), sourceStepId: identifier,
+  /** PoC semantic-source artifacts carry an internally checked semantic clause, not an authored substring. */
+  sourceMode: z.literal('semantic_poc').optional(),
   sourceText: authoredText, sourceInstructionSpan: SourceSpanSchema,
   sourceAccounting: z.array(ActionSourceSegmentV2Schema).min(1).max(256),
   anchors: z.array(z.strictObject({ id: identifier, sourceSegmentIds: references, authoredText })).max(24),
@@ -71,8 +73,11 @@ const allowedOwners: Record<ActionObligationV2['kind'], readonly ActionSourceSeg
 
 /** Mechanical proof only: never interprets ordinary English, role words or connective wording. */
 export function validateActionGoalV2(goal: ActionGoalV2, sourceInstruction: string,
-  previousSteps: readonly { id: string; type: string; obligations?: readonly ActionObligationV2[] }[] = []): void {
-  exactSourceSpan(sourceInstruction, goal.sourceInstructionSpan, goal.sourceText);
+  previousSteps: readonly { id: string; type: string; obligations?: readonly ActionObligationV2[] }[] = [],
+  context: { semanticPocSourceValidated: true } | undefined = undefined): void {
+  if (goal.sourceMode === 'semantic_poc') {
+    if (!context?.semanticPocSourceValidated) invalidSource('UNTRUSTED_SEMANTIC_SOURCE_MODE');
+  } else exactSourceSpan(sourceInstruction, goal.sourceInstructionSpan, goal.sourceText);
   if (goal.sourceStepId !== goal.id) invalidSource('ACTION_LINKAGE_MISMATCH');
   uniqueIds(goal.sourceAccounting.map((segment) => segment.id), 'DUPLICATE_SEGMENT_ID');
   uniqueIds(goal.obligations.map((obligation) => obligation.id), 'DUPLICATE_OBLIGATION_ID');

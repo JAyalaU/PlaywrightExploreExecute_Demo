@@ -70,17 +70,27 @@ export function unspannedWireV4(spec: TestSpecV6V2, kind: 'primary' | 'independe
 }
 export function unspannedStep(step: Step): unknown {
   const base = unspannedStepV4(step) as Record<string, unknown>;
+  if (step.type === 'navigate' || step.type === 'verification_goal' && !('verificationVersion' in step))
+    return { ...base, sourceText: step.sourceText };
   if (step.type !== 'action_goal') return base;
   const { sourceStepId: _sourceStepId, ...goal } = base;
   return { ...goal, sourceAccounting: (goal.sourceAccounting as Record<string, unknown>[]).map(
     ({ obligationIds: _owners, ...segment }) => segment) };
 }
 export function forwardInstructionAccounting(accounting: TestSpecV6V2['instructionAccounting']): unknown[] {
-  return accounting.map((item) => {
-    const { sourceSpan: _span, ...segment } = item;
-    if (segment.classification !== 'clause') return segment;
-    const { stepId: _stepId, ...clause } = segment;
-    return clause;
+  return accounting.filter((item, index) => !(item.classification === 'neutral' &&
+    /^[ \t]*(?:\d+[.)]|\(\d+\)|[-*•])[ \t]+$/u.test(item.authoredText) &&
+    (index === 0 || accounting[index - 1]!.authoredText.endsWith('\n')))).filter((item) => {
+    if (item.classification !== 'neutral' || !/^\r?\n$/.test(item.authoredText)) return true;
+    const next = accounting[accounting.indexOf(item) + 1];
+    return !(next?.classification === 'neutral' &&
+      /^[ \t]*(?:\d+[.)]|\(\d+\)|[-*\u2022])[ \t]+$/u.test(next.authoredText));
+  }).map((item) => {
+    if (item.classification !== 'clause') {
+      const { sourceSpan: _span, ...gap } = item;
+      return gap;
+    }
+    return { classification: 'clause' };
   });
 }
 export function unspannedWire(spec: TestSpecV6V2, kind: 'primary' | 'independent'): unknown {

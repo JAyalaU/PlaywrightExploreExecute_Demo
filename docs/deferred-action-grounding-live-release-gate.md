@@ -129,10 +129,10 @@ Source and semantic admission
   VerificationGoal version: 2
   TestSpec ID:
   Source digest:
-  Primary extraction format: qa_deferred_action_interpretation_v9
-  Independent source-first format: qa_deferred_action_source_first_v5
-  Primary prompt version: action_v2_primary_p5
-  Independent source-first prompt version: action_v2_source_first_p5
+  Primary extraction format: qa_deferred_action_interpretation_v10
+  Independent source-first format: qa_deferred_action_source_first_v6
+  Primary prompt version: action_v2_primary_p7
+  Independent source-first prompt version: action_v2_source_first_p7
   Native verification decision format: agentic_native_option_verification_decision_v6
   Native verification decision version: 6
   Native observation / strategy / comparison / resolved assertion versions: 2 / 2 / 2 / 2

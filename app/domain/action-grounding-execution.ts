@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { candidateGroundingDigest as hash } from './action-candidate-grounding.js';
 import { PreparedActionGroundingV1Schema, parsePreparedActionGroundingV1 } from './action-grounding-strategy.js';
+import type { PocSemanticValidationContextV2 } from './action-semantic-admission.js';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -75,9 +76,11 @@ export const ActionGroundingWitnessV1Schema = z.strictObject({
 });
 export type ActionGroundingWitnessV1 = z.infer<typeof ActionGroundingWitnessV1Schema>;
 /** Integrity only. Successful origin requires exact private runtime journal readback. */
-export function parseActionGroundingWitnessV1(input: unknown): ActionGroundingWitnessV1 {
+export function parseActionGroundingWitnessV1(input: unknown,
+  semanticContext?: PocSemanticValidationContextV2): ActionGroundingWitnessV1 {
   const record = ActionGroundingWitnessV1Schema.parse(input), { witnessDigest, ...data } = record;
-  const original = parsePreparedActionGroundingV1(record.preparation), check = parsePreparedActionGroundingV1(record.finalCheck);
+  const original = parsePreparedActionGroundingV1(record.preparation, semanticContext),
+    check = parsePreparedActionGroundingV1(record.finalCheck, semanticContext);
   const execution = parseActionExecutionAttemptV1(record.execution), post = parseActionPostEffectV1(record.postEffect);
   const { witnessDigest: postDigest, ...postData } = post;
   const parent = check.candidateObservation, effect = post.effect;

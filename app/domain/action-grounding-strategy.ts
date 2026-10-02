@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { ActionObligationV2Schema, ActionGoalV2Schema, validateActionGoalV2, exactSourceSpan, type ActionGoalV2 } from './action-goal-v2.js';
 import { SourceSpanSchema } from './action-goal.js';
 import { ActionCandidateRoleV1Schema, ActionCandidateObservationV1Schema, parseActionCandidateObservationV1, candidateGroundingDigest as hash } from './action-candidate-grounding.js';
-import { buildActionObligationHandoffV2, requireTrustedSemanticAdmissionV2, type TrustedSemanticAdmissionV2 } from './action-semantic-admission.js';
+import { buildActionObligationHandoffV2, requirePocSemanticGoalContextV2, requireTrustedSemanticAdmissionV2,
+  type PocSemanticValidationContextV2, type TrustedSemanticAdmissionV2 } from './action-semantic-admission.js';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -139,10 +140,14 @@ export const PreparedActionGroundingV1Schema = z.strictObject({
   observedAt: z.iso.datetime(), expiresAt: z.iso.datetime(), witnessDigest: digest,
 });
 export type PreparedActionGroundingV1 = z.infer<typeof PreparedActionGroundingV1Schema>;
-export function parsePreparedActionGroundingV1(input: unknown): PreparedActionGroundingV1 {
+export function parsePreparedActionGroundingV1(input: unknown,
+  semanticContext?: PocSemanticValidationContextV2): PreparedActionGroundingV1 {
   const record = PreparedActionGroundingV1Schema.parse(input), { witnessDigest, ...data } = record;
   const parent = parseActionCandidateObservationV1(record.candidateObservation);
-  validateActionGoalV2(record.sourceGoal, record.sourceInstruction);
+  if (record.sourceGoal.sourceMode === 'semantic_poc')
+    requirePocSemanticGoalContextV2(semanticContext, record.sourceGoal, record.sourceInstruction, record.admissionDigest);
+  validateActionGoalV2(record.sourceGoal, record.sourceInstruction, [],
+    record.sourceGoal.sourceMode === 'semantic_poc' ? { semanticPocSourceValidated: true } : undefined);
   validateGoalCorrespondence(record.sourceGoal, record.correspondence);
   const ids = parent.request.handoff.goals.find((g) => g.goalId === record.goalId)?.obligationIds ?? [];
   const entries = record.correspondence, effect = entries.find((e) => e.obligation.kind === 'effect')?.obligation;

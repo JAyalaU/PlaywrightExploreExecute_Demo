@@ -44,7 +44,7 @@ test('source-first extraction sees only source and contract while independent fo
   expect(result.outcome.kind).toBe('accepted');
   expect(result.bodies).toHaveLength(2);
   expect(result.bodies.map((body) => (body.text as { format: { name: string } }).format.name)).toEqual([
-    'qa_deferred_action_interpretation_v9', 'qa_deferred_action_source_first_v5',
+    'qa_deferred_action_interpretation_v10', 'qa_deferred_action_source_first_v6',
   ]);
   expect(result.bodies[0]!.input).toBe(second.sourceInstruction);
   expect(result.bodies[1]!.input).toBe(second.sourceInstruction);

@@ -158,6 +158,26 @@ export const IndependentActionExtractionV5WireSchema = z.strictObject({ response
     instructionAccounting: forwardInstructionAccounting }), unspannedAmbiguity, unspannedUnresolved,
 ]) });
 
+// One exact clause copy lives at the step boundary, never again in instructionAccounting.
+const singleSourceSteps = z.array(z.union([
+  unspannedNavigation, ForwardActionGoalV5Schema,
+  unspannedVerification.omit({ instruction: true }), UnspannedNativeVerificationV4Schema,
+])).min(1).max(100);
+const classifiedInstructionAccounting = z.array(z.discriminatedUnion('classification', [
+  z.strictObject({ classification: z.literal('clause') }),
+  z.strictObject({ classification: z.literal('neutral'), authoredText: text }),
+  z.strictObject({ classification: z.literal('unresolved'), authoredText: text,
+    reason: z.enum(['unclassified_material', 'unclear_clause_linkage', 'authored_alternative']) }),
+])).min(1).max(301);
+export const PrimaryActionExtractionV6WireSchema = z.strictObject({ response: z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('extraction'), steps: singleSourceSteps,
+    instructionAccounting: classifiedInstructionAccounting }), unspannedAmbiguity, unspannedUnresolved,
+]) });
+export const IndependentActionExtractionV6WireSchema = z.strictObject({ response: z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('source_extraction'), clauses: singleSourceSteps,
+    instructionAccounting: classifiedInstructionAccounting }), unspannedAmbiguity, unspannedUnresolved,
+]) });
+
 function format(name: string, schema: z.ZodType) {
   const { $schema: _dialect, ...jsonSchema } = z.toJSONSchema(schema, { target: 'draft-7', io: 'input' });
   // Zod discriminated unions are pairwise disjoint by kind/classification, so anyOf is
@@ -167,6 +187,9 @@ function format(name: string, schema: z.ZodType) {
     if (value === null || typeof value !== 'object') return value;
     const node = value as Record<string, unknown>;
     return Object.fromEntries(Object.entries(node).flatMap(([key, child]) => {
+      // PoC-only internal marker is never requested from historical provider formats.
+      if (key === 'properties' && child && typeof child === 'object' && !Array.isArray(child))
+        return [[key, providerSchema(Object.fromEntries(Object.entries(child).filter(([field]) => field !== 'sourceMode')))]];
       if (key === 'format' && child === 'uri') return []; // URL policy is enforced locally.
       if (key === 'const') return [['enum', [child]]];
       if (key === 'exclusiveMinimum' && node.type === 'integer' && typeof child === 'number') return [['minimum', child + 1]];
@@ -184,8 +207,10 @@ export const PREVIOUS_OFFSETLESS_ACTION_V2_PRIMARY_RESPONSE_FORMAT = format('qa_
 export const PREVIOUS_OFFSETLESS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT = format('qa_deferred_action_source_first_v3', IndependentActionExtractionV3WireSchema);
 export const PREVIOUS_CANONICAL_ACTION_V2_PRIMARY_RESPONSE_FORMAT = format('qa_deferred_action_interpretation_v8', PrimaryActionExtractionV4WireSchema);
 export const PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT = format('qa_deferred_action_source_first_v4', IndependentActionExtractionV4WireSchema);
-export const ACTION_V2_PRIMARY_RESPONSE_FORMAT = format('qa_deferred_action_interpretation_v9', PrimaryActionExtractionV5WireSchema);
-export const ACTION_V2_INDEPENDENT_RESPONSE_FORMAT = format('qa_deferred_action_source_first_v5', IndependentActionExtractionV5WireSchema);
+export const PREVIOUS_FORWARD_ACTION_V2_PRIMARY_RESPONSE_FORMAT = format('qa_deferred_action_interpretation_v9', PrimaryActionExtractionV5WireSchema);
+export const PREVIOUS_FORWARD_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT = format('qa_deferred_action_source_first_v5', IndependentActionExtractionV5WireSchema);
+export const ACTION_V2_PRIMARY_RESPONSE_FORMAT = format('qa_deferred_action_interpretation_v10', PrimaryActionExtractionV6WireSchema);
+export const ACTION_V2_INDEPENDENT_RESPONSE_FORMAT = format('qa_deferred_action_source_first_v6', IndependentActionExtractionV6WireSchema);
 
 function normalizeSteps(input: z.infer<typeof steps>) {
   return input.map((step) => {
@@ -225,6 +250,100 @@ function partition(source: string, segments: readonly { authoredText: string }[]
   });
   if (cursor !== source.length) invalidSource('INCOMPLETE_ORDERED_SOURCE_RECONSTRUCTION');
   return spans;
+}
+
+/** List syntax at the start of an authored line is source framing, not model-owned clause text. */
+function listFraming(source: string): { start: number; authoredText: string }[] {
+  const markers: { start: number; authoredText: string }[] = [];
+  let lineStart = 0;
+  while (lineStart < source.length) {
+    const lineEnd = source.indexOf('\n', lineStart);
+    const end = lineEnd < 0 ? source.length : lineEnd;
+    const line = source.slice(lineStart, end);
+    const marker = /^[ \t]*(?:\d+[.)]|\(\d+\)|[-*•])[ \t]+/u.exec(line)?.[0];
+    if (marker && line.slice(marker.length).trim()) markers.push({ start: lineStart, authoredText: marker });
+    if (lineEnd < 0) break;
+    lineStart = lineEnd + 1;
+  }
+  return markers;
+}
+
+/** Provider segments must account for every non-framing byte; they cannot absorb or repair a marker. */
+function trustedFramedInstructionAccounting(source: string,
+  segments: z.infer<typeof forwardInstructionAccounting>): z.infer<typeof forwardInstructionAccounting> {
+  const markers = listFraming(source);
+  const accounted: z.infer<typeof forwardInstructionAccounting> = [];
+  let cursor = 0, markerIndex = 0;
+  const insertMarker = () => {
+    const marker = markers[markerIndex]!;
+    if (marker.start !== cursor) return false;
+    exactSourceSpan(source, { start: cursor, end: cursor + marker.authoredText.length }, marker.authoredText);
+    accounted.push({ classification: 'neutral', authoredText: marker.authoredText });
+    cursor += marker.authoredText.length;
+    markerIndex++;
+    return true;
+  };
+  for (const segment of segments) {
+    while (markerIndex < markers.length && insertMarker()) { /* Trusted framing before this segment. */ }
+    const end = cursor + segment.authoredText.length;
+    if (markerIndex < markers.length && markers[markerIndex]!.start < end)
+      invalidSource('SPAN_OR_LITERAL_MISMATCH');
+    exactSourceSpan(source, { start: cursor, end }, segment.authoredText);
+    accounted.push(segment);
+    cursor = end;
+  }
+  while (markerIndex < markers.length && insertMarker()) { /* Trusted trailing framing. */ }
+  if (cursor !== source.length || markerIndex !== markers.length)
+    invalidSource('INCOMPLETE_ORDERED_SOURCE_RECONSTRUCTION');
+  return accounted;
+}
+
+/** A line break immediately before a recognized list marker is trusted list framing too. */
+function listAndLineFraming(source: string): { start: number; authoredText: string }[] {
+  return listFraming(source).flatMap((marker) => {
+    const newlineEnd = marker.start;
+    if (newlineEnd === 0 || source[newlineEnd - 1] !== '\n') return [marker];
+    const newlineStart = source[newlineEnd - 2] === '\r' ? newlineEnd - 2 : newlineEnd - 1;
+    return [{ start: newlineStart, authoredText: source.slice(newlineStart, newlineEnd) }, marker];
+  });
+}
+
+/** Sequential exact reconstruction from one step clause copy plus any non-clause gaps. */
+function trustedClassifiedInstructionAccounting(source: string, stepsInput: z.infer<typeof singleSourceSteps>,
+  segments: z.infer<typeof classifiedInstructionAccounting>): z.infer<typeof forwardInstructionAccounting> {
+  const markers = listAndLineFraming(source);
+  const accounted: z.infer<typeof forwardInstructionAccounting> = [];
+  let cursor = 0, markerIndex = 0, clauseIndex = 0;
+  const insertMarkers = () => {
+    while (markerIndex < markers.length && markers[markerIndex]!.start === cursor) {
+      const marker = markers[markerIndex++]!;
+      exactSourceSpan(source, { start: cursor, end: cursor + marker.authoredText.length }, marker.authoredText);
+      accounted.push({ classification: 'neutral', authoredText: marker.authoredText });
+      cursor += marker.authoredText.length;
+    }
+  };
+  for (const segment of segments) {
+    insertMarkers();
+    let authoredText: string;
+    if (segment.classification === 'clause') {
+      const step = stepsInput[clauseIndex++];
+      if (!step) invalidSource('CLAUSE_OWNERSHIP_OR_ORDER');
+      authoredText = step.type === 'action_goal' ? step.sourceAccounting.map((item) => item.authoredText).join('') :
+        step.type === 'verification_goal' && 'verificationVersion' in step ?
+          step.claim.claimAccounting.map((item) => item.authoredText).join('') : step.sourceText;
+    } else authoredText = segment.authoredText;
+    const end = cursor + authoredText.length;
+    if (end <= cursor || end > source.length ||
+        markerIndex < markers.length && markers[markerIndex]!.start < end)
+      invalidSource('SPAN_OR_LITERAL_MISMATCH');
+    exactSourceSpan(source, { start: cursor, end }, authoredText);
+    accounted.push({ ...segment, authoredText });
+    cursor = end;
+  }
+  insertMarkers();
+  if (cursor !== source.length || markerIndex !== markers.length || clauseIndex !== stepsInput.length)
+    invalidSource('INCOMPLETE_ORDERED_SOURCE_RECONSTRUCTION');
+  return accounted;
 }
 
 function normalizeUnspannedExtraction(source: string, input: {
@@ -384,20 +503,18 @@ export function normalizeIndependentActionExtractionV4Wire(input: unknown, trust
     normalizeUnspannedDecision(trustedSource, response);
 }
 
-function normalizeForwardExtraction(source: string, input: {
-  steps: z.infer<typeof forwardSteps>; instructionAccounting: z.infer<typeof forwardInstructionAccounting>;
-}): string {
+function normalizeForwardExtractionFromAccounting(source: string, stepsInput: z.infer<typeof forwardSteps>,
+  sourceAccounting: z.infer<typeof forwardInstructionAccounting>): string {
   // Exact source order supplies the clause-to-step index; it never searches for a matching clause.
-  partition(source, input.instructionAccounting);
   let clauseIndex = 0;
-  const instructionAccounting = input.instructionAccounting.map((segment) => {
+  const instructionAccounting = sourceAccounting.map((segment) => {
     if (segment.classification !== 'clause') return segment;
-    const step = input.steps[clauseIndex++];
+    const step = stepsInput[clauseIndex++];
     if (!step) invalidSource('CLAUSE_OWNERSHIP_OR_ORDER');
     return { ...segment, stepId: step.id };
   });
-  if (clauseIndex !== input.steps.length) invalidSource('CLAUSE_OWNERSHIP_OR_ORDER');
-  const stepsWithReverseOwnership = input.steps.map((step) => {
+  if (clauseIndex !== stepsInput.length) invalidSource('CLAUSE_OWNERSHIP_OR_ORDER');
+  const stepsWithReverseOwnership = stepsInput.map((step) => {
     if (step.type !== 'action_goal') return step;
     uniqueIds(step.sourceAccounting.map((segment) => segment.id), 'DUPLICATE_SEGMENT_ID');
     uniqueIds(step.obligations.map((obligation) => obligation.id), 'DUPLICATE_OBLIGATION_ID');
@@ -429,6 +546,25 @@ function normalizeForwardExtraction(source: string, input: {
     instructionAccounting: unspannedInstructionAccounting.parse(instructionAccounting) });
 }
 
+function normalizeForwardExtraction(source: string, input: {
+  steps: z.infer<typeof forwardSteps>; instructionAccounting: z.infer<typeof forwardInstructionAccounting>;
+}): string {
+  return normalizeForwardExtractionFromAccounting(source, input.steps,
+    trustedFramedInstructionAccounting(source, input.instructionAccounting));
+}
+
+function normalizeClassifiedExtraction(source: string, input: {
+  steps: z.infer<typeof singleSourceSteps>; instructionAccounting: z.infer<typeof classifiedInstructionAccounting>;
+}): string {
+  const instructionAccounting = trustedClassifiedInstructionAccounting(source, input.steps, input.instructionAccounting);
+  const untexted = input.steps.map((step) => {
+    if (step.type === 'action_goal' || 'verificationVersion' in step) return step;
+    const { sourceText: _sourceText, ...rest } = step;
+    return rest;
+  });
+  return normalizeForwardExtractionFromAccounting(source, forwardSteps.parse(untexted), instructionAccounting);
+}
+
 export function normalizePrimaryActionExtractionV5Wire(input: unknown, trustedSource: string): string {
   const { response } = PrimaryActionExtractionV5WireSchema.parse(input);
   return response.kind === 'extraction' ? normalizeForwardExtraction(trustedSource, response) :
@@ -437,6 +573,17 @@ export function normalizePrimaryActionExtractionV5Wire(input: unknown, trustedSo
 export function normalizeIndependentActionExtractionV5Wire(input: unknown, trustedSource: string): string {
   const { response } = IndependentActionExtractionV5WireSchema.parse(input);
   return response.kind === 'source_extraction' ? normalizeForwardExtraction(trustedSource,
+    { steps: response.clauses, instructionAccounting: response.instructionAccounting }) :
+    normalizeUnspannedDecision(trustedSource, response);
+}
+export function normalizePrimaryActionExtractionV6Wire(input: unknown, trustedSource: string): string {
+  const { response } = PrimaryActionExtractionV6WireSchema.parse(input);
+  return response.kind === 'extraction' ? normalizeClassifiedExtraction(trustedSource, response) :
+    normalizeUnspannedDecision(trustedSource, response);
+}
+export function normalizeIndependentActionExtractionV6Wire(input: unknown, trustedSource: string): string {
+  const { response } = IndependentActionExtractionV6WireSchema.parse(input);
+  return response.kind === 'source_extraction' ? normalizeClassifiedExtraction(trustedSource,
     { steps: response.clauses, instructionAccounting: response.instructionAccounting }) :
     normalizeUnspannedDecision(trustedSource, response);
 }

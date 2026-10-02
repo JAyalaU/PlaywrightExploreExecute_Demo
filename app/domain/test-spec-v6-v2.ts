@@ -24,11 +24,13 @@ export const InstructionAccountingV2Schema = z.discriminatedUnion('classificatio
 
 /** New source-only successor. The old v6/v1 reader and adapter retain their meaning. */
 export const TestSpecV6V2Schema = z.strictObject({
-  schemaVersion: z.literal('6'), sourceContractVersion: z.literal('2'), testSpecId: identifier,
+  schemaVersion: z.literal('6'), sourceContractVersion: z.literal('2'),
+  /** Additive PoC mode; historical artifacts omit it and keep exact-source validation. */
+  semanticMode: z.literal('poc_v1').optional(), testSpecId: identifier,
   sourceInstruction: z.string().min(1).max(16384), executionProfileRef: ExecutionProfileRefSchema,
   startState: z.strictObject({ url: z.union([ApprovedAbsoluteUrlSchema, z.literal('about:blank')]) }),
   steps: z.array(DeferredAuthoredStepV2Schema).min(1).max(100),
-  instructionAccounting: z.array(InstructionAccountingV2Schema).min(1).max(301),
+  instructionAccounting: z.array(InstructionAccountingV2Schema).max(301),
 });
 export type TestSpecV6V2 = z.infer<typeof TestSpecV6V2Schema>;
 export type DeferredAuthoredStepV2 = z.infer<typeof DeferredAuthoredStepV2Schema>;
@@ -37,6 +39,34 @@ export type DeferredAuthoredStepV2 = z.infer<typeof DeferredAuthoredStepV2Schema
 export function parseTestSpecV6V2(input: unknown): TestSpecV6V2 {
   const spec = TestSpecV6V2Schema.parse(input);
   uniqueIds(spec.steps.map((step) => step.id), 'DUPLICATE_STEP_ID');
+  if (spec.semanticMode === 'poc_v1') {
+    // PoC does not classify authored bytes as neutral or ask the model for a source partition.
+    // The original instruction is retained verbatim in sourceInstruction and admission digests.
+    if (spec.instructionAccounting.length) invalidSource('UNEXPECTED_POC_SOURCE_PARTITION');
+    for (const [index, step] of spec.steps.entries()) {
+      // Required legacy field is a whole-instruction context sentinel in this tagged mode,
+      // never an exact clause provenance assertion.
+      if (step.sourceInstructionSpan.start !== 0 || step.sourceInstructionSpan.end !== spec.sourceInstruction.length)
+        invalidSource('INVALID_SEMANTIC_SOURCE_BOUND');
+      const prior = spec.steps.slice(0, index);
+      if (step.type === 'action_goal') {
+        if (step.sourceMode !== 'semantic_poc') invalidSource('INVALID_SEMANTIC_ACTION_MODE');
+        validateActionGoalV2(step, spec.sourceInstruction, prior, { semanticPocSourceValidated: true });
+      } else if (step.type === 'verification_goal') {
+        if ('verificationVersion' in step) validateNativeOptionVerificationGoalV2(step, spec.sourceInstruction,
+          prior.map((item) => item.id), true);
+        else if (step.dependsOnStepId && !prior.some((item) => item.id === step.dependsOnStepId))
+          invalidSource('INVALID_STEP_DEPENDENCY');
+      } else {
+        const { sourceInstructionSpan: _span, ...navigation } = step;
+        if (!AuthoredStepSchema.safeParse(navigation).success || !step.sourceText.includes(step.url))
+          invalidSource('INVALID_NAVIGATION_SOURCE');
+      }
+    }
+    return spec;
+  }
+  if (spec.steps.some((step) => step.type === 'action_goal' && step.sourceMode === 'semantic_poc'))
+    invalidSource('SEMANTIC_MODE_IN_HISTORICAL_SOURCE');
   let end = 0;
   const accountedSteps: string[] = [];
   for (const segment of spec.instructionAccounting) {

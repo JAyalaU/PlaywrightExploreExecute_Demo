@@ -161,6 +161,9 @@ export class ActionCandidateGroundingSessionV1 {
       if (!this.#compilerMappings.has(mapping) || mapping.admission !== this.#admission) stop('UNTRUSTED_EVIDENCE');
     } else requireTrustedGroundingMappingV1(mapping, this.#admission);
   }
+  #semanticContext() {
+    return this.#compilerHandoff ? { source: this.#admission.spec, semanticAdmission: this.#admission.record } : this.#admission;
+  }
   #id(object: object, prefix: string): string {
     let id = this.#ids.get(object);
     if (!id) { id = `${prefix}-${randomUUID()}`; this.#ids.set(object, id); }
@@ -739,7 +742,7 @@ export class ActionCandidateGroundingSessionV1 {
           ...(argument ? { argument } : {}), ...(nativeOptionEvidence ? { nativeOptionEvidence } : {}),
           observedAt: new Date(now).toISOString(), expiresAt: parent.expiresAt };
         const { witnessDigest: _digest, ...orderedData } = PreparedActionGroundingV1Schema.parse({ ...data, witnessDigest: hash(data) });
-        const record = parsePreparedActionGroundingV1({ ...orderedData, witnessDigest: hash(orderedData) });
+        const record = parsePreparedActionGroundingV1({ ...orderedData, witnessDigest: hash(orderedData) }, this.#semanticContext());
         if (original) {
           if (record.selectedRef !== original.record.selectedRef || record.frameId !== original.record.frameId ||
             hash(record.correspondence) !== hash(original.record.correspondence) || fresh.length !== original.held.length ||
@@ -791,7 +794,7 @@ export class ActionCandidateGroundingSessionV1 {
   async executePreparedGrounding(input: unknown, deadline = Number.POSITIVE_INFINITY): Promise<ActionGroundingExecutionOutcomeV1> {
     this.#owner(); if (this.#busy) stop('BUSY');
     let preparation: PreparedActionGroundingV1;
-    try { preparation = parsePreparedActionGroundingV1(input); } catch { stop('UNTRUSTED_EVIDENCE'); }
+    try { preparation = parsePreparedActionGroundingV1(input, this.#semanticContext()); } catch { stop('UNTRUSTED_EVIDENCE'); }
     const original = this.#preparedCaptures.get(preparation.strategyId);
     const mapping = this.#preparedMappings.get(preparation.strategyId);
     if (!original || !mapping || !same(preparation, original.record) || this.#consumedPreparations.has(preparation.strategyId)) stop('UNTRUSTED_EVIDENCE');
@@ -905,7 +908,7 @@ export class ActionCandidateGroundingSessionV1 {
           const data = { actionGroundingWitnessVersion: '1', witnessId: `action-grounding-witness-${randomUUID()}`, status: 'succeeded',
             preparation, finalCheck: check, execution, postEffect: post };
           const { witnessDigest: _digest, ...ordered } = ActionGroundingWitnessV1Schema.parse({ ...data, witnessDigest: hash(data) });
-          const witness = parseActionGroundingWitnessV1({ ...ordered, witnessDigest: hash(ordered) });
+          const witness = parseActionGroundingWitnessV1({ ...ordered, witnessDigest: hash(ordered) }, this.#semanticContext());
           this.#postEffects.set(post.observationId, structuredClone(post)); this.#groundingWitnesses.set(witness.witnessId, structuredClone(witness));
           this.#executions.set(executionId, structuredClone(execution));
           return { status: 'succeeded', execution, witness };

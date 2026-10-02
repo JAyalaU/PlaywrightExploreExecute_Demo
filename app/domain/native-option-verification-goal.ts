@@ -22,9 +22,9 @@ export type NativeOptionVerificationGoalV2 = z.infer<typeof NativeOptionVerifica
 
 /** Mechanical source linkage only. Polarity and ownership require independent semantic agreement. */
 export function validateNativeOptionVerificationGoalV2(goal: NativeOptionVerificationGoalV2,
-  sourceInstruction: string, previousStepIds: readonly string[] = []): void {
+  sourceInstruction: string, previousStepIds: readonly string[] = [], semanticPoc = false): void {
   NativeOptionVerificationGoalV2Schema.parse(goal);
-  exactSourceSpan(sourceInstruction, goal.sourceInstructionSpan, goal.sourceText);
+  if (!semanticPoc) exactSourceSpan(sourceInstruction, goal.sourceInstructionSpan, goal.sourceText);
   if (goal.instruction !== goal.sourceText) invalidSource('TRANSFORMED_NATIVE_VERIFICATION_CLAUSE');
   if (goal.dependsOnStepId && !previousStepIds.includes(goal.dependsOnStepId))
     invalidSource('INVALID_NATIVE_VERIFICATION_DEPENDENCY');

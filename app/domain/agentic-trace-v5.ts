@@ -2,7 +2,10 @@ import { z } from 'zod';
 import { createHash } from 'node:crypto';
 import { TestSpecV6V2Schema, parseTestSpecV6V2 } from './test-spec-v6-v2.js';
 import { SemanticAdmissionRecordV2Schema, canonicalSemanticProjectionV2, TrustedSemanticSourceV2Schema,
-  ActionObligationHandoffV2Schema,NATIVE_OPTION_ADMISSION_VERSIONS_V2 } from './action-semantic-admission.js';
+  ActionObligationHandoffV2Schema,NATIVE_OPTION_ADMISSION_VERSIONS_V2,
+  POC_SEMANTIC_ADMISSION_VERSIONS_V2,
+  PREVIOUS_NATIVE_OPTION_P5_ADMISSION_VERSIONS_V2,
+  PREVIOUS_NATIVE_OPTION_P6_ADMISSION_VERSIONS_V2 } from './action-semantic-admission.js';
 import { semanticAdmissionDigestV2 as sourceHash } from './action-semantic-admission.js';
 import { ActionGroundingWitnessV1Schema, parseActionGroundingWitnessV1 } from './action-grounding-execution.js';
 import { ActionGroundingRetirementV1Schema, parseActionGroundingRetirementV1 } from './action-grounding-execution.js';
@@ -53,7 +56,13 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
   verificationSource: ProtectedTraceObservationSourceV3 & ProtectedNativeVerificationSourceV5): SuccessfulExplorationTraceV5 {
   const trace = SuccessfulExplorationTraceV5Schema.parse(input);
   const source = parseTestSpecV6V2(trace.source), admission = trace.semanticAdmission;
-  requireFact(!source.steps.some(s=>'verificationVersion'in s)||same(admission.versions,NATIVE_OPTION_ADMISSION_VERSIONS_V2),'V5 native admission version mismatch');
+  requireFact((source.semanticMode === 'poc_v1') === same(admission.versions,POC_SEMANTIC_ADMISSION_VERSIONS_V2),
+    'V5 semantic admission mode mismatch');
+  requireFact(!source.steps.some(s=>'verificationVersion'in s)||
+    same(admission.versions,POC_SEMANTIC_ADMISSION_VERSIONS_V2)||
+    same(admission.versions,NATIVE_OPTION_ADMISSION_VERSIONS_V2)||
+    same(admission.versions,PREVIOUS_NATIVE_OPTION_P6_ADMISSION_VERSIONS_V2)||
+    same(admission.versions,PREVIOUS_NATIVE_OPTION_P5_ADMISSION_VERSIONS_V2),'V5 native admission version mismatch');
   const { traceDigest, ...data } = trace;
   const trustedSource = TrustedSemanticSourceV2Schema.parse({ testSpecId: source.testSpecId,
     sourceInstruction: source.sourceInstruction, executionProfileRef: source.executionProfileRef, startState: source.startState });
@@ -83,7 +92,8 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
     requireFact(record.sequence === index + 1 && record.source === 'authored' && record.originStepId === step.id &&
       record.type === step.type && record.preStateDigest === current.stateDigest, 'V5 ordered source/state chain mismatch');
     if (record.type === 'action_goal' && step.type === 'action_goal') {
-      const witness = parseActionGroundingWitnessV1(record.witness), pre = witness.finalCheck,
+      const witness = parseActionGroundingWitnessV1(record.witness,
+        { source, semanticAdmission: admission }), pre = witness.finalCheck,
         parent = pre.candidateObservation, execution = witness.execution, post = witness.postEffect,
         retirement = parseActionGroundingRetirementV1(record.retirement);
       requireFact(parent.status === 'complete' && parent.testSpecId === trace.testSpecId &&

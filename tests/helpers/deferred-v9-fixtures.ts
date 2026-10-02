@@ -76,8 +76,14 @@ export function correspondence(goal: ActionGoalV2): GroundingCorrespondenceV1 {
         { kind: 'role_exact', role: obligation.authoredText as 'checkbox' | 'radio' | 'textbox' } };
     if (obligation.kind === 'constraint' && obligation.constraint === 'name') return { obligation,
       realization: { kind: 'name_exact', name: obligation.authoredText } };
-    if (obligation.kind === 'constraint' && obligation.constraint === 'context') return { obligation,
-      realization: { kind: 'label', text: 'Country', sourceSegmentIds: ['p4'], sourceSpan: goal.sourceAccounting[4]!.sourceSpan } };
+    if (obligation.kind === 'constraint' && obligation.constraint === 'context') {
+      const country = obligation.sourceSegmentIds.map((id) => goal.sourceAccounting.find((s) => s.id === id))
+        .find((segment) => segment?.authoredText.includes('Country'));
+      if (!country) throw new Error('Missing Country context fixture');
+      const start = country.sourceSpan.start + country.authoredText.indexOf('Country');
+      return { obligation, realization: { kind: 'label', text: 'Country', sourceSegmentIds: [country.id],
+        sourceSpan: { start, end: start + 'Country'.length } } };
+    }
     return { obligation, realization: { kind: 'pending' } };
   });
 }

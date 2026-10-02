@@ -2,7 +2,8 @@ import { expect, test } from '@playwright/test';
 import { parseTestSpecV6V2, type ActionGoalV2, type TestSpecV6V2 } from '../app/domain/index.js';
 import { createOpenAIActionSemanticExtractionModelsV2 } from '../app/interpretation/deferred-action-v2-adapters.js';
 import { interpretDeferredActionTaskV2 } from '../app/interpretation/deferred-action-v2-interpret.js';
-import { normalizeIndependentActionExtractionV5Wire, normalizePrimaryActionExtractionV5Wire,
+import { normalizeIndependentActionExtractionV6Wire, normalizePrimaryActionExtractionV6Wire,
+  normalizePrimaryActionExtractionV5Wire,
   normalizePrimaryActionExtractionV4Wire,
   normalizePrimaryActionExtractionV3Wire, normalizePrimaryActionExtractionV2Wire,
   ACTION_V2_PRIMARY_RESPONSE_FORMAT,
@@ -82,6 +83,171 @@ function liveFiveSteps(): TestSpecV6V2 {
     startState: { url: 'about:blank' }, steps, instructionAccounting: accounting };
 }
 
+function reframeFiveSteps(prefixes: readonly string[], separator: string): TestSpecV6V2 {
+  const draft = liveFiveSteps();
+  const accounting: TestSpecV6V2['instructionAccounting'] = [];
+  let source = '', cursor = 0;
+  for (const [index, step] of draft.steps.entries()) {
+    const prefix = prefixes[index] ?? '';
+    if (prefix) {
+      accounting.push({ classification: 'neutral', authoredText: prefix,
+        sourceSpan: { start: cursor, end: cursor + prefix.length } });
+      source += prefix; cursor += prefix.length;
+    }
+    step.sourceInstructionSpan = { start: cursor, end: cursor + step.sourceText.length };
+    accounting.push({ classification: 'clause', stepId: step.id, authoredText: step.sourceText,
+      sourceSpan: step.sourceInstructionSpan });
+    source += step.sourceText; cursor += step.sourceText.length;
+    if (index < draft.steps.length - 1) {
+      accounting.push({ classification: 'neutral', authoredText: separator,
+        sourceSpan: { start: cursor, end: cursor + separator.length } });
+      source += separator; cursor += separator.length;
+    }
+  }
+  return { ...draft, sourceInstruction: source, instructionAccounting: accounting };
+}
+
+test('trusted list framing reconstructs numbered, unnumbered, CRLF, multi-digit and bullet sources for both extractions', () => {
+  const cases = [
+    reframeFiveSteps(['1. ', '2. ', '3. ', '4. ', '5. '], '\n'),
+    reframeFiveSteps([], '\n'),
+    reframeFiveSteps(['1. ', '2. ', '3. ', '4. ', '5. '], '\r\n'),
+    reframeFiveSteps(['10. ', '11. ', '12. ', '13. ', '14. '], '\n'),
+    reframeFiveSteps(['- ', '* ', '• ', '- ', '* '], '\n'),
+  ];
+  for (const draft of cases) {
+    for (const phase of ['primary', 'independent'] as const) {
+      const wire = unspannedWire(draft, phase);
+      const output = JSON.parse(phase === 'primary' ?
+        normalizePrimaryActionExtractionV6Wire(wire, draft.sourceInstruction) :
+        normalizeIndependentActionExtractionV6Wire(wire, draft.sourceInstruction));
+      const parsed = parseTestSpecV6V2({ ...draft, steps: output.steps,
+        instructionAccounting: output.instructionAccounting });
+      expect(parsed.steps.map((step) => step.sourceText)).toEqual(draft.steps.map((step) => step.sourceText));
+      expect(parsed.instructionAccounting.map((segment) => segment.authoredText).join('')).toBe(draft.sourceInstruction);
+      expect(parsed.steps[2]).toMatchObject({ type: 'verification_goal',
+        sourceText: 'Confirm it takes you to https://the-internet.herokuapp.com/dropdown' });
+      expect(parsed.steps[3]!.sourceText).toContain('Option 1'); // A semantic number is never stripped.
+    }
+  }
+});
+
+test('trusted instruction bytes survive an old duplicate-clause typo without accepting copied literals', () => {
+  const draft = liveFiveSteps();
+  const oldWire = unspannedWireV4(draft, 'primary') as { response: { instructionAccounting: { authoredText: string }[] } };
+  oldWire.response.instructionAccounting[4]!.authoredText = 'Findand click the link with the text: "Dropdown"';
+  expect(() => normalizePrimaryActionExtractionV4Wire(oldWire, draft.sourceInstruction)).toThrow('SPAN_OR_LITERAL_MISMATCH');
+  for (const phase of ['primary', 'independent'] as const) {
+    const wire = unspannedWire(draft, phase) as { response: any };
+    expect(wire.response.instructionAccounting.every((item: Record<string, unknown>) => !('authoredText' in item))).toBe(true);
+    const normalized = JSON.parse(phase === 'primary' ?
+      normalizePrimaryActionExtractionV6Wire(wire, draft.sourceInstruction) :
+      normalizeIndependentActionExtractionV6Wire(wire, draft.sourceInstruction));
+    expect(normalized.instructionAccounting.map((item: { authoredText: string }) => item.authoredText).join(''))
+      .toBe(draft.sourceInstruction);
+    expect(normalized.steps[1].sourceText).toBe('Find and click the link with the text: "Dropdown"');
+    const duplicate = clone(wire);
+    duplicate.response.instructionAccounting[2].authoredText = 'Findand click the link with the text: "Dropdown"';
+    expect(() => (phase === 'primary' ? normalizePrimaryActionExtractionV6Wire :
+      normalizeIndependentActionExtractionV6Wire)(duplicate, draft.sourceInstruction)).toThrow();
+  }
+});
+
+test('p6 literal-accounting reader remains isolated from the active one-copy wire', () => {
+  const draft = liveFiveSteps();
+  const old = unspannedWireV4(draft, 'primary') as { response: any };
+  old.response.instructionAccounting = old.response.instructionAccounting.filter(
+    (item: { classification: string; authoredText: string }) =>
+      item.classification !== 'neutral' || !/^\d+\. $/.test(item.authoredText));
+  for (const item of old.response.instructionAccounting) if (item.classification === 'clause') delete item.stepId;
+  for (const step of old.response.steps) if (step.type === 'action_goal') {
+    delete step.sourceStepId;
+    for (const segment of step.sourceAccounting) delete segment.obligationIds;
+  }
+  expect(JSON.parse(normalizePrimaryActionExtractionV5Wire(old, draft.sourceInstruction)).steps)
+    .toHaveLength(draft.steps.length);
+  expect(() => normalizePrimaryActionExtractionV6Wire(old, draft.sourceInstruction)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV5Wire(unspannedWire(draft, 'primary'), draft.sourceInstruction)).toThrow();
+});
+
+test('action segment partition rejects a moved clause boundary in either extraction', () => {
+  const draft = liveFiveSteps();
+  for (const phase of ['primary', 'independent'] as const) {
+    const wire = unspannedWire(draft, phase) as { response: any };
+    const steps = wire.response.steps ?? wire.response.clauses;
+    steps[1].sourceAccounting.at(-1).authoredText += '\n';
+    expect(() => (phase === 'primary' ? normalizePrimaryActionExtractionV6Wire :
+      normalizeIndependentActionExtractionV6Wire)(wire, draft.sourceInstruction)).toThrow('SPAN_OR_LITERAL_MISMATCH');
+  }
+});
+
+test('unnumbered newline gap must match trusted source exactly in both phases', () => {
+  const draft = reframeFiveSteps([], '\n');
+  for (const phase of ['primary', 'independent'] as const) {
+    const wire = unspannedWire(draft, phase) as { response: {
+      instructionAccounting: { classification: string; authoredText?: string }[] } };
+    const gap = wire.response.instructionAccounting.find((item) => item.classification === 'neutral');
+    if (!gap) throw new Error('Expected unnumbered line gap');
+    gap.authoredText = '\r\n';
+    expect(() => (phase === 'primary' ? normalizePrimaryActionExtractionV6Wire :
+      normalizeIndependentActionExtractionV6Wire)(wire, draft.sourceInstruction)).toThrow('SPAN_OR_LITERAL_MISMATCH');
+  }
+});
+
+test('unnumbered same-line clause ownership still requires independent agreement', async () => {
+  const primary = spec(choose());
+  const verificationText = 'Verify exactly one Notice dialog exists.';
+  const first = primary.steps[0]!;
+  const secondStart = first.sourceText.length + 1;
+  const verification: TestSpecV6V2['steps'][number] = { id: 'verify', type: 'verification_goal',
+    sourceText: verificationText, instruction: verificationText,
+    sourceInstructionSpan: { start: secondStart, end: secondStart + verificationText.length },
+    subject: { role: 'dialog', accessibleName: 'Notice' },
+    intent: { kind: 'cardinality', comparison: 'equal', count: 1 } };
+  primary.sourceInstruction = `${first.sourceText} ${verificationText}`;
+  primary.steps.push(verification);
+  primary.instructionAccounting.push(
+    { classification: 'neutral', authoredText: ' ', sourceSpan: { start: first.sourceText.length, end: secondStart } },
+    { classification: 'clause', stepId: verification.id, authoredText: verificationText,
+      sourceSpan: verification.sourceInstructionSpan });
+  const independent = clone(primary);
+  const actionStep = independent.steps[0];
+  if (!actionStep || actionStep.type !== 'action_goal') throw new Error('Expected ActionGoal');
+  actionStep.sourceText = actionStep.sourceText.slice(0, -1);
+  actionStep.sourceInstructionSpan.end--;
+  actionStep.sourceAccounting.pop();
+  const firstClause = independent.instructionAccounting[0];
+  if (!firstClause || firstClause.classification !== 'clause') throw new Error('Expected clause');
+  firstClause.authoredText = actionStep.sourceText;
+  firstClause.sourceSpan.end = actionStep.sourceInstructionSpan.end;
+  const gap = independent.instructionAccounting[1];
+  if (!gap || gap.classification !== 'neutral') throw new Error('Expected gap');
+  gap.authoredText = '. ';
+  gap.sourceSpan.start--;
+  expect(() => parseTestSpecV6V2(primary)).not.toThrow();
+  expect(() => parseTestSpecV6V2(independent)).not.toThrow();
+  expect((await interpret(primary, independent)).result).toMatchObject({ kind: 'rejected',
+    stop: { stage: 'admission', code: 'SEMANTIC_INTERPRETATION_DISAGREEMENT' } });
+});
+
+test('provider-owned list markers and cross-marker boundaries reject without source repair in either phase', () => {
+  const draft = reframeFiveSteps(['10. ', '11. ', '12. ', '13. ', '14. '], '\r\n');
+  for (const phase of ['primary', 'independent'] as const) {
+    const normalize = phase === 'primary' ? normalizePrimaryActionExtractionV6Wire : normalizeIndependentActionExtractionV6Wire;
+    const good = unspannedWire(draft, phase) as { response: { instructionAccounting: { classification: string; authoredText?: string }[] } };
+    const included = clone(good);
+    included.response.instructionAccounting[0]!.authoredText = '10. ';
+    expect(() => normalize(included, draft.sourceInstruction)).toThrow();
+    const crossing = clone(good);
+    crossing.response.instructionAccounting.splice(1, 0,
+      { classification: 'neutral', authoredText: '\r\n11. ' });
+    expect(() => normalize(crossing, draft.sourceInstruction)).toThrow('SPAN_OR_LITERAL_MISMATCH');
+    const missing = clone(good);
+    missing.response.instructionAccounting.splice(2, 1);
+    expect(() => normalize(missing, draft.sourceInstruction)).toThrow();
+  }
+});
+
 test('exact five-step live source and URLs survive both offsetless extractions and admission', async () => {
   const draft = liveFiveSteps();
   const primaryWire = unspannedWire(draft, 'primary') as { response: any };
@@ -92,7 +258,8 @@ test('exact five-step live source and URLs survive both offsetless extractions a
       if (segment.classification === 'clause') expect(segment).not.toHaveProperty('stepId');
     }
     for (const step of wireSteps) {
-      expect(step).not.toHaveProperty('sourceText');
+      if (step.type === 'action_goal' || 'verificationVersion' in step) expect(step).not.toHaveProperty('sourceText');
+      else expect(step).toHaveProperty('sourceText');
       if (step.type === 'action_goal') {
         expect(step).not.toHaveProperty('sourceStepId');
         for (const segment of step.sourceAccounting) expect(segment).not.toHaveProperty('obligationIds');
@@ -118,6 +285,10 @@ test('exact five-step live source and URLs survive both offsetless extractions a
     expect(result.testSpec.steps.map((step) => step.sourceText)).toEqual(draft.steps.map((step) => step.sourceText));
     expect(result.testSpec.steps[0]).toMatchObject({ url: 'https://the-internet.herokuapp.com/' });
     expect(result.testSpec.steps[2]!.sourceText).toContain('https://the-internet.herokuapp.com/dropdown');
+    expect(result.testSpec.steps[2]).toMatchObject({ type: 'verification_goal',
+      instruction: 'Confirm it takes you to https://the-internet.herokuapp.com/dropdown' });
+    expect(result.testSpec.steps[2]).not.toHaveProperty('subject');
+    expect(result.testSpec.steps[2]).not.toHaveProperty('intent');
     const link = result.testSpec.steps[1];
     if (!link || link.type !== 'action_goal') throw new Error('Expected link ActionGoal');
     expect(link.sourceStepId).toBe(link.id);
@@ -153,10 +324,14 @@ test('UTF-16 boundaries, CRLF, repeated text and punctuation derive from ordered
     { classification: 'neutral', authoredText: prefix, sourceSpan: { start: 0, end: prefix.length } },
     { classification: 'clause', stepId: goal.id, authoredText: goal.sourceText,
       sourceSpan: draft.steps[0]!.sourceInstructionSpan },
-    { classification: 'neutral', authoredText: suffix,
-      sourceSpan: { start: prefix.length + goal.sourceText.length, end: draft.sourceInstruction.length } },
+    { classification: 'neutral', authoredText: '\r\n',
+      sourceSpan: { start: prefix.length + goal.sourceText.length, end: prefix.length + goal.sourceText.length + 2 } },
+    { classification: 'neutral', authoredText: '2. ',
+      sourceSpan: { start: prefix.length + goal.sourceText.length + 2, end: prefix.length + goal.sourceText.length + 5 } },
+    { classification: 'neutral', authoredText: suffix.slice(5),
+      sourceSpan: { start: prefix.length + goal.sourceText.length + 5, end: draft.sourceInstruction.length } },
   ];
-  const normalized = JSON.parse(normalizePrimaryActionExtractionV5Wire(unspannedWire(draft, 'primary'), draft.sourceInstruction));
+  const normalized = JSON.parse(normalizePrimaryActionExtractionV6Wire(unspannedWire(draft, 'primary'), draft.sourceInstruction));
   const segments = normalized.steps[0].sourceAccounting;
   expect(segments[2].sourceSpan).toEqual({ start: 4, end: 10 });
   expect(segments[4].sourceSpan).toEqual({ start: 14, end: 20 });
@@ -179,8 +354,8 @@ test('new wire rejects omissions, rewrites, reorder, duplicate, empty and model 
   ]));
   const good = unspannedWire(draft, 'primary') as { response: any };
   const edits: ((wire: typeof good) => void)[] = [
-    (wire) => { wire.response.instructionAccounting[0].authoredText = 'Select Option 1'; },
-    (wire) => { wire.response.instructionAccounting[0].authoredText = 'select Option 1.'; },
+    (wire) => { wire.response.instructionAccounting[0].sourceEnd--; },
+    (wire) => { wire.response.instructionAccounting[0].sourceEnd++; },
     (wire) => { wire.response.steps[0].sourceAccounting[1].authoredText = '  '; },
     (wire) => { wire.response.steps[0].sourceAccounting.reverse(); },
     (wire) => { wire.response.steps[0].sourceAccounting[2].authoredText = 'Option 1Option 1'; },
@@ -191,24 +366,24 @@ test('new wire rejects omissions, rewrites, reorder, duplicate, empty and model 
   ];
   for (const edit of edits) {
     const wire = clone(good); edit(wire);
-    expect(() => normalizePrimaryActionExtractionV5Wire(wire, draft.sourceInstruction)).toThrow();
+    expect(() => normalizePrimaryActionExtractionV6Wire(wire, draft.sourceInstruction)).toThrow();
     const independent = { response: { ...wire.response, kind: 'source_extraction', clauses: wire.response.steps } };
     delete (independent.response as any).steps;
-    expect(() => normalizeIndependentActionExtractionV5Wire(independent, draft.sourceInstruction)).toThrow();
+    expect(() => normalizeIndependentActionExtractionV6Wire(independent, draft.sourceInstruction)).toThrow();
   }
   const oldWire = { response: { ...good.response, steps: draft.steps,
     instructionAccounting: draft.instructionAccounting } };
   expect(() => normalizePrimaryActionExtractionV2Wire(oldWire)).not.toThrow();
-  expect(() => normalizePrimaryActionExtractionV5Wire(oldWire, draft.sourceInstruction)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(oldWire, draft.sourceInstruction)).toThrow();
   const v3Wire = unspannedWireV3(draft, 'primary');
   expect(() => normalizePrimaryActionExtractionV3Wire(v3Wire, draft.sourceInstruction)).not.toThrow();
-  expect(() => normalizePrimaryActionExtractionV5Wire(v3Wire, draft.sourceInstruction)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(v3Wire, draft.sourceInstruction)).toThrow();
 });
 
 test('nested native claim and decision evidence use full exact partitions without model offsets', () => {
   const draft = liveFiveSteps();
   const wire = unspannedWire(draft, 'primary') as { response: any };
-  const normalized = JSON.parse(normalizePrimaryActionExtractionV5Wire(wire, draft.sourceInstruction));
+  const normalized = JSON.parse(normalizePrimaryActionExtractionV6Wire(wire, draft.sourceInstruction));
   expect(normalized.steps[4].claim.optionSourceSpan).toEqual({ start: 12, end: 20 });
   for (const edit of [
     (value: any) => { value.response.steps[4].claim.claimAccounting[0].authoredText = 'Verify'; },
@@ -216,16 +391,16 @@ test('nested native claim and decision evidence use full exact partitions withou
     (value: any) => { value.response.steps[4].claim.claimAccounting[1].controlIndex = 0; },
   ]) {
     const changed = clone(wire); edit(changed);
-    expect(() => normalizePrimaryActionExtractionV5Wire(changed, draft.sourceInstruction)).toThrow();
+    expect(() => normalizePrimaryActionExtractionV6Wire(changed, draft.sourceInstruction)).toThrow();
   }
   const decision = { response: { kind: 'unresolved', reasonCode: 'unclear_reference', sourcePartition: [
     { classification: 'neutral', authoredText: draft.sourceInstruction.slice(0, 3) },
     { classification: 'evidence', authoredText: draft.sourceInstruction.slice(3) },
   ] } };
-  expect(JSON.parse(normalizePrimaryActionExtractionV5Wire(decision, draft.sourceInstruction)).sourceEvidence[0].sourceSpan)
+  expect(JSON.parse(normalizePrimaryActionExtractionV6Wire(decision, draft.sourceInstruction)).sourceEvidence[0].sourceSpan)
     .toEqual({ start: 3, end: draft.sourceInstruction.length });
   decision.response.sourcePartition[0]!.authoredText = '1.';
-  expect(() => normalizePrimaryActionExtractionV5Wire(decision, draft.sourceInstruction)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(decision, draft.sourceInstruction)).toThrow();
 });
 
 test('text-exact but semantically wrong ownership reaches independent semantic comparison', async () => {
@@ -275,13 +450,13 @@ test('closed successor wire rejects model-supplied duplicate text and keeps prev
     (wire: typeof good) => { wire.response.steps[4].claim.optionLabel = 'Invented'; },
   ]) {
     const wire = clone(good); edit(wire);
-    expect(() => normalizePrimaryActionExtractionV5Wire(wire, draft.sourceInstruction)).toThrow();
+    expect(() => normalizePrimaryActionExtractionV6Wire(wire, draft.sourceInstruction)).toThrow();
   }
   const previousV3 = unspannedWireV3(draft, 'primary');
   const previousV4 = unspannedWireV4(draft, 'primary');
   expect(() => normalizePrimaryActionExtractionV3Wire(previousV3, draft.sourceInstruction)).not.toThrow();
   expect(() => normalizePrimaryActionExtractionV4Wire(previousV4, draft.sourceInstruction)).not.toThrow();
-  expect(() => normalizePrimaryActionExtractionV5Wire(previousV4, draft.sourceInstruction)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(previousV4, draft.sourceInstruction)).toThrow();
   expect(() => normalizePrimaryActionExtractionV4Wire(good, draft.sourceInstruction)).toThrow();
 });
 
@@ -304,15 +479,15 @@ test('native option and control text are canonically sourced by classified claim
   const wire = unspannedWire(draft, 'primary') as { response: any };
   expect(wire.response.steps[0].claim).not.toHaveProperty('optionLabel');
   expect(wire.response.steps[0].claim.controlConstraints[0]).not.toHaveProperty('text');
-  const canonical = JSON.parse(normalizePrimaryActionExtractionV5Wire(wire, sourceText));
+  const canonical = JSON.parse(normalizePrimaryActionExtractionV6Wire(wire, sourceText));
   expect(canonical.steps[0].claim).toMatchObject({ optionLabel: 'Option 1',
     controlConstraints: [{ kind: 'label', text: 'Country' }] });
   const changed = clone(wire);
   changed.response.steps[0].claim.claimAccounting[3].controlIndex = 1;
-  expect(() => normalizePrimaryActionExtractionV5Wire(changed, sourceText)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(changed, sourceText)).toThrow();
   const injected = clone(wire);
   injected.response.steps[0].claim.controlConstraints[0].text = 'Fabricated';
-  expect(() => normalizePrimaryActionExtractionV5Wire(injected, sourceText)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(injected, sourceText)).toThrow();
 });
 
 test('forward-only graph rejects dangling, duplicate, cross-clause, illegal and unowned material refs', async () => {
@@ -340,8 +515,8 @@ test('forward-only graph rejects dangling, duplicate, cross-clause, illegal and 
   link.obligations.find((item: any) => item.kind === 'constraint' && item.constraint === 'name')
     .sourceSegmentIds = ['onlyLinkClause'];
   choice.obligations.find((item: any) => item.kind === 'argument').sourceSegmentIds = ['onlyLinkClause'];
-  expect(() => normalizePrimaryActionExtractionV5Wire(crossClause, five.sourceInstruction)).toThrow();
-  const canonical = JSON.parse(normalizePrimaryActionExtractionV5Wire(unspannedWire(draft, 'primary'), draft.sourceInstruction));
+  expect(() => normalizePrimaryActionExtractionV6Wire(crossClause, five.sourceInstruction)).toThrow();
+  const canonical = JSON.parse(normalizePrimaryActionExtractionV6Wire(unspannedWire(draft, 'primary'), draft.sourceInstruction));
   const changed = clone({ ...draft, steps: canonical.steps, instructionAccounting: canonical.instructionAccounting });
   (changed.steps[0] as ActionGoalV2).sourceAccounting[2]!.obligationIds = [];
   expect(() => parseTestSpecV6V2(changed)).toThrow();
@@ -356,13 +531,13 @@ test('new provider wire rejects reverse fields; v8/v4 reader remains separately 
     (wire: typeof current) => { wire.response.instructionAccounting[1].stepId = 's1'; },
   ]) {
     const wire = clone(current); edit(wire);
-    expect(() => normalizePrimaryActionExtractionV5Wire(wire, draft.sourceInstruction)).toThrow();
+    expect(() => normalizePrimaryActionExtractionV6Wire(wire, draft.sourceInstruction)).toThrow();
   }
   const oldPrimary = unspannedWireV4(draft, 'primary');
   const oldIndependent = unspannedWireV4(draft, 'independent');
   expect(() => normalizePrimaryActionExtractionV4Wire(oldPrimary, draft.sourceInstruction)).not.toThrow();
-  expect(() => normalizePrimaryActionExtractionV5Wire(oldPrimary, draft.sourceInstruction)).toThrow();
-  expect(() => normalizeIndependentActionExtractionV5Wire(oldIndependent, draft.sourceInstruction)).toThrow();
+  expect(() => normalizePrimaryActionExtractionV6Wire(oldPrimary, draft.sourceInstruction)).toThrow();
+  expect(() => normalizeIndependentActionExtractionV6Wire(oldIndependent, draft.sourceInstruction)).toThrow();
 });
 
 test('wrong but internally valid forward ownership reaches independent semantic admission', async () => {

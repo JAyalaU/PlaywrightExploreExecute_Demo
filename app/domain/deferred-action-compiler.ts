@@ -83,7 +83,8 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
     new Set(a.freshVerifications.map(x=>x.traceRecordId)).size!==a.freshVerifications.length ||
     new Set(a.freshNavigations.map(x=>x.traceRecordId)).size!==a.freshNavigations.length) throw new Error('INVALID_COMPILER_V4');
   for (const fresh of a.freshActions) {
-    const w=parseActionGroundingWitnessV1(fresh.witness), original=trace.successfulPath.find(r=>r.recordId===fresh.traceRecordId);
+    const w=parseActionGroundingWitnessV1(fresh.witness,
+      {source:trace.source,semanticAdmission:trace.semanticAdmission}), original=trace.successfulPath.find(r=>r.recordId===fresh.traceRecordId);
     if (!original || original.type!=='action_goal' || !same(w.finalCheck.sourceGoal,original.witness.finalCheck.sourceGoal) ||
       !same(w.finalCheck.correspondence,original.witness.finalCheck.correspondence) || w.finalCheck.mappingDigest!==original.witness.finalCheck.mappingDigest ||
       w.finalCheck.operation!==original.witness.finalCheck.operation || w.execution.admissionDigest!==original.witness.execution.admissionDigest ||
