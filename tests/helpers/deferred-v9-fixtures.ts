@@ -7,7 +7,7 @@ import { expect } from '@playwright/test';
 import { ActionCandidateGroundingSessionV1 } from '../../app/exploration/action-candidate-grounding.js';
 import { McpExplorationSession } from '../../app/exploration/mcp.js';
 import { ProtectedContextFactory, ProfileCatalog } from '../../app/profile/index.js';
-import { admitActionSemanticsV2,NATIVE_OPTION_ADMISSION_VERSIONS_V2 } from '../../app/domain/action-semantic-admission.js';
+import { admitActionSemanticsV2,admitPocSemanticFidelityV2,NATIVE_OPTION_ADMISSION_VERSIONS_V2 } from '../../app/domain/action-semantic-admission.js';
 import type { GroundingCorrespondenceV1 } from '../../app/domain/action-grounding-strategy.js';
 import type { ActionGoalV2, TestSpecV6V2 } from '../../app/domain/index.js';
 import { executeActionGoalGroundingV1 } from '../../app/interpretation/action-grounding-execution-controller.js';
@@ -31,7 +31,7 @@ export const verification = (id = 'verify'): TestSpecV6V2['steps'][number] => ({
   subject: { role: 'textbox' }, intent: { kind: 'property', property: 'visible', expected: true },
   sourceInstructionSpan: { start: 0, end: 31 } });
 
-export async function harness(html: string, goalsInput: TestSpecV6V2['steps'] | ((url: string) => TestSpecV6V2['steps']) = [choose()]) {
+export async function harness(html: string, goalsInput: TestSpecV6V2['steps'] | ((url: string) => TestSpecV6V2['steps']) = [choose()], semanticMode?:'poc_v1') {
   let currentHtml = html;
   const server = http.createServer((_request, response) => { response.setHeader('content-type', 'text/html'); response.end(currentHtml); });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -44,16 +44,20 @@ export async function harness(html: string, goalsInput: TestSpecV6V2['steps'] | 
     g.sourceInstructionSpan = { start: end, end: end + g.sourceText.length }; end += g.sourceText.length;
     return g;
   });
+  const sourceInstruction=steps.map((g) => g.sourceText).join(' ');
+  if(semanticMode==='poc_v1')for(const step of steps)step.sourceInstructionSpan={start:0,end:sourceInstruction.length};
   const draft: TestSpecV6V2 = { schemaVersion: '6', sourceContractVersion: '2', testSpecId: 'trace-v5-fixture',
-    sourceInstruction: steps.map((g) => g.sourceText).join(' '), executionProfileRef: { id: 'desktop', version: '1' },
-    startState: { url }, steps, instructionAccounting: steps.flatMap((g, i) => [
+    ...(semanticMode?{semanticMode}:{}),sourceInstruction, executionProfileRef: { id: 'desktop', version: '1' },
+    startState: { url }, steps, instructionAccounting: semanticMode==='poc_v1'?[]:steps.flatMap((g, i) => [
       ...(i ? [{ classification: 'neutral' as const, sourceSpan: { start: g.sourceInstructionSpan.start - 1, end: g.sourceInstructionSpan.start }, authoredText: ' ' }] : []),
       { classification: 'clause' as const, stepId: g.id, sourceSpan: g.sourceInstructionSpan, authoredText: g.sourceText },
     ]) };
   const versions = { goalContractVersion: '2' as const, primaryExtractionVersion: 'mock_primary', independentExtractionVersion: 'mock_independent',
     primaryPromptVersion: 'mock_primary', independentPromptVersion: 'mock_independent' };
-  const { schemaVersion: _schema, sourceContractVersion: _contract, steps: _steps, instructionAccounting: _accounting, ...metadata } = draft;
-  const admission = admitActionSemanticsV2(metadata, draft, structuredClone(draft),steps.some(s=>'verificationVersion'in s)?NATIVE_OPTION_ADMISSION_VERSIONS_V2:versions);
+  const { schemaVersion: _schema, sourceContractVersion: _contract, semanticMode: _mode,
+    steps: _steps, instructionAccounting: _accounting, ...metadata } = draft;
+  const admission = semanticMode==='poc_v1'?admitPocSemanticFidelityV2(metadata,draft,{verdict:'faithful',issues:[]}):
+    admitActionSemanticsV2(metadata, draft, structuredClone(draft),steps.some(s=>'verificationVersion'in s)?NATIVE_OPTION_ADMISSION_VERSIONS_V2:versions);
   const factory = new ProtectedContextFactory(new ProfileCatalog([{
     id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 }, locale: 'en-US',
     timeoutPolicy: { actionMs: 3000, navigationMs: 5000, waits: { default: 3000 } }, networkPolicyRef: { id: 'local', version: '1' },

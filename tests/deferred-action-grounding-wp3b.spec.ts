@@ -284,7 +284,7 @@ test('ordered native fill and VerificationGoal project fresh trusted strategy in
   const run=await harness('<input>',[fill(),verification()]);
   try{const readback=await verifiedInput(run),result=await compile(run,readback);expect(result.kind,JSON.stringify(result.compiler.result)).toBe('compiled');
     expect(result.resolved!.executionSteps.map(s=>s.type)).toEqual(['action_goal','verification_goal']);
-    expect(result.compiler.freshVerifications[0]!.observation.stateDigest).toBe(result.compiler.freshActions[0]!.retirement.after.stateDigest);
+     expect(result.compiler.freshVerifications[0]!.observation.stateDigest).toBe(result.compiler.freshActions[0]!.retirement!.after.stateDigest);
     const trace=requireTrustedSuccessfulTraceReadbackV5(readback).trace;
     for(const change of [
       (a:any)=>a.freshVerifications[0].observation.result.value=false,

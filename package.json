@@ -30,6 +30,7 @@
     "test:live": "node scripts/run-live-interpretation-tests.mjs",
     "test:live:provider-contract": "npm run build && node scripts/provider-contract-spike.mts",
     "test:live:browser-contract": "npm run build && node scripts/protected-browser-contract-spike.mts",
+    "test:live:compiler-target-spike": "npm run build && node scripts/live-compiler-target-stability-spike.mjs",
     "test:all": "npm run test:release",
     "test:p2-1-live": "playwright test tests/openai-live-p2-1d.spec.ts",
     "test:p2-2-live": "playwright test tests/local-release-p2-2e.spec.ts",

@@ -313,6 +313,7 @@ test('recomputed retirement receipt cannot replace exact protected post/current-
   try {
     const { assembled } = await artifact(run), value = requireAssembledSuccessfulTraceV5(assembled);
     const record = value.trace.successfulPath[0]; if (record?.type !== 'action_goal') throw new Error('Missing action');
+    if (!record.retirement) throw new Error('Missing native retirement');
     record.retirement.postEffectDigest = 'f'.repeat(64);
     const { witnessDigest: _receipt, ...receiptData } = record.retirement; record.retirement.witnessDigest = hash(receiptData);
     value.capture.actions[0]!.retirement = structuredClone(record.retirement);
@@ -369,7 +370,7 @@ for (const mutation of ['dropped_obligation', 'changed_obligation', 'argument_su
       if (mutation === 'dropped_obligation') record.witness.preparation.correspondence.pop();
       if (mutation === 'changed_obligation') record.witness.preparation.sourceGoal.obligations[0] = { id: 'e', kind: 'effect', effect: 'activate', sourceSegmentIds: ['p0'] };
       if (mutation === 'argument_substitution') record.witness.execution.executableArgument = 'fabricated';
-      if (mutation === 'frame') record.witness.postEffect.after.frameId = 'another-frame';
+       if (mutation === 'frame') { if (!record.witness.postEffect.after) throw new Error('Missing native after state'); record.witness.postEffect.after.frameId = 'another-frame'; }
       if (mutation === 'state') record.preStateDigest = 'f'.repeat(64);
       if (mutation === 'order') record.sequence = 2;
       if (mutation === 'generic_activation') Reflect.set(record.witness.postEffect, 'effect', { kind: 'generic_activation', delivered: true });

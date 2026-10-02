@@ -18,8 +18,9 @@ export const DeferredEffectV9Schema=z.discriminatedUnion('kind',[
   z.strictObject({kind:z.literal('entered_text'),nativeControl:z.enum(['input','textarea']),value:z.string().max(1024)}),
   z.strictObject({kind:z.literal('native_choice'),complete:z.literal(true),label:z.string().max(1024),value:z.string().max(1024),options:z.array(z.strictObject({label:z.string().max(1024),text:z.string().max(1024),value:z.string().max(1024),disabled:z.boolean(),selected:z.boolean(),owned:z.literal(true)})).max(80)}),
   z.strictObject({kind:z.literal('native_activation'),executionId:id,nativeInputType:z.enum(['checkbox','radio']),beforeChecked:z.boolean(),checked:z.boolean(),clicks:z.literal(1),targetOwned:z.literal(true)}),
-  z.strictObject({kind:z.literal('generic_activation'),role:ActionCandidateRoleV1Schema,beforeUrl:z.string().min(1).max(2048),afterUrl:z.string().min(1).max(2048),
-    delivery:z.strictObject({executionId:id,clicks:z.literal(1),targetOwned:z.literal(true),returned:z.literal(true)})})]);
+  z.strictObject({kind:z.literal('generic_activation'),role:ActionCandidateRoleV1Schema,
+    delivery:z.strictObject({executionId:id,clicks:z.literal(1),targetOwned:z.literal(true),dispatched:z.literal(true),returned:z.literal(true),
+      elapsedMs:z.number().int().nonnegative().max(120_000)})})]);
 export const DeferredRunnerRecordV9Schema=z.strictObject({runnerVersion:z.literal('9'),executionRunId:id,startedAt:z.iso.datetime(),finishedAt:z.iso.datetime(),
   provenance:z.strictObject({testSpecId:id,resolvedSpecId:id,resolvedDigest:digest,compilerAttemptId:id,traceDigest:digest,admissionDigest:digest,
     executionProfileRef:ExecutionProfileRefSchema,profileFingerprint:digest,sessionId:id.optional()}).optional(),cleanup:z.enum(['verified','unverified']),
@@ -37,14 +38,19 @@ export function parseDeferredRunnerRecordV9(input:unknown):DeferredRunnerRecordV
   const r=DeferredRunnerRecordV9Schema.parse(input),{recordDigest,...data}=r;
   if(hash(data)!==recordDigest||Date.parse(r.finishedAt)<Date.parse(r.startedAt)||new Set(r.steps.map(s=>s.stepId)).size!==r.steps.length)throw new Error('INVALID_RUN_V9');
   if(new Set(r.steps.flatMap(s=>s.verificationProof?[s.verificationProof.proofId]:[])).size!==r.steps.filter(s=>s.verificationProof).length)throw new Error('DUPLICATE_NATIVE_PROOF');
-  let current=r.startState;
-  for(const s of r.steps){if(!current||hash(current)!==hash(s.before)||s.before.sessionId!==r.provenance?.sessionId||s.after.sessionId!==s.before.sessionId||
+  let current=r.startState, pendingGeneric=false;
+  for(const s of r.steps){
+    const resumed=pendingGeneric&&!!current&&s.before.sessionId===current.sessionId&&
+      s.before.stateEpoch>current.stateEpoch&&s.before.mutationEpoch>current.mutationEpoch;
+    if(!current||hash(current)!==hash(s.before)&&!resumed||s.before.sessionId!==r.provenance?.sessionId||s.after.sessionId!==s.before.sessionId||
     s.after.pageId!==s.before.pageId||s.after.stateEpoch<s.before.stateEpoch||s.after.mutationEpoch<s.before.mutationEpoch||
     s.mutationMayHaveOccurred!==(s.invocation!=='not_invoked')||s.type==='action_goal'&&s.status==='succeeded'&&(!s.effectDigest||s.invocation!=='returned'||!s.predicateDigest)||
-    s.status==='stopped'&&!s.reasonCode||s.status!=='stopped'&&s.afterStateStatus!=='observed'||s.effectDigest!==undefined&&(!s.effect||hash(s.effect)!==s.effectDigest)||s.effect!==undefined&&(s.status!=='succeeded'||s.type!=='action_goal')||
+    s.status==='stopped'&&!s.reasonCode||s.status!=='stopped'&&s.afterStateStatus!=='observed'&&
+      !(s.status==='succeeded'&&s.effect?.kind==='generic_activation'&&s.afterStateStatus==='unavailable'&&hash(s.after)===hash(s.before))||
+    s.effectDigest!==undefined&&(!s.effect||hash(s.effect)!==s.effectDigest)||s.effect!==undefined&&(s.status!=='succeeded'||s.type!=='action_goal')||
     s.type==='verification_goal'&&s.status!=='stopped'&&(!s.verification||s.verification.evaluated!==(s.status==='assertion_passed')))throw new Error('INVALID_RUN_STEP_V9');
-    if(s.effect?.kind==='generic_activation'&&(s.operation!=='click'||s.invocation!=='returned'||!s.invokedAt||!s.returnedAt||
-      s.effect.beforeUrl.length===0||s.effect.afterUrl.length===0))throw new Error('INVALID_GENERIC_ACTIVATION');
+    if(s.effect?.kind==='generic_activation'&&(s.operation!=='click'||s.invocation!=='returned'||!s.invokedAt||!s.returnedAt))
+      throw new Error('INVALID_GENERIC_ACTIVATION');
     if(s.verification?.assertion.assertionVersion==='2'){
       const a=s.verification.assertion,p=s.verificationProof;
       if(!p||!['assertion_passed','assertion_failed'].includes(s.status)||s.type!=='verification_goal'||s.invocation!=='not_invoked'||p.sessionId!==s.before.sessionId||p.pageId!==s.before.pageId||p.stateDigest!==s.before.stateDigest||p.stateEpoch!==s.before.stateEpoch||p.mutationEpoch!==s.before.mutationEpoch||hash(s.before)!==hash(s.after))throw new Error('INVALID_NATIVE_VERIFICATION_PROOF_OWNER');
@@ -52,8 +58,10 @@ export function parseDeferredRunnerRecordV9(input:unknown):DeferredRunnerRecordV
       const {proofDigest,...data}=p,m=p.result.options.filter(o=>o.label===a.optionLabel);
       if(hash(data)!==proofDigest||hash(p.result.labelOwnership)!==p.result.labelOwnershipDigest||hash(p.result.predicate)!==hash(a.controlPredicate)||hash(p.result.frame)!==hash(a.frame)||p.result.optionLabel!==a.optionLabel||p.result.optionValue!==a.compiledOptionValue||p.result.labelOwnershipDigest!==a.compiledLabelOwnershipDigest||m.length!==1||p.result.options.filter(o=>o.value===a.compiledOptionValue).length!==1||p.result.optionCount!==p.result.options.length||m[0]!.value!==a.compiledOptionValue||m[0]!.selected!==p.result.selected||s.verification.actual!==p.result.selected||s.verification.evaluated!==(p.result.selected===a.expectedSelected))throw new Error('INVALID_NATIVE_VERIFICATION_PROOF');
     }else if(s.verificationProof)throw new Error('UNEXPECTED_NATIVE_VERIFICATION_PROOF');
-    current=s.after;}
-  if(r.result.kind==='completed'&&(!r.provenance||r.cleanup!=='verified'||!r.startState||!r.finalState||hash(current)!==hash(r.finalState)||
+    current=s.after;pendingGeneric=s.status==='succeeded'&&s.effect?.kind==='generic_activation'&&s.afterStateStatus==='unavailable';}
+  const resumedFinal=pendingGeneric&&!!current&&!!r.finalState&&r.finalState.sessionId===current.sessionId&&
+    r.finalState.stateEpoch>current.stateEpoch&&r.finalState.mutationEpoch>current.mutationEpoch;
+  if(r.result.kind==='completed'&&(!r.provenance||r.cleanup!=='verified'||!r.startState||!r.finalState||hash(current)!==hash(r.finalState)&&!resumedFinal||
     r.steps.some(s=>s.status==='stopped')||r.result.assertions!==r.steps.filter(s=>s.type==='verification_goal').length||r.result.passed!==!r.steps.some(s=>s.status==='assertion_failed')))throw new Error('INCOMPLETE_RUN_V9');
   return r;
 }

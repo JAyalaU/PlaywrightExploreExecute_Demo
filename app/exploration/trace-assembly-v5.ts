@@ -62,7 +62,27 @@ export class SuccessfulTraceAssemblerV5 {
   readonly #stopCapture;
   #start: TraceStateV5;
   #current: TraceStateV5;
+  #pendingGenericAction: number | undefined;
   #finalized = false;
+
+  #resumeGenericAction(observation: { sessionId: string; pageId: string;
+    stateDigest: string; stateEpoch: number; mutationEpoch: number; observedAt: string },
+    reference: { observationId: string } | { nextActionWitnessId: string }): void {
+    if (this.#pendingGenericAction === undefined) return;
+    const index = this.#pendingGenericAction, record = this.#path[index];
+    requireFact(record?.type === 'action_goal' && record.witness.postEffect.effect.kind === 'generic_activation' &&
+      observation.sessionId === this.#owner.sessionId &&
+      Date.parse(observation.observedAt) >= Date.parse(record.witness.execution.finishedAt) &&
+      observation.stateEpoch > this.#current.stateEpoch && observation.mutationEpoch > this.#current.mutationEpoch,
+      'V5 generic click continuation is not a later protected observation');
+    if (!record || record.type !== 'action_goal') throw new Error('V5 generic action missing');
+    const after = { sessionId: observation.sessionId, pageId: observation.pageId,
+      stateDigest: observation.stateDigest, stateEpoch: observation.stateEpoch, mutationEpoch: observation.mutationEpoch };
+    this.#path[index] = { ...record, postStateDigest: after.stateDigest,
+      continuation: { ...reference, after } };
+    this.#current = after;
+    this.#pendingGenericAction = undefined;
+  }
 
   /** Use create: start and owner fields are never caller-authored provenance. */
   private constructor(authority: symbol, runtime: ActionCandidateGroundingSessionV1, admission: TrustedSemanticAdmissionV2,
@@ -76,11 +96,13 @@ export class SuccessfulTraceAssemblerV5 {
     this.#nativeObservations=nativeObservations;this.#nativeVerification=nativeVerification;
     this.#stopNativeCapture=nativeObservations?NativeOptionObservationSessionV2.prototype.onProtectedRecord.call(nativeObservations,(record)=>{
       if(this.#finalized||record.status!=='complete')return;
+      this.#resumeGenericAction(record, { observationId: record.observationId });
       requireFact(record.sessionId===this.#owner.sessionId&&record.pageId===this.#current.pageId&&record.stateDigest===this.#current.stateDigest&&record.stateEpoch===this.#current.stateEpoch&&record.mutationEpoch===this.#current.mutationEpoch&&record.testSpecId===admission.spec.testSpecId&&record.explorationAttemptId===this.#owner.attemptId&&ActionCandidateGroundingSessionV1.prototype.protectedSuccessfulGroundingWitnesses.call(runtime).length===this.#actions.length,'Native capture outside committed state');
       this.#nativeCaptures.set(record.observationId,{record,actionOrdinal:this.#actions.length,pathPosition:this.#path.length,pathStateDigest:this.#current.stateDigest,currentAtCapture:true});
     }):()=>{};
     this.#stopCapture = observations ? TrustedObservationSessionV1.prototype.onProtectedRecord.call(observations, (record) => {
       if (this.#finalized || record.status !== 'complete' || record.result.kind === 'snapshot') return;
+      this.#resumeGenericAction(record, { observationId: record.observationId });
       requireFact(record.sessionId === this.#owner.sessionId && record.pageId === this.#current.pageId &&
         record.testSpecId === admission.spec.testSpecId && record.explorationAttemptId === this.#owner.attemptId &&
         record.stateDigest === this.#current.stateDigest && record.stateEpoch === this.#current.stateEpoch &&
@@ -120,6 +142,8 @@ export class SuccessfulTraceAssemblerV5 {
   }
   appendActionGroundingWitness(input: unknown): void {
     this.#active(); const witness = parseActionGroundingWitnessV1(input, this.#admission);
+    this.#resumeGenericAction({ ...witness.postEffect.before, observedAt: witness.preparation.observedAt },
+      { nextActionWitnessId: witness.witnessId });
     this.#step('action_goal', witness.preparation.goalId);
     const runtime = this.#runtime, journal = ActionCandidateGroundingSessionV1.prototype;
     const selected = journal.protectedSuccessfulGroundingWitnesses.call(runtime)[this.#actions.length];
@@ -128,20 +152,24 @@ export class SuccessfulTraceAssemblerV5 {
     const retirement = journal.protectedActionGroundingRetirement.call(runtime, witness.witnessId);
     requireFact(!!selected && same(selected, witness) && same(readback, witness) && !!mapping, 'V5 untrusted or abandoned witness');
     requireTrustedGroundingMappingV1(mapping!, this.#admission);
+    const generic = witness.postEffect.effect.kind === 'generic_activation';
     requireFact(mapping!.mappingDigest === witness.preparation.mappingDigest && same(mapping!.correspondence, witness.preparation.correspondence) &&
       same(journal.protectedActionGroundingFinalCheck.call(runtime, witness.execution.executionId), witness.finalCheck) &&
       same(journal.protectedActionExecution.call(runtime, witness.execution.executionId), witness.execution) &&
-      same(journal.protectedActionPostEffect.call(runtime, witness.postEffect.observationId), witness.postEffect) && !!retirement,
+      same(journal.protectedActionPostEffect.call(runtime, witness.postEffect.observationId), witness.postEffect) &&
+      (generic ? !retirement : !!retirement),
       'V5 private finalcheck/execution/post/mapping readback mismatch');
     const { frameId: _beforeFrame, ...before } = witness.postEffect.before;
-    const { frameId: _afterFrame, ...after } = retirement!.after;
     requireFact(same(this.#current, before), 'V5 action state chain mismatch');
+    const after = generic ? before : (() => { const { frameId: _afterFrame, ...state } = retirement!.after; return state; })();
     const record: SuccessfulPathRecordV5 = { type: 'action_goal', source: 'authored', recordId: `record-${randomUUID()}`,
       sequence: this.#path.length + 1, originStepId: witness.preparation.goalId,
-      preStateDigest: before.stateDigest, postStateDigest: after.stateDigest, witness, retirement: retirement! };
+      preStateDigest: before.stateDigest, postStateDigest: after.stateDigest, witness,
+      ...(retirement ? { retirement } : {}) };
     this.#actions.push({ recordId: record.recordId, witness, finalCheck: witness.finalCheck,
-      execution: witness.execution, postEffect: witness.postEffect, retirement: retirement!, mappingDigest: mapping!.mappingDigest });
+      execution: witness.execution, postEffect: witness.postEffect, ...(retirement ? { retirement } : {}), mappingDigest: mapping!.mappingDigest });
     this.#path.push(record); this.#current = after;
+    if (generic) this.#pendingGenericAction = this.#path.length - 1;
   }
   /** Existing navigation is evidenced by fresh protected URL/state, never model text. */
   async appendObservedNavigation(stepId: string): Promise<void> {
@@ -197,7 +225,7 @@ export class SuccessfulTraceAssemblerV5 {
   }
   async finalize(): Promise<AssembledSuccessfulTraceV5> {
     this.#active(); const current = await ActionCandidateGroundingSessionV1.prototype.protectedTraceState.call(this.#runtime);
-    requireFact(this.#path.length === this.#admission.spec.steps.length && same(statePoint(current, this.#owner.sessionId), this.#current) &&
+    requireFact(this.#pendingGenericAction === undefined && this.#path.length === this.#admission.spec.steps.length && same(statePoint(current, this.#owner.sessionId), this.#current) &&
       same(ActionCandidateGroundingSessionV1.prototype.protectedSuccessfulGroundingWitnesses.call(this.#runtime), this.#actions.map((a) => a.witness)),
       'V5 omitted/abandoned successful path or final state drift');
     validateSemanticAdmissionReadbackV2(this.#admission.record, this.#admission.spec, this.#admission);

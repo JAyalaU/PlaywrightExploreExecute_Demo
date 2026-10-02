@@ -53,7 +53,7 @@ export const CompilerAttemptV4Schema = z.strictObject({ compilerVersion: z.liter
   freshStartState: TraceStateV5Schema.optional(), freshFinalState: TraceStateV5Schema.optional(),
   // Validated successful invocation/effect accounting survives a later rejected result.
   // Only acceptance adds the complete ordered path/final-state requirements below.
-  freshActions: z.array(z.strictObject({ traceRecordId: id, witness: ActionGroundingWitnessV1Schema, retirement: ActionGroundingRetirementV1Schema })).max(100),
+  freshActions: z.array(z.strictObject({ traceRecordId: id, witness: ActionGroundingWitnessV1Schema, retirement: ActionGroundingRetirementV1Schema.optional() })).max(100),
   executionStops: z.array(z.strictObject({traceRecordId:id,execution:ActionExecutionAttemptV1Schema})).max(100),
   freshVerifications: z.array(z.strictObject({ traceRecordId: id, observation: z.union([TrustedObservationResultV1Schema,NativeOptionObservationV2Schema]) })).max(100),
   freshNavigations: z.array(z.strictObject({ traceRecordId:id,url:ApprovedAbsoluteUrlSchema,before:TraceStateV5Schema,after:TraceStateV5Schema,observedAt:z.iso.datetime() })).max(100),
@@ -95,9 +95,14 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
       Date.parse(w.preparation.observedAt)<Date.parse(a.startedAt) || Date.parse(w.execution.finishedAt)>Date.parse(a.finishedAt) ||
       !same(durableDeferredFrame(w.finalCheck.candidateObservation.status==='complete' ? w.finalCheck.candidateObservation.candidates.find(c=>c.selectedRef===w.finalCheck.selectedRef && c.frameId===w.finalCheck.frameId)!.frame : {kind:'main'}),
         durableDeferredFrame(original.witness.finalCheck.candidateObservation.status==='complete' ? original.witness.finalCheck.candidateObservation.candidates.find(c=>c.selectedRef===original.witness.finalCheck.selectedRef && c.frameId===original.witness.finalCheck.frameId)!.frame : {kind:'main'}))) throw new Error('INVALID_COMPILER_ACTION_CORRESPONDENCE');
-    const receipt=parseActionGroundingRetirementV1(fresh.retirement);
-    if(receipt.witnessId!==w.witnessId || receipt.postEffectDigest!==w.postEffect.witnessDigest || !same(receipt.before,w.postEffect.after) ||
-      Date.parse(receipt.observedAt)<Date.parse(w.execution.finishedAt)||Date.parse(receipt.observedAt)>Date.parse(a.finishedAt))throw new Error('INVALID_FRESH_RETIREMENT');
+    if (w.postEffect.effect.kind === 'generic_activation') {
+      if (fresh.retirement) throw new Error('INVALID_FRESH_GENERIC_RETIREMENT');
+    } else {
+      if (!fresh.retirement) throw new Error('MISSING_FRESH_RETIREMENT');
+      const receipt=parseActionGroundingRetirementV1(fresh.retirement);
+      if(receipt.witnessId!==w.witnessId || receipt.postEffectDigest!==w.postEffect.witnessDigest || !same(receipt.before,w.postEffect.after) ||
+        Date.parse(receipt.observedAt)<Date.parse(w.execution.finishedAt)||Date.parse(receipt.observedAt)>Date.parse(a.finishedAt))throw new Error('INVALID_FRESH_RETIREMENT');
+    }
   }
   for(const fresh of a.freshVerifications){
     const original=trace.successfulPath.find(r=>r.recordId===fresh.traceRecordId);
@@ -137,15 +142,41 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
     let current=a.freshStartState!;
     const point=(v:{sessionId:string;pageId:string;stateDigest:string;stateEpoch:number;mutationEpoch:number})=>({sessionId:v.sessionId,pageId:v.pageId,stateDigest:v.stateDigest,stateEpoch:v.stateEpoch,mutationEpoch:v.mutationEpoch});
     if(current.sessionId!==a.freshSessionId)throw new Error('INVALID_FRESH_START');
+    let pendingGeneric: CompilerAttemptV4['freshActions'][number]['witness'] | undefined;
     for(const record of trace.successfulPath){
       if(record.type==='action_goal'){const f=a.freshActions.find(x=>x.traceRecordId===record.recordId)!;
-        if(!same(current,point(f.witness.postEffect.before)))throw new Error('INVALID_FRESH_ACTION_ORDER');current=point(f.retirement.after);
+        if (pendingGeneric) {
+          const before = point(f.witness.postEffect.before);
+          if (before.sessionId !== current.sessionId || before.stateEpoch <= current.stateEpoch ||
+            before.mutationEpoch <= current.mutationEpoch ||
+            Date.parse(f.witness.preparation.observedAt) < Date.parse(pendingGeneric.execution.finishedAt))
+            throw new Error('INVALID_FRESH_GENERIC_CONTINUATION');
+          current = before; pendingGeneric = undefined;
+        }
+        if(!same(current,point(f.witness.postEffect.before)))throw new Error('INVALID_FRESH_ACTION_ORDER');
+        if (f.witness.postEffect.effect.kind === 'generic_activation') pendingGeneric = f.witness;
+        else { if (!f.retirement) throw new Error('MISSING_FRESH_RETIREMENT'); current=point(f.retirement.after); }
       }else if(record.type==='navigate'){const f=a.freshNavigations.find(x=>x.traceRecordId===record.recordId)!;
+        if (pendingGeneric) {
+          if (f.before.sessionId !== current.sessionId || f.before.stateEpoch <= current.stateEpoch ||
+            f.before.mutationEpoch <= current.mutationEpoch ||
+            Date.parse(f.observedAt) < Date.parse(pendingGeneric.execution.finishedAt))
+            throw new Error('INVALID_FRESH_GENERIC_CONTINUATION');
+          current = f.before; pendingGeneric = undefined;
+        }
         if(!same(current,f.before))throw new Error('INVALID_FRESH_NAVIGATION_ORDER');current=f.after;
       }else{const f=a.freshVerifications.find(x=>x.traceRecordId===record.recordId)!;
+        if (pendingGeneric) {
+          const observed = point(f.observation);
+          if (observed.sessionId !== current.sessionId || observed.stateEpoch <= current.stateEpoch ||
+            observed.mutationEpoch <= current.mutationEpoch ||
+            Date.parse(f.observation.observedAt) < Date.parse(pendingGeneric.execution.finishedAt))
+            throw new Error('INVALID_FRESH_GENERIC_CONTINUATION');
+          current = observed; pendingGeneric = undefined;
+        }
         if(!same(current,point(f.observation)))throw new Error('INVALID_FRESH_VERIFICATION_ORDER');}
     }
-    if(!same(current,a.freshFinalState))throw new Error('INVALID_FRESH_FINAL_STATE');
+    if(pendingGeneric || !same(current,a.freshFinalState))throw new Error('INVALID_FRESH_FINAL_STATE');
   }
   return a;
 }

@@ -24,7 +24,12 @@ export type TraceStateV5 = z.infer<typeof TraceStateV5Schema>;
 const base = { recordId: id, sequence: z.number().int().positive(), source: z.literal('authored'),
   originStepId: id, preStateDigest: digest, postStateDigest: digest };
 export const SuccessfulActionGroundingRecordV5Schema = z.strictObject({ ...base,
-  type: z.literal('action_goal'), witness: ActionGroundingWitnessV1Schema, retirement: ActionGroundingRetirementV1Schema });
+  type: z.literal('action_goal'), witness: ActionGroundingWitnessV1Schema, retirement: ActionGroundingRetirementV1Schema.optional(),
+  // A navigating PoC click is delivered before the next step observes its new document.
+  continuation: z.union([
+    z.strictObject({ observationId: id, after: TraceStateV5Schema }),
+    z.strictObject({ nextActionWitnessId: id, after: TraceStateV5Schema }),
+  ]).optional() });
 export const SuccessfulNavigationRecordV5Schema = z.strictObject({ ...base, type: z.literal('navigate'),
   url: ApprovedAbsoluteUrlSchema, before: TraceStateV5Schema, after: TraceStateV5Schema, observedAt: z.iso.datetime() });
 export const SuccessfulPathRecordV5Schema = z.union([
@@ -95,16 +100,35 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
       const witness = parseActionGroundingWitnessV1(record.witness,
         { source, semanticAdmission: admission }), pre = witness.finalCheck,
         parent = pre.candidateObservation, execution = witness.execution, post = witness.postEffect,
-        retirement = parseActionGroundingRetirementV1(record.retirement);
+        generic = post.effect.kind === 'generic_activation',
+        retirement = record.retirement ? parseActionGroundingRetirementV1(record.retirement) : undefined;
+      const continuation = record.continuation;
+      const following = trace.successfulPath[index + 1];
+      const actionAfter = generic ? continuation?.after : retirement?.after;
       requireFact(parent.status === 'complete' && parent.testSpecId === trace.testSpecId &&
         parent.explorationAttemptId === trace.explorationAttemptId && parent.sessionId === trace.sessionId &&
         parent.profileFingerprint === trace.profileFingerprint && same(parent.executionProfileRef, trace.executionProfileRef) &&
         same(parent.request.handoff, trace.obligationHandoff) && same(pre.sourceGoal, step) &&
         pre.sourceInstruction === source.sourceInstruction && pre.admissionDigest === sourceHash(admission) &&
         same(witness.preparation.sourceGoal, step) && record.preStateDigest === post.before.stateDigest &&
-        retirement.witnessId === witness.witnessId && retirement.postEffectDigest === post.witnessDigest &&
-        same(retirement.before, post.after) && record.postStateDigest === retirement.after.stateDigest &&
-        Date.parse(retirement.observedAt) >= Date.parse(execution.finishedAt) && Date.parse(retirement.observedAt) <= Date.parse(trace.finishedAt) &&
+        (generic ? !retirement && !!continuation && !!actionAfter && continuation.after.sessionId === trace.sessionId &&
+          continuation.after.stateEpoch > post.before.stateEpoch && continuation.after.mutationEpoch > post.before.mutationEpoch &&
+          (following?.type === 'verification_goal' && 'observationId' in continuation &&
+            following.observationIds.includes(continuation.observationId) &&
+            following.observations.some(o => o.observationId === continuation.observationId &&
+              same(continuation.after, { sessionId: o.sessionId, pageId: o.pageId, stateDigest: o.stateDigest,
+                stateEpoch: o.stateEpoch, mutationEpoch: o.mutationEpoch })) ||
+          following?.type === 'action_goal' && 'nextActionWitnessId' in continuation &&
+            following.witness.witnessId === continuation.nextActionWitnessId &&
+            same(continuation.after, { sessionId: following.witness.postEffect.before.sessionId,
+              pageId: following.witness.postEffect.before.pageId,
+              stateDigest: following.witness.postEffect.before.stateDigest,
+              stateEpoch: following.witness.postEffect.before.stateEpoch,
+              mutationEpoch: following.witness.postEffect.before.mutationEpoch })) :
+          !!retirement && !continuation && retirement.witnessId === witness.witnessId && retirement.postEffectDigest === post.witnessDigest &&
+          same(retirement.before, post.after) && Date.parse(retirement.observedAt) >= Date.parse(execution.finishedAt) &&
+          Date.parse(retirement.observedAt) <= Date.parse(trace.finishedAt)) &&
+        record.postStateDigest === actionAfter?.stateDigest &&
         same(current, { sessionId: post.before.sessionId, pageId: post.before.pageId, stateDigest: post.before.stateDigest,
           stateEpoch: post.before.stateEpoch, mutationEpoch: post.before.mutationEpoch }) &&
         Date.parse(witness.preparation.observedAt) >= Date.parse(trace.startedAt) &&
@@ -112,7 +136,9 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
         !executions.has(execution.executionId) && !witnessIds.has(witness.witnessId) && !strategies.has(pre.strategyId),
         'V5 successful action source/argument/frame/execution correspondence mismatch');
       executions.add(execution.executionId); witnessIds.add(witness.witnessId); strategies.add(pre.strategyId);
-      const { frameId: _frame, ...after } = retirement.after; current = after; actions++;
+      if (!actionAfter) throw new Error('V5 action continuation missing');
+      current = { sessionId: actionAfter.sessionId, pageId: actionAfter.pageId, stateDigest: actionAfter.stateDigest,
+        stateEpoch: actionAfter.stateEpoch, mutationEpoch: actionAfter.mutationEpoch }; actions++;
     } else if (record.type === 'navigate' && step.type === 'navigate') {
       requireFact(record.url === step.url && same(record.before, current) && record.after.sessionId === trace.sessionId &&
         record.after.pageId === current.pageId && record.after.stateDigest === record.postStateDigest &&

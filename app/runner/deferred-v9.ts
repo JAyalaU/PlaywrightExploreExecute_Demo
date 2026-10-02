@@ -106,26 +106,27 @@ class FreshRunner {
     for(const [left,right] of [[a.all.map(c=>c.handle),b.all.map(c=>c.handle)],[a.labels,b.labels],[a.options,b.options]])for(let i=0;i<left!.length;i++)if(!await identical(left![i]!,right![i]!))stop('STALE_EVIDENCE');}
   async execute(action:Action,before:DeferredRunStateV9):Promise<Step>{return this.exclusive(async()=>{
     let initial:Proof|undefined,renewed:Proof|undefined;let invocation:Step['invocation']='not_invoked',predicateDigest:string|undefined,effectDigest:string|undefined,reasonCode:DeferredRunnerStopV9|undefined,invokedAt:string|undefined,returnedAt:string|undefined;
-    let after=before,effect:Step['effect'],activationId:string|undefined,afterStateStatus:Step['afterStateStatus']='observed';
+    let after=before,effect:Step['effect'],activationId:string|undefined,afterStateStatus:Step['afterStateStatus']='observed',genericClick=false;
     try{if(!same(await this.state(),before))stop('STATE_CONTINUITY_MISMATCH');initial=await this.prove(action);
       // Preparation can scroll/mutate; renew the entire predicate and retain identity afterwards.
       await initial.target.handle.scrollIntoViewIfNeeded({timeout:3000});renewed=await this.prove(action);await this.sameProof(initial,renewed);
       const finalState=await this.state();if(!same(finalState,before))stop('STALE_EVIDENCE');predicateDigest=renewed.digest;
-      const executionId=`execution-${randomUUID()}`,genericClick=action.operation==='click'&&action.guard.nativeEffect==='generic_activation';
+      const executionId=`execution-${randomUUID()}`;genericClick=action.operation==='click'&&action.guard.nativeEffect==='generic_activation';
       if(action.operation==='click'&&!genericClick){activationId=executionId;const armed=await nativeActivationReceipt(renewed.target.handle,executionId,'arm');if(armed.clicks!==0)stop('POST_EFFECT_UNPROVEN');}
       if(!same(await this.state(),finalState))stop('STALE_EVIDENCE');this.bounded();invokedAt=new Date().toISOString();invocation='threw';this.mutated();
-      const beforeUrl=this.page.url();
+      const dispatchStarted=Date.now();
       try{if(action.operation==='fill')await renewed.target.handle.fill(action.executableArgument!,{force:true,timeout:3000});
         else if(action.operation==='select_option')await renewed.target.handle.selectOption({value:action.executableArgument!},{force:true,timeout:3000});
         else if(genericClick)await renewed.target.handle.click({force:true,timeout:Math.max(1,Math.min(this.session.effectiveProfile.profile.timeoutPolicy.navigationMs,this.deadline-Date.now()))});
         else await renewed.target.handle.click({force:true,timeout:3000,noWaitAfter:true});}
       catch{stop('ACTION_FAILED_PARTIAL_OR_UNKNOWN');}invocation='returned';returnedAt=new Date().toISOString();
       if(genericClick){
-        const effectState=await this.state(),afterUrl=this.page.url();
-        if(!same(effectState,await this.state())||afterUrl!==this.page.url())stop('POST_EFFECT_UNPROVEN');
-        effect={kind:'generic_activation',role:renewed.target.role,beforeUrl,afterUrl,
-          delivery:{executionId,clicks:1,targetOwned:true,returned:true}};
-        after=effectState;effectDigest=hash(effect);
+        effect={kind:'generic_activation',role:renewed.target.role,
+          delivery:{executionId,clicks:1,targetOwned:true,dispatched:true,returned:true,
+            elapsedMs:Math.min(120_000,Math.max(0,Date.now()-dispatchStarted))}};
+        // Delivery is already established. The next replay step obtains its own
+        // browser state after a possible document replacement.
+        effectDigest=hash(effect);afterStateStatus='unavailable';
       }else{
       const effectState=await this.state(),current=await this.facts(renewed.target.handle);if(await renewed.target.handle.ownerFrame()!==renewed.target.frame||!same(await this.framePath(renewed.target.frame),action.guard.frame))stop('POST_EFFECT_UNPROVEN');
       const postProof=await this.prove(action,true);
@@ -140,7 +141,7 @@ class FreshRunner {
         after=await this.state();if(!same(effectState,after)||!same(after,await this.state()))stop('POST_EFFECT_UNPROVEN');effectDigest=hash(effect);
       }finally{if(postProof)await dispose(postProof);}
       }
-    }catch(e){reasonCode=e instanceof Stop?e.reason:invocation==='returned'?'POST_EFFECT_UNPROVEN':'ENVIRONMENT_FAILURE';effectDigest=undefined;effect=undefined;try{after=await this.state();}catch{afterStateStatus='unavailable';/* after retains only the last known point */}}
+    }catch(e){reasonCode=e instanceof Stop?e.reason:invocation==='returned'?(genericClick?'ENVIRONMENT_FAILURE':'POST_EFFECT_UNPROVEN'):'ENVIRONMENT_FAILURE';effectDigest=undefined;effect=undefined;try{after=await this.state();}catch{afterStateStatus='unavailable';/* after retains only the last known point */}}
     finally{if(activationId&&renewed)await nativeActivationReceipt(renewed.target.handle,activationId,'clear').catch(()=>{});if(initial)await dispose(initial);if(renewed)await dispose(renewed);}
     return{stepId:action.id,traceRecordId:action.traceRecordId,originStepId:action.originStepId,type:'action_goal',status:reasonCode?'stopped':'succeeded',before,after,afterStateStatus,operation:action.operation,
       ...(action.executableArgument!==undefined?{argument:action.executableArgument}:{}),invocation,mutationMayHaveOccurred:invocation!=='not_invoked',...(predicateDigest?{predicateDigest}:{}),...(effectDigest&&effect?{effectDigest,effect}:{}),
@@ -160,7 +161,13 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
     if(artifact.trace.source.startState.url!=='about:blank'){const response=await page.goto(artifact.trace.source.startState.url,{timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
       if(response?.status()===403&&await response.text()==='Network policy denied request')stop('ENVIRONMENT_FAILURE');runtime.mutated();}
     startState=await runtime.state();let current=startState;
-    for(const s of r.executionSteps){failedStepId=s.id;runtime.bounded();if(!same(await runtime.state(),current))stop('STATE_CONTINUITY_MISMATCH');let entry:Step;
+    for(const s of r.executionSteps){
+      failedStepId=s.id;runtime.bounded();
+      const preceding=steps.at(-1);
+      if(preceding?.status==='succeeded'&&preceding.effect?.kind==='generic_activation'&&preceding.afterStateStatus==='unavailable')
+        current=await runtime.state();
+      else if(!same(await runtime.state(),current))stop('STATE_CONTINUITY_MISMATCH');
+      let entry:Step;
       if(s.type==='action_goal')entry=await runtime.execute(s,current);
       else{const base={stepId:s.id,traceRecordId:s.traceRecordId,originStepId:s.originStepId,type:s.type,before:current};
         entry=await runtime.exclusive(async()=>{if(s.type==='navigate'){let invocation:Step['invocation']='not_invoked';try{runtime!.mutated();invocation='threw';const response=await page.goto(s.url,{timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
@@ -172,7 +179,11 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
           return{...base,after,afterStateStatus:'observed' as const,status:result.status==='QA_ASSERTION_PASSED'?'assertion_passed' as const:result.status==='QA_ASSERTION_FAILED'?'assertion_failed' as const:'stopped' as const,
             invocation:'not_invoked' as const,mutationMayHaveOccurred:false,...(result.facts?{verification:result.facts}:{}),...(result.proof?{verificationProof:result.proof}:{}),...(result.status==='QA_ASSERTION_PASSED'||result.status==='QA_ASSERTION_FAILED'?{}:{reasonCode:result.reason==='OPTION_MAPPING_MISMATCH'?'OPTION_MAPPING_MISMATCH' as const:result.reason==='FRAME_MISMATCH'?'FRAME_MISMATCH' as const:result.reason==='NON_UNIQUE_MATCH'?'NON_UNIQUE_MATCH' as const:'VERIFICATION_UNEVALUABLE' as const})};});}
       steps.push(entry);current=entry.after;if(entry.status==='stopped')stop(entry.reasonCode!);
-    }finalState=await runtime.state();if(!same(current,finalState))stop('STATE_CONTINUITY_MISMATCH');failedStepId=undefined;
+    }finalState=await runtime.state();
+    const last=steps.at(-1);
+    if(last?.status==='succeeded'&&last.effect?.kind==='generic_activation'&&last.afterStateStatus==='unavailable')
+      current=finalState;
+    if(!same(current,finalState))stop('STATE_CONTINUITY_MISMATCH');failedStepId=undefined;
   }catch(e){reason=e instanceof Stop?e.reason:'ENVIRONMENT_FAILURE';}
   finally{if(session)try{if(runtime&&finalState)await session.closeWithFinalCheck(async()=>{if(!same(finalState,await runtime!.state(true)))stop('STATE_CONTINUITY_MISMATCH');});else await session.close();}
     catch(e){if(e instanceof ProtectedFinalCheckError){reason=e.checkError instanceof Stop?e.checkError.reason:'STATE_CONTINUITY_MISMATCH';}else{cleanup='unverified';reason='CLEANUP_UNVERIFIED';}}}

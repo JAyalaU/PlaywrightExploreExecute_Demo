@@ -17,6 +17,8 @@ const identical=async(a:ElementHandle,b:ElementHandle)=>a.evaluate((node,old)=>n
 async function ownedLabels(...args:Parameters<typeof readOwnedLabelSourcesFromLocator>){try{return await readOwnedLabelSourcesFromLocator(...args);}catch(e){const message=e instanceof Error?e.message:'';stop(message==='LABEL_RESULT_LIMIT'?'RESULT_LIMIT':message==='LABEL_STALE_STATE'?'STALE_STATE':'UNSUPPORTED_CONTROL');}}
 type Candidate={frame:Frame;locator:Locator;handle:ElementHandle;role:'combobox'|'listbox'};
 type Read={all:Candidate[];target:Candidate;labels:ElementHandle[];options:ElementHandle[];value:z.infer<typeof NativeOptionProofSchema>};
+/** Optional restricted diagnostic side channel; it has no effect on native proof. */
+export type NativeOptionReadDiagnostic={ownerCandidateCount?:number;ownerRole?:'combobox'|'listbox';optionCandidateCount?:number;optionSelected?:boolean;unresolvedConstraint?:string};
 async function framePath(page:Page,frame:Frame):Promise<z.infer<typeof NativeOptionProofSchema>['frame']>{if(frame===page.mainFrame())return{kind:'main'};const anchors:Extract<z.infer<typeof NativeOptionProofSchema>['frame'],{kind:'nested'}>['anchors']=[];
  let child=frame;while(child!==page.mainFrame()){const parent=child.parentFrame();if(!parent||anchors.length>=8)stop('UNPROVEN_FRAME');const owner=await child.frameElement();try{let found:typeof anchors[number]|undefined;
  for(const kind of ['title','testId'] as const){const attribute=kind==='title'?'title':'data-testid',value=await owner.getAttribute(attribute);if(!value||value.length>512)continue;const siblings=parent!.locator('iframe'),count=await siblings.count();if(count>80)stop('RESULT_LIMIT');let matches=0,owned=false;
@@ -27,22 +29,29 @@ async function framePath(page:Page,frame:Frame):Promise<z.infer<typeof NativeOpt
 const dispose=async(p:Read)=>{await Promise.allSettled([...p.all.map(c=>c.handle),...p.labels,...p.options].map(h=>h.dispose()));};
 /** Fixed utility-world native reader. No action authority, source parsing or model locator language. */
 export async function readNativeOwnedOptionState(page:Page,predicate:NativeOptionAssertionV2['controlPredicate'],optionLabel:string,
- state:()=>Promise<unknown>,bounded:()=>void,identity:(h:ElementHandle)=>Promise<string>,expectedFrame?:NativeOptionAssertionV2['frame'],compiledValue?:string,compiledLabelOwnershipDigest?:string):Promise<z.infer<typeof NativeOptionProofSchema>>{
+ state:()=>Promise<unknown>,bounded:()=>void,identity:(h:ElementHandle)=>Promise<string>,expectedFrame?:NativeOptionAssertionV2['frame'],compiledValue?:string,compiledLabelOwnershipDigest?:string,diagnostic?:NativeOptionReadDiagnostic):Promise<z.infer<typeof NativeOptionProofSchema>>{
  await Promise.all([engines,nativeOptionEngine,nativeOptionFactsEngine]);const before=await state();let first:Read|undefined,renewed:Read|undefined;
  const prove=async():Promise<Read>=>{const all:Candidate[]=[],labels:ElementHandle[]=[],options:ElementHandle[]=[];
  try{bounded();const frames=page.frames();if(frames.length>8)stop('RESULT_LIMIT');
  for(const frame of frames)for(const role of ['combobox','listbox'] as const){let locator=frame.getByRole(role,{includeHidden:true});
   for(const c of predicate.controlConstraints){if(c.kind==='role'&&c.text!==role){locator=locator.and(frame.getByRole(c.text as 'combobox',{includeHidden:true}));}if(c.kind==='name')locator=locator.and(frame.getByRole(role,{name:c.text,exact:true,includeHidden:true}));}
   const count=await locator.count();if(all.length+count>80)stop('RESULT_LIMIT');for(let i=0;i<count;i++){bounded();const current=locator.nth(i),handle=await current.elementHandle();if(!handle||await handle.ownerFrame()!==frame){await handle?.dispose();stop('STALE_STATE');}all.push({frame,locator:current,handle,role});}}
- let eligible=all;for(const c of predicate.controlConstraints.filter(c=>c.kind==='label')){const kept:Candidate[]=[];for(const candidate of eligible){const sources=await ownedLabels(candidate.frame,candidate.locator,c.text,candidate.role,bounded);if(sources.length)kept.push(candidate);await Promise.allSettled(sources.map(s=>s.handle.dispose()));}eligible=kept;}
+ let eligible=all;for(const c of predicate.controlConstraints.filter(c=>c.kind==='label')){const kept:Candidate[]=[];for(const candidate of eligible){const sources=await ownedLabels(candidate.frame,candidate.locator,c.text,candidate.role,bounded);if(sources.length)kept.push(candidate);await Promise.allSettled(sources.map(s=>s.handle.dispose()));}eligible=kept;if(!eligible.length&&diagnostic)diagnostic.unresolvedConstraint=`label:${c.text}`;}
+ if(diagnostic){diagnostic.ownerCandidateCount=eligible.length;
+  if(!eligible.length&&!diagnostic.unresolvedConstraint)diagnostic.unresolvedConstraint=
+    predicate.controlConstraints.some(c=>c.kind==='role'||c.kind==='name')?'role_or_name':'owner_absent';}
  if(eligible.length!==1)stop(eligible.length?'NON_UNIQUE':'NO_MATCH');const target=eligible[0]!,frame=await framePath(page,target.frame);
+ if(diagnostic)diagnostic.ownerRole=target.role;
  for(const c of predicate.controlConstraints.filter(c=>c.kind==='label')){const sources=await ownedLabels(target.frame,target.locator,c.text,target.role,bounded);if(!sources.length)stop('STALE_STATE');for(const source of sources){if(await Promise.all(labels.map(h=>identical(h,source.handle))).then(values=>values.some(Boolean)))await source.handle.dispose();else labels.push(source.handle);}}
  if(expectedFrame&&hash(frame)!==hash(expectedFrame))stop('UNPROVEN_FRAME');if(!await target.handle.isVisible())stop('UNSUPPORTED_CONTROL');
  const carrier=await target.handle.$('verification_v2_native_options=');let payload;try{payload=await carrier?.textContent();}finally{await carrier?.dispose();}
  if(!payload||payload==='overflow'||payload.length>262144)stop('RESULT_LIMIT');let f=facts.parse(JSON.parse(payload!));if(!f.native||f.multiple)stop('UNSUPPORTED_CONTROL');
  const sharedCarrier=await target.handle.$('wp2b_native_option_facts=');let sharedPayload;try{sharedPayload=await sharedCarrier?.textContent();}finally{await sharedCarrier?.dispose();}
  if(!sharedPayload||sharedPayload.length>262144)stop('RESULT_LIMIT');const shared=nativeFactsSchema.parse(JSON.parse(sharedPayload!));if(shared.status!=='complete')stop('RESULT_LIMIT');if(shared.count!==shared.options.length||shared.multiple)stop('UNSUPPORTED_CONTROL');f={native:true,multiple:false,options:shared.options.map(({displayedLabel,...o})=>({...o,label:displayedLabel}))};
- const matches=f.options.filter(o=>o.label===optionLabel);if(!matches.length)stop('OPTION_ABSENT');if(matches.length!==1)stop('OPTION_NON_UNIQUE');const matched=matches[0]!;
+ const matches=f.options.filter(o=>o.label===optionLabel);if(diagnostic){diagnostic.optionCandidateCount=matches.length;
+  if(matches.length!==1)diagnostic.unresolvedConstraint='option_label';}
+ if(!matches.length)stop('OPTION_ABSENT');if(matches.length!==1)stop('OPTION_NON_UNIQUE');const matched=matches[0]!;
+ if(diagnostic)diagnostic.optionSelected=matched.selected;
  if(f.options.filter(o=>o.value===matched.value).length!==1)stop('VALUE_NON_UNIQUE');if(compiledValue!==undefined&&matched.value!==compiledValue)stop('VALUE_NON_UNIQUE');
  options.push(...await target.handle.$$('wp2b_native_options='));if(options.length!==f.options.length||options.length>80)stop('RESULT_LIMIT');for(const h of options)if(await h.ownerFrame()!==target.frame)stop('STALE_STATE');
  const ownership=predicate.controlConstraints.some(c=>c.kind==='label')?await readNativeLabelOwnership(target.handle):null,labelOwnershipDigest=hash(ownership);if(compiledLabelOwnershipDigest!==undefined&&compiledLabelOwnershipDigest!==labelOwnershipDigest)stop('STALE_STATE');

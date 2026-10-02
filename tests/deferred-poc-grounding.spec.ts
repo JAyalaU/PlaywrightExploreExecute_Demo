@@ -62,9 +62,17 @@ test('PoC unique link click navigates and retains a generic delivery witness aft
     expect(result.status, JSON.stringify(result)).toBe('succeeded');
     if (result.status !== 'succeeded') return;
     expect(result.witness.postEffect.effect).toMatchObject({ kind: 'generic_activation', role: 'link',
-      beforeUrl: f.url, afterUrl: `${f.url}next`, delivery: { clicks: 1, targetOwned: true, returned: true } });
+      accessibleName: 'Dropdown', delivery: { stepId: 'click', clicks: 1, targetOwned: true,
+        dispatched: true, returned: true, elapsedMs: expect.any(Number) } });
+    expect(f.session.browserSession.context.pages()[0]!.url()).toBe(`${f.url}next`);
+    expect(f.runtime.protectedGenericClickDelivery(result.witness.execution.executionId)).toMatchObject({
+      stepId: 'click', role: 'link', accessibleName: 'Dropdown', dispatched: true, returned: true,
+      elapsedMs: expect.any(Number) });
+    expect(result.witness.execution.genericClickDelivery).toMatchObject({ stepId: 'click', role: 'link', accessibleName: 'Dropdown',
+      dispatched: true, returned: true, elapsedMs: expect.any(Number) });
     expect(result.witness.postEffect.sameTargetNode).toBe(false);
-    expect(f.runtime.protectedActionGroundingRetirement(result.witness.witnessId)).toBeDefined();
+    expect(result.witness.postEffect.after).toBeUndefined();
+    expect(f.runtime.protectedActionGroundingRetirement(result.witness.witnessId)).toBeUndefined();
   } finally { await f.close(); }
 });
 
@@ -78,7 +86,11 @@ test('PoC two matching links stop as non-unique before click', async () => {
 test('PoC unnamed native dropdown resolves its option without another source model', async () => {
   const f = await fixture('<select><option value="">Choose</option><option value="runtime-1">Option 1</option></select>', select());
   try { const result = await run(f, 'choose'); expect(result.status, JSON.stringify(result)).toBe('succeeded');
-    if (result.status === 'succeeded') expect(result.witness.postEffect.effect).toMatchObject({ kind: 'native_choice', value: 'runtime-1' }); }
+    if (result.status === 'succeeded') {
+      expect(result.witness.postEffect.effect).toMatchObject({ kind: 'native_choice', value: 'runtime-1' });
+      expect(result.witness.postEffect.after).toBeDefined();
+      expect(f.runtime.protectedActionGroundingRetirement(result.witness.witnessId)).toBeDefined();
+    } }
   finally { await f.close(); }
 });
 
@@ -97,8 +109,71 @@ test('PoC same-page click remains witnessable after the clicked target removes i
       { kind: 'name', value: 'Remove', polarity: 'positive' }], argument: null, dependsOnStepId: null };
   const f = await fixture('<button onclick="this.remove()">Remove</button>', button);
   try { const result = await run(f, 'click'); expect(result.status, JSON.stringify(result)).toBe('succeeded');
-    if (result.status === 'succeeded') { expect(result.witness.postEffect.effect.kind).toBe('generic_activation');
+    if (result.status === 'succeeded') { expect(result.witness.postEffect.effect).toMatchObject({kind:'generic_activation',
+      role:'button',accessibleName:'Remove',delivery:{dispatched:true,returned:true}});
       expect(result.witness.postEffect.sameTargetNode).toBe(false);
-      expect(f.runtime.protectedActionGroundingRetirement(result.witness.witnessId)).toBeDefined(); } }
+      expect(result.witness.postEffect.after).toBeUndefined();
+      expect(f.runtime.protectedActionGroundingRetirement(result.witness.witnessId)).toBeUndefined(); } }
   finally { await f.close(); }
+});
+
+test('PoC generic click dispatch failure remains an automation stop', async () => {
+  const f = await fixture('<a href="/next">Dropdown</a>', link());
+  const handle = await f.session.browserSession.context.pages()[0]!.$('a');
+  if (!handle) throw new Error('Missing fixture link');
+  const proto = Object.getPrototypeOf(handle) as { click: typeof handle.click };
+  const original = proto.click;
+  try {
+    proto.click = async () => { throw new Error('Injected click failure'); };
+    const result = await run(f, 'click');
+    expect(result).toMatchObject({ status: 'stop', reason: 'ACTION_FAILED_PARTIAL_OR_UNKNOWN' });
+    expect(result.executionAttempts[0]?.genericClickDelivery).toBeUndefined();
+    expect(f.session.browserSession.context.pages()[0]!.url()).toBe(f.url);
+  } finally { proto.click = original; await handle.dispose(); await f.close(); }
+});
+
+test('PoC returned click succeeds when immediate ARIA continuity capture is unavailable', async () => {
+  const f = await fixture('<a href="/next">Dropdown</a>', link());
+  const page = f.session.browserSession.context.pages()[0]!;
+  const handle = await page.$('a');
+  if (!handle) throw new Error('Missing fixture link');
+  const handleProto = Object.getPrototypeOf(handle) as { click: typeof handle.click };
+  const locator = page.locator('body');
+  const locatorProto = Object.getPrototypeOf(locator) as { ariaSnapshot: typeof locator.ariaSnapshot };
+  const originalClick = handleProto.click, originalSnapshot = locatorProto.ariaSnapshot;
+  try {
+    handleProto.click = async function (...args) {
+      await originalClick.apply(this, args);
+      locatorProto.ariaSnapshot = async () => { throw new Error('Injected continuity capture failure'); };
+    };
+    const result = await run(f, 'click');
+    expect(result.status, JSON.stringify(result)).toBe('succeeded');
+    if (result.status !== 'succeeded') return;
+    expect(result.witness.execution).toMatchObject({ invocationOutcome: 'returned', reason: 'DELIVERY_PROVEN',
+      genericClickDelivery: { stepId: 'click', role: 'link', accessibleName: 'Dropdown', dispatched: true, returned: true,
+        elapsedMs: expect.any(Number) } });
+    expect(result.witness.postEffect.after).toBeUndefined();
+    expect(page.url()).toBe(`${f.url}next`);
+  } finally { handleProto.click = originalClick; locatorProto.ariaSnapshot = originalSnapshot;
+    await handle.dispose(); await f.close(); }
+});
+
+test('PoC target disappearance before dispatch stops without clicking', async () => {
+  const f = await fixture('<a href="/next">Dropdown</a>', link());
+  const page = f.session.browserSession.context.pages()[0]!;
+  const handle = await page.$('a');
+  if (!handle) throw new Error('Missing fixture link');
+  const proto = Object.getPrototypeOf(handle) as { scrollIntoViewIfNeeded: typeof handle.scrollIntoViewIfNeeded };
+  const original = proto.scrollIntoViewIfNeeded;
+  let replaced = false;
+  try {
+    proto.scrollIntoViewIfNeeded = async function (...args) {
+      await original.apply(this, args);
+      if (!replaced) { replaced = true; await page.evaluate(() => { document.querySelector('a')!.remove(); }); }
+    };
+    const result = await run(f, 'click');
+    expect(replaced).toBe(true);
+    expect(result).toMatchObject({ status: 'stop' });
+    expect(page.url()).toBe(f.url);
+  } finally { proto.scrollIntoViewIfNeeded = original; await handle.dispose(); await f.close(); }
 });

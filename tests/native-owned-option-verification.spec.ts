@@ -187,7 +187,7 @@ test('primary complete three-step path admits unnamed select and deterministic s
   expect(f.calls.slice(0,2).map(c=>c.format)).toEqual(['qa_deferred_semantic_poc_primary_v1','qa_deferred_semantic_poc_fidelity_v1']);
   expect(f.calls[0]!.input).toBe(f.request.taskText);
   expect(f.calls[1]!.input).toMatchObject({originalInstruction:f.request.taskText});
-  expect(f.calls.map(c=>c.format)).toContain('agentic_native_option_verification_decision_v6');
+  expect(f.calls.map(c=>c.format)).not.toContain('agentic_native_option_verification_decision_v6');
   const trace=await new SuccessfulTraceV5Store(f.root).readSuccessfulExplorationV5(r.context.result.testSpecId,r.context.result.explorationAttemptId!);const data=trace.protectedArtifact().trace;
   const goal=data.source.steps.find(g=>g.type==='action_goal');expect(goal?.type==='action_goal'&&goal.obligations.filter(o=>o.kind==='constraint')).toEqual([]);
   const native=data.successfulPath.find(p=>p.type==='verification_goal');expect(native&&'verificationVersion'in native).toBeTruthy();
@@ -202,6 +202,46 @@ for(const [name,html]of [['absent control','<p>Option 1</p>'],['absent option','
 test('disabled native option is readable and native selected wins over contradictory ARIA',async()=>{
  const html=options.replace('<select>','<select disabled>').replace('value="runtime-one"','value="runtime-one" selected disabled aria-selected="false"');const f=await fixture(html,[selected()]);try{const r=await f.run();expect(r.kind,JSON.stringify(r)).toBe('success');}finally{await f.close();}});
 function country(){const g=selected(),text='Verify that Option 1 is selected in Country.';return NativeOptionVerificationGoalV2Schema.parse({...g,instruction:text,sourceText:text,sourceInstructionSpan:{start:0,end:text.length},claim:{...g.claim,controlConstraints:[{kind:'label',text:'Country',sourceSpan:{start:text.indexOf('Country'),end:text.indexOf('Country')+7}}]}});}
+for(const [name,html,goal,decision,reason,owners,optionsCount] of [
+ ['selected',options.replace('value="runtime-one"','value="runtime-one" selected'),selected(),'true',undefined,1,1],
+ ['unselected',options,selected(),'false',undefined,1,1],
+ ['ambiguous owner',options+options,selected(),'unresolved','NON_UNIQUE',2,undefined],
+ ['missing option','<select><option>Other</option></select>',selected(),'unresolved','OPTION_ABSENT',1,0],
+ ['constraint mismatch',options,country(),'unresolved','NO_MATCH',0,undefined],
+ ['unsupported control',options.replace('<select>','<select multiple>'),selected(),'unsupported','UNSUPPORTED_CONTROL',1,undefined],
+] as const)test(`private native verification diagnostic: ${name}`,async()=>{
+ const f=await fixture(html,[goal]);try{const r=await f.run();if(r.kind==='bridge_error')throw Error('bridge');const result=r.context.result;
+  const store=new DeferredWorkflowStopStoreV1(f.root);
+  const diagnostics=result.deferredStage?
+   (await store.readPrivateAccounting(result.testSpecId)).verificationDiagnostics:
+   await store.readVerificationDiagnostics(result.testSpecId,result.explorationAttemptId!,result.profileFingerprint);
+  expect(diagnostics).toHaveLength(1);expect(diagnostics?.[0]).toMatchObject({stepId:'verify',verificationVersion:'2',
+   claimKind:'native_owned_option_selected',expected:true,optionLabel:'Option 1',strategy:'native_owned_option',
+   decision,ownerCandidateCount:owners,comparisonAttempted:decision==='true'||decision==='false',
+   decisionKind:decision==='true'||decision==='false'?'conclude':'observe',
+   decisionTurn:1,
+   ...(decision==='true'||decision==='false'?{comparisonKind:'native_owned_option_selected',comparisonExpected:true}:{}),
+   ...(reason?{reason}:{}),...(optionsCount===undefined?{}:{optionCandidateCount:optionsCount})});
+  if(name==='constraint mismatch')expect(diagnostics?.[0]?.unresolvedConstraint).toBe('label:Country');
+  if(decision==='true'||decision==='false')expect(diagnostics?.[0]).toMatchObject({observationKind:'native_owned_option_state',
+   observed:decision==='true',optionSelected:decision==='true',optionValue:'runtime-one'});
+  expect(result.cleanup).toBe('verified');
+ }finally{await f.close();}
+});
+test('private ordinary VerificationGoal diagnostic records bounded observation and comparison',async()=>{
+ const text='Verify that exactly one Notice dialog exists.';
+ const goal:TestSpecV6V2['steps'][number]={id:'verify',type:'verification_goal',sourceText:text,instruction:text,
+  sourceInstructionSpan:{start:0,end:text.length},subject:{role:'dialog',accessibleName:'Notice'},
+  intent:{kind:'cardinality',comparison:'equal',count:1}};
+ const f=await fixture('<div role="dialog" aria-label="Notice">Ready</div>',[goal]);
+ try{const r=await f.run();if(r.kind==='bridge_error')throw Error('bridge');expect(r.context.result.terminal.status).toBe('QA_ASSERTION_PASSED');
+  const result=r.context.result,diagnostics=await new DeferredWorkflowStopStoreV1(f.root)
+   .readVerificationDiagnostics(result.testSpecId,result.explorationAttemptId!,result.profileFingerprint);
+  expect(diagnostics).toEqual([expect.objectContaining({stepId:'verify',verificationVersion:'1',claimKind:'cardinality',
+   subject:{role:'dialog',name:'Notice'},intentKind:'cardinality',strategy:'ordinary_model',
+   observationKind:'matches',observed:1,comparisonKind:'count',comparisonExpected:1,decision:'true'})]);
+ }finally{await f.close();}
+});
 test('admitted Country label proves unique owner without turning option into target name',async()=>{const f=await fixture('<label for="country">Country</label>'+options.replace('<select>','<select id="country">').replace('value="runtime-one"','value="runtime-one" selected')+options,[country()]);try{expect((await f.run()).kind).toBe('success');}finally{await f.close();}});
 for(const kind of ['remap_compiler','remap_replay','selected_false','disagreement','frame_drift','label_drift']as const)test(`fresh mapping/state ${kind}`,async()=>{
  const html=options.replace('value="runtime-one"','value="runtime-one" selected'),goal=kind==='label_drift'?country():selected(),initial=kind==='label_drift'?'<label for="country">Country</label>'+html.replace('<select>','<select id="country">')+options:html,f=await fixture(initial,[goal]),original=ProtectedContextFactory.prototype.open;let opened=0;
@@ -222,10 +262,74 @@ test('native replay proof is separately validated, authenticated and restart rea
  const file=path.join(f.root,'deferred-replay-v9-result-v2',result.testSpecId,`${result.deferredReplay!.orchestrationId}.json`),envelope=JSON.parse(await readFile(file,'utf8'));envelope.record.runs[0].steps.at(-1).verificationProof.result.selected=false;await writeFile(file,JSON.stringify(envelope));await expect(new DeferredReplayV9Store(f.root).readReplayV1(result.testSpecId,result.deferredReplay!.orchestrationId,v9)).rejects.toThrow('authenticated');
  }finally{await f.close();}});
 test('native decision cannot add discovered owner constraints or model executable values',async()=>{const r=await harness(options,[selected()]);try{const o=new NativeOptionObservationSessionV2(r.session,r.runtime),controller=new NativeOptionVerificationControllerV2(o,r.runtime,{complete:async({context})=>JSON.stringify({decisionVersion:'6',kind:'observe',request:{kind:'native_owned_option_state',goalStepId:'verify',admissionDigest:context.admissionDigest,claimDigest:context.claimDigest,value:'runtime-one',controlName:'Fabricated'}})});expect((await controller.evaluate(r.admission.spec.steps[0],0)).conclusion).toBe('unresolved');expect(controller.protectedStrategy(r.runtime,'verify')).toBeUndefined();}finally{await r.close();}});
+for(const [variant,reason,turn] of [
+ ['repeat','REPEAT_OBSERVE_REQUEST',2],['goal','REQUEST_GOAL_MISMATCH',1],
+ ['admission','REQUEST_ADMISSION_MISMATCH',1],['claim','REQUEST_CLAIM_MISMATCH',1],
+] as const)test(`native diagnostic distinguishes ${variant} observe request`,async()=>{
+ const r=await harness(options,[selected()]);try{const observer=new NativeOptionObservationSessionV2(r.session,r.runtime);
+  const controller=new NativeOptionVerificationControllerV2(observer,r.runtime,{complete:async({context})=>{
+   const request={kind:'native_owned_option_state',goalStepId:context.goal.id,
+    admissionDigest:context.admissionDigest,claimDigest:context.claimDigest};
+   if(variant==='goal')request.goalStepId='other';
+   if(variant==='admission')request.admissionDigest='0'.repeat(64);
+   if(variant==='claim')request.claimDigest='0'.repeat(64);
+   return JSON.stringify({decisionVersion:'6',kind:'observe',request});
+  }});
+  expect(await controller.evaluate(r.admission.spec.steps[0],0)).toMatchObject({conclusion:'unresolved',
+   reason,decisionKind:'observe',decisionTurn:turn,
+   stop:{category:'integrity',code:'VERIFICATION_UNRESOLVED'}});
+  expect(controller.protectedStrategy(r.runtime,'verify')).toBeUndefined();
+ }finally{await r.close();}
+});
+for(const [variant,html,optionLabel,expected] of [
+ ['admission reference',options.replace('value="runtime-one"','value="runtime-one" selected'),'Option 1','satisfied'],
+ ['claim reference',options,'Option 1','unsatisfied'],
+ ['goal request and repeat',options.replace('value="runtime-one"','value="runtime-one" selected'),'Option 1','satisfied'],
+] as const)test(`PoC native comparison uses admitted goal and fresh observation despite ${variant}`,async()=>{
+ const r=await harness(html,[selected(optionLabel)],'poc_v1');try{
+  const observer=new NativeOptionObservationSessionV2(r.session,r.runtime);
+  let modelCalls=0;
+  const controller=new NativeOptionVerificationControllerV2(observer,r.runtime,{complete:async()=>{
+   modelCalls++;throw new Error('PoC must not consult duplicated model request references');
+  }});
+  const outcome=await controller.evaluate(r.admission.spec.steps[0],0);
+  expect(outcome.conclusion).toBe(expected);
+  expect(outcome.comparisonAttempted).toBe(true);
+  expect(outcome.strategy?.comparison.expectedSelected).toBe(true);
+  expect(outcome.strategy?.evaluated).toBe(expected==='satisfied');
+  expect(modelCalls).toBe(0);
+ }finally{await r.close();}
+});
+test('PoC native comparison refuses a changed step, dependency, or claim',async()=>{
+ const r=await harness(options,[selected()],'poc_v1');try{
+  const controller=new NativeOptionVerificationControllerV2(new NativeOptionObservationSessionV2(r.session,r.runtime),r.runtime,
+   {complete:async()=>{throw new Error('Unexpected model call');}});
+  const accepted=r.admission.spec.steps[0]!;
+  for(const mutation of [
+   {id:'other'},
+   {dependsOnStepId:'other'},
+   {claim:{...(accepted as NativeOptionVerificationGoalV2).claim,optionLabel:'Option 2'}},
+   {claim:{...(accepted as NativeOptionVerificationGoalV2).claim,expectedSelected:false}},
+  ])await expect(controller.evaluate({...accepted,...mutation},0)).rejects.toThrow('source/order mismatch');
+ }finally{await r.close();}
+});
+for(const [label,html] of [
+ ['missing option',options],
+ ['duplicate option value',options.replace('value="runtime-two"','value="runtime-one"')],
+] as const)test(`PoC native comparison stops on ${label} without comparing the wrong option`,async()=>{
+ const r=await harness(html,[selected(label==='missing option'?'Option 3':'Option 1')],'poc_v1');try{
+  const controller=new NativeOptionVerificationControllerV2(new NativeOptionObservationSessionV2(r.session,r.runtime),r.runtime,
+   {complete:async()=>{throw new Error('Unexpected model call');}});
+  const outcome=await controller.evaluate(r.admission.spec.steps[0],0);
+  expect(outcome.conclusion).toBe('unresolved');
+  expect(outcome.comparisonAttempted).toBe(false);
+  expect(outcome.reason).toBe(label==='missing option'?'OPTION_ABSENT':'VALUE_NON_UNIQUE');
+ }finally{await r.close();}
+});
 test('overridden observer methods cannot confer native strategy authority',async()=>{const r=await harness(options,[selected()]);try{const observer=new NativeOptionObservationSessionV2(r.session,r.runtime),fact=await observer.observe('verify');if(fact.status!=='complete')throw Error('fact');const forged=structuredClone(fact);if(forged.status!=='complete')throw Error('fact');forged.result.selected=true;forged.result.options[1]!.selected=true;const{witnessDigest:_d,...data}=forged;forged.witnessDigest=hash(data);observer.observe=async()=>forged;observer.currentEvidence=async()=>forged;
  const controller=new NativeOptionVerificationControllerV2(observer,r.runtime,{complete:async({context})=>{const o=context.observations[0];if(!o)return JSON.stringify({decisionVersion:'6',kind:'observe',request:{kind:'native_owned_option_state',goalStepId:'verify',admissionDigest:context.admissionDigest,claimDigest:context.claimDigest}});expect(o.status==='complete'&&o.result.selected).toBe(false);return JSON.stringify({decisionVersion:'6',kind:'conclude',conclusion:'unsatisfied',comparison:{comparisonVersion:'2',kind:'native_owned_option_selected',observationId:o.observationId,expectedSelected:true}});}});const result=await controller.evaluate(r.admission.spec.steps[0],0);expect(result.conclusion).toBe('unsatisfied');expect(result.strategy?.evaluated).toBe(false);expect(result.strategy?.observations[0]?.status==='complete'&&result.strategy.observations[0].result.selected).toBe(false);
  }finally{await r.close();}});
-test('provider failure in native verification remains a grounding provider non-QA stop',async()=>{const f=await fixture(options,[selected()]);f.nativeFailure();try{const r=await f.run();if(r.kind==='bridge_error')throw Error('bridge');expect(r.context.result.deferredStage).toMatchObject({stage:'grounding',category:'provider',code:'PROVIDER_ERROR'});expect(r.context.result.terminal.stage).toBe('environment');expect(r.context.result.executionRunIds).toEqual([]);expect(JSON.stringify(r)).not.toContain('PRIVATE_PROVIDER_FAILURE');}finally{await f.close();}});
+test('PoC native verification does not depend on a provider decision',async()=>{const f=await fixture(options.replace('value="runtime-one"','value="runtime-one" selected'),[selected()]);f.nativeFailure();try{const r=await f.run();if(r.kind==='bridge_error')throw Error('bridge');expect(r.context.result.terminal.status).toBe('QA_ASSERTION_PASSED');expect(f.calls.map(c=>c.format)).not.toContain('agentic_native_option_verification_decision_v6');}finally{await f.close();}});
 test('neutral reader complete journal fact',async()=>{const r=await harness(options,[selected()]),ids=nativeOptionIdentityJournal();try{const value=await readNativeOwnedOptionState(r.page,nativeOptionPredicate(selected()),'Option 1',()=>r.runtime.protectedTraceState().then(({page:_p,frames:_f,...s})=>s),()=>{},h=>ids.identify(h));expect(value.selected).toBe(false);expect(value.labelOwnership).toBeNull();expect(value.labelSourceIds).toEqual([]);expect(()=>validateNativeOptionProof({...value,labelSourceIds:['fabricated-label-source']})).toThrow('INVALID_NATIVE_OPTION_MAPPING');}finally{await ids.close();await r.close();}});
 for(const mode of ['wrapped','aria','multiple_labels']as const)test(`reviewed native label association ${mode}`,async()=>{
  let goal=country(),html=options.replace('value="runtime-one"','value="runtime-one" selected');

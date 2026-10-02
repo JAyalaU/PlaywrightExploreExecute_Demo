@@ -10,7 +10,7 @@ const state = z.strictObject({ sessionId: id, pageId: id, frameId: id,
 export const ActionPostEffectV1Schema = z.strictObject({
   postEffectVersion: z.literal('1'), observationId: id, executionId: id, preparedDigest: digest,
   selectedRef: id, sameTargetNode: z.boolean(), complete: z.literal(true),
-  before: state, after: state, observedAt: z.iso.datetime(),
+  before: state, after: state.optional(), observedAt: z.iso.datetime(),
   effect: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('entered_text'), nativeControl: z.enum(['input', 'textarea']), value: z.string().max(1024) }),
     z.strictObject({ kind: z.literal('native_choice'), value: z.string().max(1024), selectedOptionId: id,
@@ -18,8 +18,9 @@ export const ActionPostEffectV1Schema = z.strictObject({
     z.strictObject({ kind: z.literal('native_activation'), role: z.enum(['checkbox', 'radio']), nativeInputType: z.enum(['checkbox', 'radio']), beforeChecked: z.boolean(), checked: z.boolean(),
       trustedClickReceipt: z.strictObject({ executionId: id, clicks: z.literal(1), targetOwned: z.literal(true), nativeInputType: z.enum(['checkbox', 'radio']) }) }),
     z.strictObject({ kind: z.literal('generic_activation'), role: ActionCandidateRoleV1Schema,
-      beforeUrl: z.string().min(1).max(2048), afterUrl: z.string().min(1).max(2048),
-      delivery: z.strictObject({ executionId: id, clicks: z.literal(1), targetOwned: z.literal(true), returned: z.literal(true) }) }),
+      accessibleName: z.string().max(512),
+      delivery: z.strictObject({ executionId: id, stepId: id, clicks: z.literal(1), targetOwned: z.literal(true),
+        dispatched: z.literal(true), returned: z.literal(true), elapsedMs: z.number().int().nonnegative().max(120_000) }) }),
   ]), witnessDigest: digest,
 });
 export type ActionPostEffectV1 = z.infer<typeof ActionPostEffectV1Schema>;
@@ -33,6 +34,8 @@ export const ActionExecutionAttemptV1Schema = z.strictObject({
   operation: z.enum(['click', 'fill', 'select_option']), executableArgument: z.string().max(1024).optional(),
   startedAt: z.iso.datetime(), finishedAt: z.iso.datetime(),
   invokedAt: z.iso.datetime().optional(), returnedAt: z.iso.datetime().optional(),
+  genericClickDelivery: z.strictObject({ stepId: id, role: ActionCandidateRoleV1Schema, accessibleName: z.string().max(512),
+    dispatched: z.literal(true), returned: z.literal(true), elapsedMs: z.number().int().nonnegative().max(120_000) }).optional(),
   finalCheckDigest: digest.optional(), postEffectDigest: digest.optional(), witnessDigest: digest,
 });
 export type ActionExecutionAttemptV1 = z.infer<typeof ActionExecutionAttemptV1Schema>;
@@ -47,22 +50,25 @@ export function parseActionExecutionAttemptV1(input: unknown): ActionExecutionAt
     record.status !== 'succeeded' && record.postEffectDigest ||
     record.invocationOutcome === 'returned' && !record.returnedAt || record.invocationOutcome !== 'returned' && record.returnedAt ||
     !record.attempted && record.invokedAt || record.invokedAt && (Date.parse(record.invokedAt) < Date.parse(record.startedAt) || Date.parse(record.invokedAt) > Date.parse(record.finishedAt)) ||
-    record.returnedAt && (Date.parse(record.returnedAt) < Date.parse(record.invokedAt!) || Date.parse(record.returnedAt) > Date.parse(record.finishedAt)))
+    record.returnedAt && (Date.parse(record.returnedAt) < Date.parse(record.invokedAt!) || Date.parse(record.returnedAt) > Date.parse(record.finishedAt)) ||
+    record.genericClickDelivery && (record.operation !== 'click' || record.invocationOutcome !== 'returned' ||
+      record.genericClickDelivery.stepId !== record.goalId))
     throw new Error('INVALID_ACTION_EXECUTION');
   return record;
 }
 export function parseActionPostEffectV1(input: unknown): ActionPostEffectV1 {
   const record = ActionPostEffectV1Schema.parse(input), { witnessDigest, ...data } = record;
-  if (hash(data) !== witnessDigest || record.after.sessionId !== record.before.sessionId ||
-    record.after.pageId !== record.before.pageId || record.after.frameId !== record.before.frameId ||
-    record.after.stateEpoch <= record.before.stateEpoch || record.after.mutationEpoch <= record.before.mutationEpoch)
+  if (hash(data) !== witnessDigest || record.effect.kind !== 'generic_activation' && !record.after ||
+    record.after && (record.after.sessionId !== record.before.sessionId ||
+      record.after.pageId !== record.before.pageId || record.after.frameId !== record.before.frameId ||
+      record.after.stateEpoch <= record.before.stateEpoch || record.after.mutationEpoch <= record.before.mutationEpoch))
     throw new Error('INVALID_ACTION_POST_EFFECT');
   if (record.effect.kind === 'native_choice') {
     const effect = record.effect, facts = effect.options, options = facts.options, selected = options.filter((o) => o.selected);
     if (facts.count !== options.length || new Set(options.map((o) => o.optionId)).size !== facts.count ||
-      options.some((o, i) => o.index !== i || o.ownerRef !== record.selectedRef || o.ownerFrameId !== record.after.frameId ||
+      options.some((o, i) => o.index !== i || o.ownerRef !== record.selectedRef || o.ownerFrameId !== record.after!.frameId ||
         o.ownerBindingId !== options[0]?.ownerBindingId) ||
-      facts.ownerRef !== record.selectedRef || facts.ownerFrameId !== record.after.frameId || selected.length !== 1 ||
+      facts.ownerRef !== record.selectedRef || facts.ownerFrameId !== record.after!.frameId || selected.length !== 1 ||
       selected[0]!.disabled || selected[0]!.optionId !== record.effect.selectedOptionId || selected[0]!.value !== record.effect.value ||
       options.filter((o) => o.value === effect.value).length !== 1) throw new Error('INVALID_ACTION_POST_EFFECT');
   }
@@ -72,8 +78,6 @@ export function parseActionPostEffectV1(input: unknown): ActionPostEffectV1 {
     record.effect.role === 'radio' && (!record.effect.checked || record.effect.beforeChecked))) throw new Error('INVALID_ACTION_POST_EFFECT');
   if (record.effect.kind === 'generic_activation') {
     if (record.effect.delivery.executionId !== record.executionId) throw new Error('INVALID_ACTION_POST_EFFECT');
-    try { new URL(record.effect.beforeUrl); new URL(record.effect.afterUrl); }
-    catch { throw new Error('INVALID_ACTION_POST_EFFECT'); }
   } else if (!record.sameTargetNode) throw new Error('INVALID_ACTION_POST_EFFECT');
   return record;
 }
@@ -104,8 +108,9 @@ export function parseActionGroundingWitnessV1(input: unknown,
     post.executionId !== execution.executionId || post.preparedDigest !== check.witnessDigest || post.selectedRef !== check.selectedRef ||
     post.before.sessionId !== parent.sessionId || post.before.pageId !== parent.pageId || post.before.frameId !== check.frameId ||
     post.before.stateDigest !== parent.stateDigest || post.before.stateEpoch !== parent.stateEpoch || post.before.mutationEpoch !== parent.mutationEpoch ||
-    post.after.sessionId !== post.before.sessionId || post.after.pageId !== post.before.pageId || post.after.frameId !== post.before.frameId ||
-    post.after.stateEpoch <= post.before.stateEpoch || post.after.mutationEpoch <= post.before.mutationEpoch ||
+    effect.kind !== 'generic_activation' && (!post.after || post.after.sessionId !== post.before.sessionId ||
+      post.after.pageId !== post.before.pageId || post.after.frameId !== post.before.frameId ||
+      post.after.stateEpoch <= post.before.stateEpoch || post.after.mutationEpoch <= post.before.mutationEpoch) ||
     Date.parse(check.observedAt) < Date.parse(original.observedAt) || Date.parse(check.observedAt) > Date.parse(check.expiresAt) ||
     !execution.invokedAt || !execution.returnedAt || Date.parse(check.observedAt) > Date.parse(execution.invokedAt) ||
     Date.parse(execution.invokedAt) > Date.parse(check.expiresAt) ||
@@ -120,7 +125,13 @@ export function parseActionGroundingWitnessV1(input: unknown,
       effect.kind === 'native_activation' && (effect.nativeInputType !== effect.role ||
         effect.role === 'checkbox' && effect.checked === effect.beforeChecked ||
         effect.role === 'radio' && (!effect.checked || effect.beforeChecked)) ||
-      effect.kind === 'generic_activation' && effect.delivery.executionId !== execution.executionId)) throw new Error('INVALID_ACTION_GROUNDING_WITNESS');
+      effect.kind === 'generic_activation' && (effect.delivery.executionId !== execution.executionId ||
+        effect.delivery.stepId !== check.goalId || effect.accessibleName !==
+          (parent.status === 'complete' ? parent.candidates.find((c) => c.selectedRef === check.selectedRef && c.frameId === check.frameId)?.accessibleName : undefined) ||
+        execution.genericClickDelivery?.role !== effect.role ||
+        execution.genericClickDelivery?.accessibleName !== effect.accessibleName ||
+        execution.genericClickDelivery?.elapsedMs !== effect.delivery.elapsedMs)) ||
+    effect.kind !== 'generic_activation' && execution.genericClickDelivery) throw new Error('INVALID_ACTION_GROUNDING_WITNESS');
   if (effect.kind === 'native_choice') {
     const before = check.nativeOptionEvidence!;
     const comparable = (v: typeof before) => v.options.map(({ selected: _selected, ...facts }) => facts);

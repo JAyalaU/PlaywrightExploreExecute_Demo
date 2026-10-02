@@ -27,6 +27,9 @@ import { projectDeferredReportV2 } from '../subprocess/deferred-report-projectio
 import { ProtectedContextFactory, profilePresentationMode } from '../profile/index.js';
 import {NativeOptionObservationSessionV2} from '../exploration/native-option-observation.js';
 import {NativeOptionVerificationControllerV2,type NativeOptionVerificationModelV6} from './native-option-verification-controller.js';
+import { DeferredVerificationDiagnosticV1Schema, diagnosticText, diagnosticOptionValue } from '../domain/deferred-verification-diagnostic.js';
+import type { TrustedObservationResultV1 } from '../domain/observation-contracts.js';
+import type { NativeOptionObservationV2 } from '../domain/native-option-verification.js';
 
 export interface DeferredProductionModelsV1 {
   extraction: PocSemanticModels;
@@ -68,7 +71,7 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
   let sourceDigest = hash(request.sourceInstruction), admissionDigest: string | undefined, traceDigest: string | undefined;
   let explorationAttemptId: string | undefined, successfulTraceId: string | undefined, compilerAttemptId: string | undefined;
   let session: McpExplorationSession | undefined, cleanup: 'not_started' | 'verified' | 'unverified' = 'not_started';
-  const accounting: z.infer<typeof DeferredWorkflowPrivateAccountingV1Schema> = { groundingAttempts: [], successfulWitnesses: [] };
+  const accounting: z.infer<typeof DeferredWorkflowPrivateAccountingV1Schema> = { groundingAttempts: [], successfulWitnesses: [], verificationDiagnostics: [] };
   const startupDiagnostics: DeferredStartupDiagnosticV1[] = [];
   accounting.startupDiagnostics = startupDiagnostics;
   const safeException = (error: unknown): DeferredStartupDiagnosticV1['exceptionName'] => {
@@ -197,8 +200,70 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
       } else if (goal.type === 'navigate') {
         await session.navigate(goal.url); runtime.invalidate(); await builder.appendObservedNavigation(goal.id);
       } else {
-        const outcome = 'verificationVersion' in goal ? nativeVerification?await nativeVerification.evaluate(goal,ordinal,options.signal):{conclusion:'unsupported' as const,strategy:undefined} : await verification.evaluate(goal, ordinal, options.signal);
-        if('stop'in outcome&&outcome.stop)throw new StageStop('grounding',outcome.stop.category as DeferredWorkflowStageV1['category'],outcome.stop.code);
+        const native = 'verificationVersion' in goal;
+        const started = performance.now();
+        const captured: Array<TrustedObservationResultV1 | NativeOptionObservationV2> = [];
+        const unsubscribe = native
+          ? nativeObservations?.onProtectedRecord((record) => { if (captured.length < 8 && record.goalStepId === goal.id) captured.push(record); })
+          : observations.onProtectedRecord((record) => { if (captured.length < 8) captured.push(record); });
+        let outcome;
+        let evaluationError: unknown;
+        try { outcome = native ? nativeVerification?await nativeVerification.evaluate(goal,ordinal,options.signal):{conclusion:'unsupported' as const,strategy:undefined,reason:'NATIVE_VERIFIER_UNAVAILABLE'}
+          : await verification.evaluate(goal, ordinal, options.signal); }
+        catch (error) { evaluationError = error; outcome = { conclusion: 'unresolved' as const, strategy: undefined, reason: 'EVALUATION_EXCEPTION' }; }
+        finally { unsubscribe?.(); }
+        const last = captured.at(-1);
+        const nativeRead = native ? nativeObservations?.protectedDiagnostic(goal.id) : undefined;
+        const nativeGoal = native ? goal as Extract<typeof goal, { verificationVersion: '2' }> : undefined;
+        const ordinaryGoal = !native ? goal as Exclude<typeof goal, { verificationVersion: '2' }> : undefined;
+        const urlLiteral = ordinaryGoal?.sourceText.match(/https?:\/\/[^\s<>"']+/)?.[0]?.replace(/[.,;!?]+$/, '');
+        const safeUrl = diagnosticText(urlLiteral);
+        const resultingUrl = !!safeUrl && /\b(?:url|takes?\s+(?:you\s+)?to)\b/i.test(ordinaryGoal!.sourceText);
+        const observationKind = last?.status === 'complete' ? last.result.kind : last?.status === 'error' ? 'error' : undefined;
+        const observed = last?.status === 'complete' ? last.result.kind === 'native_owned_option_state' ? last.result.selected :
+          last.result.kind === 'url' ? diagnosticText(last.result.value) : last.result.kind === 'matches' ? last.result.count :
+          last.result.kind === 'property' && (typeof last.result.value === 'boolean' || typeof last.result.value === 'number') ? last.result.value : undefined : undefined;
+        const comparison = outcome.strategy?.comparison;
+        const comparisonAttempted = native ? 'comparisonAttempted' in outcome && outcome.comparisonAttempted === true :
+          !!comparison || !!outcome.strategy;
+        const verificationStop = (outcome as { stop?: { category: string; code: string } }).stop;
+        const reason = 'reason' in outcome && typeof outcome.reason === 'string' ? outcome.reason :
+          last?.status === 'error' ? last.reason : verificationStop?.code;
+        const decision = outcome.conclusion === 'satisfied' ? 'true' : outcome.conclusion === 'unsatisfied' ? 'false' : outcome.conclusion;
+        const diagnostic = DeferredVerificationDiagnosticV1Schema.safeParse({
+          diagnosticVersion: '1', stepId: goal.id, verificationVersion: native ? '2' : '1',
+          ...(goal.dependsOnStepId ? { dependencyStepId: goal.dependsOnStepId } : {}),
+          claimKind: native ? nativeGoal!.claim.kind : resultingUrl ? 'resulting_url' : ordinaryGoal?.intent?.kind ?? 'unhinted',
+          ...(native ? { expected: nativeGoal!.claim.expectedSelected, optionLabel: diagnosticText(nativeGoal!.claim.optionLabel),
+            controlConstraints: nativeGoal!.claim.controlConstraints.map(({ kind, text }) => ({ kind, text: diagnosticText(text) })).filter((item): item is {kind:'role'|'name'|'label';text:string} => !!item.text) } :
+            resultingUrl ? { expected: safeUrl } : ordinaryGoal?.intent && 'expected' in ordinaryGoal.intent ? { expected: ordinaryGoal.intent.expected } :
+              ordinaryGoal?.intent && 'count' in ordinaryGoal.intent ? { expected: ordinaryGoal.intent.count } : {}),
+          ...(ordinaryGoal?.subject ? { subject: { ...(ordinaryGoal.subject.role ? { role: ordinaryGoal.subject.role } : {}),
+            ...(diagnosticText(ordinaryGoal.subject.accessibleName) ? { name: diagnosticText(ordinaryGoal.subject.accessibleName) } : {}) } } : {}),
+          ...(ordinaryGoal?.intent ? { intentKind: ordinaryGoal.intent.kind } : {}),
+          strategy: native ? 'native_owned_option' : resultingUrl ? 'poc_resulting_url' : 'ordinary_model',
+          ...(observationKind ? { observationKind } : {}), ...(observed !== undefined ? { observed } : {}),
+          ...(nativeRead?.ownerCandidateCount !== undefined ? { ownerCandidateCount: nativeRead.ownerCandidateCount } : {}),
+          ...(nativeRead?.ownerRole ? { ownerRole: nativeRead.ownerRole } : {}),
+          ...(nativeGoal?.claim.controlConstraints.find((c) => c.kind === 'name') ? { ownerName: diagnosticText(nativeGoal.claim.controlConstraints.find((c) => c.kind === 'name')!.text) } : {}),
+          ...(nativeRead?.optionCandidateCount !== undefined ? { optionCandidateCount: nativeRead.optionCandidateCount } : {}),
+          ...(nativeRead?.optionSelected !== undefined ? { optionSelected: nativeRead.optionSelected } : {}),
+          ...(last?.status === 'complete' && last.result.kind === 'native_owned_option_state' ?
+            { optionValue: diagnosticOptionValue(last.result.optionValue) } : {}),
+          ...(nativeRead?.unresolvedConstraint ? { unresolvedConstraint: diagnosticText(nativeRead.unresolvedConstraint) } : {}),
+          comparisonAttempted,
+          ...('decisionKind' in outcome && outcome.decisionKind ? { decisionKind: outcome.decisionKind } : {}),
+          ...('decisionTurn' in outcome && outcome.decisionTurn ? { decisionTurn: outcome.decisionTurn } : {}),
+          ...(comparisonAttempted ? { comparisonKind: native ? 'native_owned_option_selected' : comparison?.kind ?? (resultingUrl ? 'string_equal_url' : undefined) } : {}),
+          ...(comparisonAttempted ? native ? { comparisonExpected: nativeGoal!.claim.expectedSelected } : comparison && 'expected' in comparison ?
+            { comparisonExpected: comparison.expected } : resultingUrl ? { comparisonExpected: safeUrl } : {} : {}),
+          decision, ...(reason ? { reason: diagnosticText(reason) } : {}),
+          elapsedMs: Math.max(0, Math.min(86_400_000, Math.round(performance.now() - started))),
+        });
+        if (diagnostic.success && accounting.verificationDiagnostics!.length < 100)
+          accounting.verificationDiagnostics!.push(diagnostic.data);
+        if (evaluationError !== undefined) throw evaluationError;
+        if(verificationStop)throw new StageStop('grounding',verificationStop.category as DeferredWorkflowStageV1['category'],verificationStop.code);
         if (!outcome.strategy || !['satisfied', 'unsatisfied'].includes(outcome.conclusion)) throw new StageStop('grounding',
           outcome.conclusion === 'unsupported' ? 'unsupported' : 'unresolved', outcome.conclusion === 'unsupported' ? 'VERIFICATION_UNSUPPORTED' : 'VERIFICATION_UNRESOLVED');
         await builder.appendVerificationGoal(goal.id);
@@ -238,6 +303,11 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
     if (explorationAttemptId && startupDiagnostics.length) {
       try { await new DeferredWorkflowStopStoreV1(artifactRoot).writeStartupDiagnostics(request.testSpecId,
         explorationAttemptId, profile.fingerprint, startupDiagnostics); } catch { /* Best-effort private diagnostics. */ }
+    }
+    if (explorationAttemptId && accounting.verificationDiagnostics?.length) {
+      try { await new DeferredWorkflowStopStoreV1(artifactRoot).writeVerificationDiagnostics(request.testSpecId,
+        explorationAttemptId, profile.fingerprint, accounting.verificationDiagnostics); }
+      catch { /* Best-effort private diagnostics never change QA. */ }
     }
     return { result, reportAvailable: true };
   } catch (error) {

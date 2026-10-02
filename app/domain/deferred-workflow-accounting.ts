@@ -5,6 +5,7 @@ import { CompilerAttemptV4Schema } from './deferred-action-compiler.js';
 import { DeferredInterpretationTimingV1Schema } from './deferred-interpretation-timing.js';
 import { DeferredInterpretationStructuralV1Schema } from './deferred-interpretation-structural.js';
 import { DeferredStartupDiagnosticV1Schema } from './deferred-startup-diagnostics.js';
+import { DeferredVerificationDiagnosticV1Schema } from './deferred-verification-diagnostic.js';
 
 const identifier = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);
 /** Bounded private explanation of a grounding stop; it never grants action or QA authority. */
@@ -27,4 +28,5 @@ export const DeferredWorkflowPrivateAccountingV1Schema = z.strictObject({
   interpretationStructural: DeferredInterpretationStructuralV1Schema.optional(),
   startupDiagnostics: z.array(DeferredStartupDiagnosticV1Schema).max(5).optional(),
   groundingStop: DeferredGroundingStopDiagnosticV1Schema.optional(),
+  verificationDiagnostics: z.array(DeferredVerificationDiagnosticV1Schema).max(100).optional(),
 });

@@ -16,7 +16,7 @@ export const ProtectedTraceCaptureBundleV5Schema = z.strictObject({ captureVersi
   successfulTraceId: id, testSpecId: id, explorationAttemptId: id, sessionId: id, profileFingerprint: digest,
   actions: z.array(z.strictObject({ recordId: id, witness: ActionGroundingWitnessV1Schema,
     finalCheck: PreparedActionGroundingV1Schema, execution: ActionExecutionAttemptV1Schema,
-    postEffect: ActionPostEffectV1Schema, retirement: ActionGroundingRetirementV1Schema, mappingDigest: digest })).max(100),
+    postEffect: ActionPostEffectV1Schema, retirement: ActionGroundingRetirementV1Schema.optional(), mappingDigest: digest })).max(100),
   observations: z.array(z.strictObject({ record: TrustedObservationResultV1Schema,
     actionOrdinal: z.number().int().nonnegative(), pathPosition: z.number().int().nonnegative(),
     pathStateDigest: digest, currentAtCapture: z.literal(true) })).max(80),
@@ -58,7 +58,8 @@ export function parseProtectedTraceCaptureBundleV5(input: unknown, traceInput: u
       {source:preliminary.source,semanticAdmission:preliminary.semanticAdmission});
     requireFact(!!captured && same(captured.witness, witness) && same(captured.finalCheck, witness.finalCheck) &&
       same(captured.execution, witness.execution) && same(captured.postEffect, witness.postEffect) &&
-      same(captured.retirement, record.retirement) &&
+      (captured.retirement === undefined && record.retirement === undefined ||
+        captured.retirement !== undefined && record.retirement !== undefined && same(captured.retirement, record.retirement)) &&
       captured.mappingDigest === witness.finalCheck.mappingDigest, 'V5 execution private readback mismatch');
   }
   for (const value of observations.values()) parseTrustedObservationWitnessV1(value.record);

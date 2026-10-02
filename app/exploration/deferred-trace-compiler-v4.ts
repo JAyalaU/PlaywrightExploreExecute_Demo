@@ -121,9 +121,10 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
         (freshEffect.kind!=='generic_activation'||originalEffect.kind==='generic_activation'&&freshEffect.role===originalEffect.role),
         'POST_EFFECT_UNPROVEN');
       const retirement=ActionCandidateGroundingSessionV1.prototype.protectedActionGroundingRetirement.call(runtime,result.witness.witnessId);
-      mark('execution',!!retirement,'POST_EFFECT_UNPROVEN',retirement);
-      if(!retirement)throw new Stop('POST_EFFECT_UNPROVEN');
-      freshActions.push({traceRecordId:record.recordId,witness:result.witness,retirement});
+      const generic = freshEffect.kind === 'generic_activation';
+      mark('execution',generic ? !retirement : !!retirement,'POST_EFFECT_UNPROVEN',retirement);
+      if(!generic && !retirement)throw new Stop('POST_EFFECT_UNPROVEN');
+      freshActions.push({traceRecordId:record.recordId,witness:result.witness,...(retirement ? {retirement} : {})});
       const pre=result.witness.finalCheck,effect=result.witness.postEffect.effect;
       if(!selected)throw new Stop('FRAME_MISMATCH');
       const guard={guardVersion:'1' as const,domain:'all_current_page_frames' as const,candidateLimit:80 as const,frameLimit:8 as const,optionLimit:80 as const,

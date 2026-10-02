@@ -97,6 +97,8 @@ export class ActionCandidateGroundingSessionV1 {
   readonly #executions = new Map<string, ActionExecutionAttemptV1>();
   readonly #groundingWitnesses = new Map<string, ActionGroundingWitnessV1>();
   readonly #postEffects = new Map<string, ActionPostEffectV1>();
+  readonly #genericClickDeliveries = new Map<string, { stepId: string; role: string; accessibleName: string;
+    dispatched: true; returned: true; elapsedMs: number }>();
   readonly #executionChecks = new Map<string, PreparedActionGroundingV1>();
   readonly #consumedPreparations = new Set<string>();
   readonly #groundingRetirements = new Map<string, ActionGroundingRetirementV1>();
@@ -790,6 +792,11 @@ export class ActionCandidateGroundingSessionV1 {
   protectedActionPostEffect(observationId: string): ActionPostEffectV1 | undefined {
     this.#owner(); const record = this.#postEffects.get(observationId); return record && structuredClone(record);
   }
+  /** Bounded private delivery diagnostics, independent of later trace-continuity capture. */
+  protectedGenericClickDelivery(executionId: string) {
+    this.#owner(); const receipt = this.#genericClickDeliveries.get(executionId);
+    return receipt && structuredClone(receipt);
+  }
   protectedActionGroundingFinalCheck(executionId: string): PreparedActionGroundingV1 | undefined {
     this.#owner(); const record = this.#executionChecks.get(executionId); return record && structuredClone(record);
   }
@@ -811,11 +818,14 @@ export class ActionCandidateGroundingSessionV1 {
     const executionId = `grounding-execution-${randomUUID()}`, startedAt = new Date(this.#clock()).toISOString();
     const ledger = (status: ActionExecutionAttemptV1['status'], reason: string, invocationOutcome: ActionExecutionAttemptV1['invocationOutcome'],
       check?: PreparedActionGroundingV1, invokedAt?: string, returnedAt?: string, post?: ActionPostEffectV1, commit = true) => {
+      const delivery = this.#genericClickDeliveries.get(executionId);
       const data = { executionVersion: '1', executionId, strategyId: preparation.strategyId, preparedDigest: preparation.witnessDigest,
         admissionDigest: preparation.admissionDigest, mappingDigest: preparation.mappingDigest, goalId: preparation.goalId,
         status, reason, attempted: invocationOutcome !== 'not_invoked', mutationMayHaveOccurred: invocationOutcome !== 'not_invoked',
         invocationOutcome, operation: preparation.operation, ...(preparation.argument ? { executableArgument: preparation.argument.executableValue } : {}),
         startedAt, finishedAt: new Date(this.#clock()).toISOString(), ...(invokedAt ? { invokedAt } : {}), ...(returnedAt ? { returnedAt } : {}),
+        ...(delivery ? { genericClickDelivery: { stepId: delivery.stepId, role: delivery.role, accessibleName: delivery.accessibleName,
+          dispatched: delivery.dispatched, returned: delivery.returned, elapsedMs: delivery.elapsedMs } } : {}),
         ...(check ? { finalCheckDigest: check.witnessDigest } : {}), ...(post ? { postEffectDigest: post.witnessDigest } : {}) };
       const { witnessDigest: _digest, ...ordered } = ActionExecutionAttemptV1Schema.parse({ ...data, witnessDigest: hash(data) });
       const record = parseActionExecutionAttemptV1({ ...ordered, witnessDigest: hash(ordered) });
@@ -846,7 +856,6 @@ export class ActionCandidateGroundingSessionV1 {
             if (armed.nativeInputType !== role || armed.clicks !== 0) stop('UNSUPPORTED_CONTROL');
           }
           if ((await this.#state()).stateDigest !== before.stateDigest) stop('STALE_STATE');
-          const beforeUrl = before.page.url();
           // Retained node actions cannot retarget a replacement. Force avoids actionability waits;
           // scroll/readiness already ran before the complete conjunction was renewed.
           const invokedAt = new Date(this.#clock()).toISOString();
@@ -854,6 +863,7 @@ export class ActionCandidateGroundingSessionV1 {
           if (this.#clock() < Date.parse(check.observedAt) || this.#clock() > Date.parse(check.expiresAt)) stop('STALE_STATE');
           invocation = { check, invokedAt };
           this.#executionChecks.set(executionId, structuredClone(check));
+          const dispatchStarted = this.#clock();
           try {
             if (check.operation === 'fill') await current.handle.fill(check.argument!.executableValue, { force: true, timeout: 3000 });
             else if (check.operation === 'select_option') await current.handle.selectOption({ value: check.argument!.executableValue }, { force: true, timeout: 3000 });
@@ -866,13 +876,21 @@ export class ActionCandidateGroundingSessionV1 {
           }
           const returnedAt = new Date(this.#clock()).toISOString();
           invocation.returnedAt = returnedAt;
+          const genericDelivery = genericClick ? { executionId, stepId: check.goalId, clicks: 1 as const,
+            targetOwned: true as const, dispatched: true as const, returned: true as const,
+            elapsedMs: Math.min(120_000, Math.max(0, this.#clock() - dispatchStarted)) } : undefined;
+          if (genericDelivery) this.#genericClickDeliveries.set(executionId, { stepId: check.goalId,
+            role: current.candidate.role, accessibleName: current.candidate.accessibleName,
+            dispatched: true, returned: true, elapsedMs: genericDelivery.elapsedMs });
           this.invalidate();
           let post: ActionPostEffectV1;
           try {
-            const after = await this.#state();
-            if (after.page !== before.page || after.pageId !== before.pageId || !genericClick && !after.frames.includes(current.frame)) stop('STALE_STATE');
+            // Generic PoC click delivery is complete when Playwright returns. A navigating
+            // document may be unavailable here; the next authored step observes it afresh.
+            const after = genericClick ? undefined : await this.#state();
+            if (after && (after.page !== before.page || after.pageId !== before.pageId || !after.frames.includes(current.frame))) stop('STALE_STATE');
             let sameTargetNode = false;
-            if (after.frames.includes(current.frame)) {
+            if (after?.frames.includes(current.frame)) {
               try {
                 const target = current.frame.locator(`aria-ref=${check.selectedRef}`);
                 if (await target.count() === 1) {
@@ -906,8 +924,7 @@ export class ActionCandidateGroundingSessionV1 {
               } finally { await Promise.all(renewed.handles.map((h) => h.dispose())); }
             } else if (genericClick) {
               effect = { kind: 'generic_activation', role: current.candidate.role,
-                beforeUrl, afterUrl: after.page.url(),
-                delivery: { executionId, clicks: 1, targetOwned: true, returned: true } };
+                accessibleName: current.candidate.accessibleName, delivery: genericDelivery! };
             } else {
               const checked = await current.handle.isChecked();
               const receipt = await nativeActivationReceipt(current.handle, executionId, 'read');
@@ -916,7 +933,7 @@ export class ActionCandidateGroundingSessionV1 {
               effect = { kind: 'native_activation', role: activation!.role, nativeInputType: activation!.role, beforeChecked: activation!.checked, checked,
                 trustedClickReceipt: { executionId, clicks: 1, targetOwned: true, nativeInputType: receipt.nativeInputType } };
             }
-            if ((await this.#state()).stateDigest !== after.stateDigest) stop('STALE_STATE');
+            if (after && (await this.#state()).stateDigest !== after.stateDigest) stop('STALE_STATE');
             if (!genericClick) {
               const renewedTarget = await current.frame.locator(`aria-ref=${check.selectedRef}`).elementHandle({ timeout: 3000 });
               try { if (!renewedTarget || !await renewedTarget.evaluate((node, old) => node === old, current.handle)) stop('STALE_STATE'); }
@@ -926,13 +943,16 @@ export class ActionCandidateGroundingSessionV1 {
               stateDigest: s.stateDigest, stateEpoch: s.stateEpoch, mutationEpoch: s.mutationEpoch });
             const data = { postEffectVersion: '1', observationId: `grounding-post-effect-${randomUUID()}`, executionId,
               preparedDigest: check.witnessDigest, selectedRef: check.selectedRef, sameTargetNode, complete: true,
-              before: owner(before), after: owner(after), observedAt: new Date(this.#clock()).toISOString(), effect };
+              before: owner(before), ...(after ? { after: owner(after) } : {}),
+              observedAt: new Date(this.#clock()).toISOString(), effect };
             const { witnessDigest: _digest, ...ordered } = ActionPostEffectV1Schema.parse({ ...data, witnessDigest: hash(data) });
             post = parseActionPostEffectV1({ ...ordered, witnessDigest: hash(ordered) });
           } catch {
-            return { status: 'stop', execution: ledger('executed_unproven', 'POST_EFFECT_UNPROVEN', 'returned', check, invokedAt, returnedAt) };
+            return { status: 'stop', execution: ledger('executed_unproven', genericClick ? 'BROWSER_FAILURE' : 'POST_EFFECT_UNPROVEN',
+              'returned', check, invokedAt, returnedAt) };
           }
-          const execution = ledger('succeeded', 'EFFECT_PROVEN', 'returned', check, invokedAt, returnedAt, post, false);
+          const execution = ledger('succeeded', genericClick ? 'DELIVERY_PROVEN' : 'EFFECT_PROVEN',
+            'returned', check, invokedAt, returnedAt, post, false);
           const data = { actionGroundingWitnessVersion: '1', witnessId: `action-grounding-witness-${randomUUID()}`, status: 'succeeded',
             preparation, finalCheck: check, execution, postEffect: post };
           const { witnessDigest: _digest, ...ordered } = ActionGroundingWitnessV1Schema.parse({ ...data, witnessDigest: hash(data) });
@@ -948,13 +968,13 @@ export class ActionCandidateGroundingSessionV1 {
           for (const [id, witness] of this.#groundingWitnesses) if (witness.execution.executionId === executionId) {
             this.#postEffects.delete(witness.postEffect.observationId); this.#groundingWitnesses.delete(id);
           }
-          return { status: 'stop', execution: ledger('executed_unproven', 'POST_EFFECT_UNPROVEN', 'returned',
+          return { status: 'stop', execution: ledger('executed_unproven', this.#genericClickDeliveries.has(executionId) ? 'BROWSER_FAILURE' : 'POST_EFFECT_UNPROVEN', 'returned',
             this.#executionChecks.get(executionId), existing.invokedAt, existing.returnedAt) };
         }
         return { status: 'stop', execution: existing };
       }
       if (invocation) return { status: 'stop', execution: ledger(invocation.returnedAt ? 'executed_unproven' : 'failed',
-        invocation.returnedAt ? 'POST_EFFECT_UNPROVEN' : 'ACTION_FAILED_PARTIAL_OR_UNKNOWN', invocation.returnedAt ? 'returned' : 'threw',
+        invocation.returnedAt ? this.#genericClickDeliveries.has(executionId) ? 'BROWSER_FAILURE' : 'POST_EFFECT_UNPROVEN' : 'ACTION_FAILED_PARTIAL_OR_UNKNOWN', invocation.returnedAt ? 'returned' : 'threw',
         invocation.check, invocation.invokedAt, invocation.returnedAt) };
       return { status: 'stop', execution: ledger('rejected', error instanceof ActionCandidateGroundingError ? error.reason : 'QUERY_UNEVALUABLE', 'not_invoked') };
     } finally {
@@ -967,7 +987,7 @@ export class ActionCandidateGroundingSessionV1 {
         if (selected) await nativeActivationReceipt(selected.handle, executionId, 'clear').catch(() => {});
       }
       const successful = [...this.#groundingWitnesses.values()].find((w) => w.execution.executionId === executionId);
-      if (successful && postState) {
+      if (successful && postState && successful.postEffect.effect.kind !== 'generic_activation') {
         try {
           await this.#exclusive(async () => {
           const after = await this.#state();
@@ -977,10 +997,9 @@ export class ActionCandidateGroundingSessionV1 {
              await selected?.frame.locator(`aria-ref=${successful.finalCheck.selectedRef}`).elementHandle({ timeout: 3000 });
            try {
              if ((effect.kind !== 'generic_activation' && (!selected || !renewed || !await renewed.evaluate((node, held) => node === held, selected.handle))) ||
-               postState.stateDigest !== successful.postEffect.after.stateDigest || postState.materialDigest !== after.materialDigest ||
+               postState.stateDigest !== successful.postEffect.after!.stateDigest || postState.materialDigest !== after.materialDigest ||
                postState.page !== after.page || postState.frames.some((f, i) => after.frames[i] !== f) || postState.frames.length !== after.frames.length)
                stop('STALE_STATE');
-             if (effect.kind === 'generic_activation' && after.page.url() !== effect.afterUrl) stop('STALE_STATE');
              if (effect.kind === 'entered_text' && await selected!.handle.inputValue() !== effect.value ||
                effect.kind === 'native_activation' && await selected!.handle.isChecked() !== effect.checked) stop('STALE_STATE');
             if (effect.kind === 'native_choice') {
