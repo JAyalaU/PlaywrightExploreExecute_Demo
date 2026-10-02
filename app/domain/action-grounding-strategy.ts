@@ -8,7 +8,7 @@ import { buildActionObligationHandoffV2, requirePocSemanticGoalContextV2, requir
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 export const GroundingRealizationV1Schema = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.enum(['effect', 'operation', 'literal', 'unique', 'pending']) }),
+  z.strictObject({ kind: z.enum(['effect', 'operation', 'literal', 'unique', 'dependency', 'pending']) }),
   z.strictObject({ kind: z.enum(['role_exact', 'role_semantic']), role: ActionCandidateRoleV1Schema }),
   z.strictObject({ kind: z.literal('name_exact'), name: z.string().min(1).max(512) }),
   z.strictObject({ kind: z.literal('label'), text: z.string().min(1).max(512), sourceSegmentIds: z.array(id).min(1).max(128), sourceSpan: SourceSpanSchema.optional() }),
@@ -49,6 +49,34 @@ export function correspondenceNeedsEndorsement(entries: GroundingCorrespondenceV
   return entries.some(({ obligation: o, realization: r }) => r.kind === 'role_semantic' ||
     r.kind === 'label' && o.kind === 'constraint' && o.constraint === 'context');
 }
+/** The PoC primary extraction and independent fidelity review already admitted these semantic fields.
+ * Mechanical dependencies constrain order, while browser evidence still proves target uniqueness. */
+export function pocGroundingCorrespondenceV1(admission: TrustedSemanticAdmissionV2, goalId: string): GroundingCorrespondenceV1 {
+  requireTrustedSemanticAdmissionV2(admission);
+  if (admission.spec.semanticMode !== 'poc_v1') return fail('UNSUPPORTED_MAPPING');
+  const goal = admission.spec.steps.find((step) => step.id === goalId);
+  if (!goal || goal.type !== 'action_goal') return fail('OBLIGATION_MAPPING_MISMATCH');
+  const entries: GroundingCorrespondenceV1 = goal.obligations.map((obligation) => {
+    let realization: GroundingCorrespondenceV1[number]['realization'] = { kind: 'pending' };
+    if (obligation.kind === 'effect') realization = { kind: 'effect' };
+    else if (obligation.kind === 'operation') realization = { kind: 'operation' };
+    else if (obligation.kind === 'argument') realization = { kind: 'literal' };
+    else if (obligation.kind === 'prerequisite') realization = { kind: 'dependency' };
+    else if (obligation.kind === 'constraint' && obligation.subject.kind === 'target' && obligation.polarity === 'positive') {
+      if (obligation.constraint === 'role') {
+        const role = obligation.authoredText.toLocaleLowerCase('en-US');
+        if (ActionCandidateRoleV1Schema.safeParse(role).success) realization = { kind: 'role_exact', role: role as z.infer<typeof ActionCandidateRoleV1Schema> };
+        else if (role === 'dropdown' || role === 'select' || role === 'select box')
+          realization = { kind: 'role_semantic', role: 'combobox' };
+      } else if (obligation.constraint === 'name') realization = { kind: 'name_exact', name: obligation.authoredText };
+      else if (obligation.constraint === 'uniqueness') realization = { kind: 'unique' };
+      else if (obligation.constraint === 'context') realization = { kind: 'label', text: obligation.authoredText,
+        sourceSegmentIds: [...obligation.sourceSegmentIds] };
+    }
+    return { obligation: ActionObligationV2Schema.parse(obligation), realization };
+  });
+  return validateGoalCorrespondence(goal, entries);
+}
 /** Only source-based independent extraction can endorse inference. Browser facts are absent here. */
 export function validateGroundingCorrespondenceV1(admission: TrustedSemanticAdmissionV2, goalId: string, primary: unknown): GroundingCorrespondenceV1 {
   requireTrustedSemanticAdmissionV2(admission);
@@ -68,6 +96,7 @@ function validateGoalCorrespondence(goal: ActionGoalV2 | Extract<TrustedSemantic
     if (r.kind === 'effect' || r.kind === 'operation') valid = o.kind === r.kind;
     if (r.kind === 'literal') valid = o.kind === 'argument';
     if (r.kind === 'unique') valid = o.kind === 'constraint' && o.constraint === 'uniqueness' && o.subject.kind === 'target' && o.polarity === 'positive';
+    if (r.kind === 'dependency') valid = goal.sourceMode === 'semantic_poc' && o.kind === 'prerequisite';
     if (r.kind === 'role_exact' || r.kind === 'role_semantic') valid = o.kind === 'constraint' && o.constraint === 'role' &&
       o.subject.kind === 'target' && o.polarity === 'positive' && effect?.kind === 'effect' && families[effect.effect].includes(r.role) &&
       (r.kind === 'role_semantic' || o.authoredText === r.role);
@@ -99,7 +128,7 @@ export function admitGroundingMappingV1(admission: TrustedSemanticAdmissionV2, g
   independent?: unknown): TrustedGroundingMappingV1 {
   const entries = validateGroundingCorrespondenceV1(admission, goalId, primary);
   let independentExtractionDigest: string | undefined;
-  if (correspondenceNeedsEndorsement(entries)) {
+  if (admission.spec.semanticMode !== 'poc_v1' && correspondenceNeedsEndorsement(entries)) {
     if (!independent) return fail('ENDORSEMENT_REQUIRED');
     const extracted = IndependentGroundingExtractionV1Schema.parse(independent);
     if (extracted.goalId !== goalId || canonical(extracted.correspondence) !== canonical(entries)) return fail('SEMANTIC_DISAGREEMENT');
@@ -146,8 +175,10 @@ export function parsePreparedActionGroundingV1(input: unknown,
   const parent = parseActionCandidateObservationV1(record.candidateObservation);
   if (record.sourceGoal.sourceMode === 'semantic_poc')
     requirePocSemanticGoalContextV2(semanticContext, record.sourceGoal, record.sourceInstruction, record.admissionDigest);
-  validateActionGoalV2(record.sourceGoal, record.sourceInstruction, [],
-    record.sourceGoal.sourceMode === 'semantic_poc' ? { semanticPocSourceValidated: true } : undefined);
+  // PoC context validation reparses the accepted full TestSpec, including ordered prerequisites.
+  // Rechecking this goal in isolation with an empty prior-step list would reject a valid dependency.
+  if (record.sourceGoal.sourceMode !== 'semantic_poc')
+    validateActionGoalV2(record.sourceGoal, record.sourceInstruction, []);
   validateGoalCorrespondence(record.sourceGoal, record.correspondence);
   const ids = parent.request.handoff.goals.find((g) => g.goalId === record.goalId)?.obligationIds ?? [];
   const entries = record.correspondence, effect = entries.find((e) => e.obligation.kind === 'effect')?.obligation;
@@ -161,7 +192,7 @@ export function parsePreparedActionGroundingV1(input: unknown,
     entries.length !== ids.length || new Set(entries.map((e) => e.obligation.id)).size !== ids.length || entries.some((e) => !ids.includes(e.obligation.id) || e.realization.kind === 'pending') ||
     effect?.kind !== 'effect' || record.operation !== (effect.effect === 'activate' ? 'click' : effect.effect === 'enter_text' ? 'fill' : 'select_option') ||
     entries.some((e) => e.obligation.kind === 'operation' && e.obligation.operation !== record.operation) ||
-    correspondenceNeedsEndorsement(entries) && !record.independentExtractionDigest ||
+    record.sourceGoal.sourceMode !== 'semantic_poc' && correspondenceNeedsEndorsement(entries) && !record.independentExtractionDigest ||
     Date.parse(record.observedAt) < Date.parse(parent.observedAt) || Date.parse(record.observedAt) > Date.parse(record.expiresAt)) throw new Error('INVALID_PREPARED_GROUNDING');
   const versions = { vocabularyVersion: record.vocabularyVersion, primaryPromptVersion: record.primaryPromptVersion, independentPromptVersion: record.independentPromptVersion };
   if (record.mappingDigest !== hash({ versions, handoff: parent.request.handoff, goalId: record.goalId,

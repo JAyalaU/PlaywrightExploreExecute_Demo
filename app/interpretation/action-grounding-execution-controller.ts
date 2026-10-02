@@ -12,7 +12,8 @@ type Runtime = Pick<ActionCandidateGroundingSessionV1, 'query' | 'prepareGroundi
 export type ActionGoalExecutionOutcomeV1 =
   | { status: 'succeeded'; witness: ActionGroundingWitnessV1; executionAttempts: ActionExecutionAttemptV1[] }
   | { status: 'stop'; reason: string; category: Exclude<ActionGroundingOutcomeV1, { status: 'prepared' }>['category'];
-      executionAttempts: ActionExecutionAttemptV1[] };
+      executionAttempts: ActionExecutionAttemptV1[];
+      diagnostic?: Exclude<ActionGroundingOutcomeV1, { status: 'prepared' }>['diagnostic'] };
 function category(reason: string): Exclude<ActionGroundingOutcomeV1, { status: 'prepared' }>['category'] {
   if (['INVALID_REQUEST', 'OBLIGATION_MAPPING_MISMATCH', 'UNTRUSTED_EVIDENCE'].includes(reason)) return 'structural';
   if (['UNSUPPORTED_OPERATION', 'UNSUPPORTED_CONTROL', 'UNSUPPORTED_MAPPING', 'PENDING_OBLIGATIONS'].includes(reason)) return 'unsupported';
@@ -22,11 +23,14 @@ function category(reason: string): Exclude<ActionGroundingOutcomeV1, { status: '
 /** Retry only rejected pre-action drift. Every retry repeats source correspondence and a complete query.
  * Attempted mutations, including partial/unknown failures, are never automatically repeated. */
 export async function executeActionGoalGroundingV1(input: { admission: TrustedSemanticAdmissionV2; goalId: string;
-  model: ActionGroundingModelV5; independentModel: IndependentGroundingModelV1; runtime: Runtime }): Promise<ActionGoalExecutionOutcomeV1> {
+  model: ActionGroundingModelV5; independentModel: IndependentGroundingModelV1; runtime: Runtime;
+  aroundFirstDecision?: (prepare: () => Promise<ActionGroundingOutcomeV1>) => Promise<ActionGroundingOutcomeV1> }): Promise<ActionGoalExecutionOutcomeV1> {
   const deadline = Date.now() + ACTION_GROUNDING_EXECUTION_LIMITS.elapsedMs, executionAttempts: ActionExecutionAttemptV1[] = [];
   for (let attempt = 0; attempt < ACTION_GROUNDING_EXECUTION_LIMITS.attempts; attempt++) {
     if (Date.now() >= deadline) return { status: 'stop', reason: 'EXECUTION_BUDGET', category: 'provider_environment', executionAttempts };
-    const prepared = await prepareActionGoalGroundingV1({ ...input, deadline });
+    // The optional diagnostic wraps only first preparation, before mutation or execution retries.
+    const prepare = () => prepareActionGoalGroundingV1({ ...input, deadline });
+    const prepared = attempt === 0 && input.aroundFirstDecision ? await input.aroundFirstDecision(prepare) : await prepare();
     if (prepared.status === 'stop') return { ...prepared, executionAttempts };
     if (Date.now() >= deadline) return { status: 'stop', reason: 'EXECUTION_BUDGET', category: 'provider_environment', executionAttempts };
     let result: ActionGroundingExecutionOutcomeV1;

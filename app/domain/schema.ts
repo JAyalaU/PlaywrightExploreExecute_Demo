@@ -26,8 +26,13 @@ const prose = nonEmpty.refine(
 
 const httpUrl = z.string().url().refine((value) => {
   const url = new URL(value);
-  return (url.protocol === 'http:' || url.protocol === 'https:') && !url.username && !url.password && !value.includes('*');
+  return (url.protocol === 'http:' || url.protocol === 'https:') &&
+    !url.username && !url.password && !value.includes('*');
 }, 'Expected an absolute HTTP(S) URL without credentials');
+const navigationUrl = z.string().url().refine((value) => {
+  const url = new URL(value);
+  return url.protocol === 'http:' || url.protocol === 'https:';
+}, 'Expected an absolute HTTP(S) URL');
 
 /** Reused by separately versioned source contracts; grants no navigation approval. */
 export const ApprovedAbsoluteUrlSchema = httpUrl;
@@ -72,7 +77,7 @@ export const WaitConditionSchema = z.discriminatedUnion('type', [
 const authoredBase = { id: identifier, sourceText: prose };
 
 export const AuthoredStepSchema = z.discriminatedUnion('type', [
-  z.strictObject({ ...authoredBase, type: z.literal('navigate'), url: httpUrl }),
+  z.strictObject({ ...authoredBase, type: z.literal('navigate'), url: navigationUrl }),
   z.strictObject({ ...authoredBase, type: z.literal('click'), target: TargetSchema,
     actionTargetIntent: ActionTargetIntentV1Schema.optional() }),
   z.strictObject({ ...authoredBase, type: z.literal('fill'), target: TargetSchema, value: dataValue,
@@ -98,7 +103,7 @@ export const TestSpecSchema = z.strictObject({
   testSpecId: identifier,
   sourceInstruction: prose,
   executionProfileRef: ExecutionProfileRefSchema,
-  startState: z.strictObject({ url: z.union([httpUrl, z.literal('about:blank')]) }),
+  startState: z.strictObject({ url: z.union([navigationUrl, z.literal('about:blank')]) }),
   steps: z.array(AuthoredStepSchema).min(1),
 }).superRefine((spec, context) => {
   if (spec.schemaVersion === SCHEMA_VERSION && spec.steps.some((step) => step.type === 'assert_link_collection')) {
@@ -260,7 +265,7 @@ const targeted = {
 };
 
 const executionOperation = z.discriminatedUnion('type', [
-  z.strictObject({ ...executionBase, type: z.literal('navigate'), url: httpUrl }),
+  z.strictObject({ ...executionBase, type: z.literal('navigate'), url: navigationUrl }),
   z.strictObject({ ...executionBase, ...targeted, type: z.literal('click') }),
   z.strictObject({ ...executionBase, ...targeted, type: z.literal('fill'), value: dataValue }),
   z.strictObject({ ...executionBase, ...targeted, type: z.literal('select_option'), value: dataValue }),

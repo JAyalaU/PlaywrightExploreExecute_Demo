@@ -50,12 +50,3 @@ test('P3-A admitted public profiles retain isolated, pinned, proxy-only sessions
     expect(await residualContainers()).toBe('');
   }
 });
-
-test('P3-A refused proxy cannot start an isolated browser and leaves no container', async () => {
-  const inspection = await inspectPublicUrl(targets[0]!);
-  const bundle = await approvePublicInspection(inspection, inspection.canonicalUrl);
-  const proxy = await ProtectedProxy.start(bundle.policy);
-  await proxy.close();
-  await expect(IsolatedBrowser.open(proxy)).rejects.toThrow('Proxy is closed');
-  expect(await residualContainers()).toBe('');
-});

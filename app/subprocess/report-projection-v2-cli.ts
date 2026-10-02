@@ -27,7 +27,7 @@ try {
       chunks.push(bytes);
     }
     const request = parseAgenticReportProjectionRequestV2(Buffer.concat(chunks, length));
-    const config = await readSubprocessTrustedConfiguration(path).catch(() => undefined);
+    const config = await readSubprocessTrustedConfiguration(path, 'active-poc').catch(() => undefined);
     response = config ? await projectStoredAgenticReportV2(request, config) :
       unavailable('CONFIGURATION_UNAVAILABLE');
   }

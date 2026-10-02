@@ -7,6 +7,9 @@ import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { execFile, spawn } from 'node:child_process';
 import { ProtectedContextFactory } from '../app/profile/index.js';
+import { McpExplorationSession, McpToolError } from '../app/exploration/mcp.js';
+import { ActionCandidateGroundingSessionV1 } from '../app/exploration/action-candidate-grounding.js';
+import { SuccessfulTraceAssemblerV5 } from '../app/exploration/trace-assembly-v5.js';
 import { runAgenticLocalWorkflow } from '../app/local/agentic-workflow.js';
 import { runAgenticSubprocessAdapterV2 } from '../app/subprocess/agentic-entry.js';
 import { parseSubprocessResponseV2, serializeSubprocessResponseV2 } from '../app/subprocess/protocol-v2.js';
@@ -53,14 +56,14 @@ const verified = (): TestSpecV6V2['steps'][number] => {
   return { id: 'verify', type: 'verification_goal', instruction: text, sourceText: text, sourceInstructionSpan: { start: 0, end: text.length },
     subject: { role: 'dialog', accessibleName: 'Notice' }, intent: { kind: 'cardinality', comparison: 'equal', count: 1 } };
 };
-async function fixture(html: string, authored: TestSpecV6V2['steps'] = [choose()]) {
+async function fixture(html: string, authored: TestSpecV6V2['steps'] | ((url: string) => TestSpecV6V2['steps']) = [choose()]) {
   let currentHtml = html;
   const server = http.createServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end(currentHtml); });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Port missing');
   const url = `http://127.0.0.1:${address.port}/`, root = await mkdtemp(path.join(tmpdir(), 'deferred-production-'));
   let offset = 0;
-  const steps = structuredClone(authored).map((goal, i) => { if (i) offset++; goal.sourceInstructionSpan = { start: offset, end: offset + goal.sourceText.length }; offset += goal.sourceText.length; return goal; });
+  const steps = structuredClone(typeof authored === 'function' ? authored(url) : authored).map((goal, i) => { if (i) offset++; goal.sourceInstructionSpan = { start: offset, end: offset + goal.sourceText.length }; offset += goal.sourceText.length; return goal; });
   const instructionAccounting = steps.flatMap((goal, i) => [
     ...(i ? [{ classification: 'neutral' as const, sourceSpan: { start: goal.sourceInstructionSpan.start - 1, end: goal.sourceInstructionSpan.start }, authoredText: ' ' }] : []),
     { classification: 'clause' as const, stepId: goal.id, sourceSpan: goal.sourceInstructionSpan, authoredText: goal.sourceText },
@@ -126,9 +129,80 @@ for (const kind of ['choice', 'country', 'fill', 'checkbox', 'radio'] as const) 
     expect(f.calls[1]!.input).toMatchObject({ originalInstruction: f.request.taskText, testSpec: { steps: expect.any(Array) } });
     const projection = await projectStoredWorkflowReportV2({ reportProjectionVersion: '2', result: response }, f.config);
     expect(projection.kind).toBe('available'); expect(projection).not.toHaveProperty('authoritativeQa');
+    if (kind === 'choice') {
+      const result = response.context.result, store = new DeferredWorkflowStopStoreV1(f.root);
+      const diagnostics = await store.readStartupDiagnostics(result.testSpecId, result.explorationAttemptId!, result.profileFingerprint);
+      expect(diagnostics.map(item => [item.stage, item.status])).toEqual([
+        ['session_open', 'completed'], ['root_navigation', 'completed'], ['initial_observation', 'completed'],
+        ['initial_protected_state', 'completed'], ['first_grounding_decision', 'completed'],
+      ]);
+      expect(JSON.stringify(response)).not.toContain('startupDiagnostics');
+      expect(JSON.stringify(projection)).not.toContain('startupDiagnostics');
+      const file = path.join(f.root, 'deferred-startup-diagnostics-v1', result.testSpecId, 'startup.json');
+      const altered = JSON.parse(await readFile(file, 'utf8'));
+      altered.diagnostics[0].status = 'failed';
+      await writeFile(file, JSON.stringify(altered));
+      await expect(store.readStartupDiagnostics(result.testSpecId, result.explorationAttemptId!, result.profileFingerprint)).rejects.toThrow();
+    }
     for (const secret of ['Option 1', 'runtime-1', 'exact text', 'PRIVATE_BROWSER_TEXT', 'sourceInstruction', 'predicate', 'actual', 'expected']) expect(JSON.stringify(projection)).not.toContain(secret);
     await throughPython(f, response, projection);
   } finally { await f.close(); }
+});
+for (const expectedMatches of [true, false]) test(`PoC resulting URL ${expectedMatches ? 'passes' : 'fails'} after two deterministic replays`, async () => {
+  const f = await fixture('<input type="checkbox">', (url) => {
+    const action = check('checkbox');
+    const expected = expectedMatches ? url : `${url}wrong`;
+    const clause = `Confirm it takes you to ${expected}`;
+    return [action, { id: 'verify-url', type: 'verification_goal', sourceText: clause,
+      instruction: clause, sourceInstructionSpan: { start: 0, end: clause.length },
+      dependsOnStepId: action.id }];
+  });
+  try {
+    const response = await f.run();
+    if (response.kind === 'bridge_error') throw new Error('Bridge');
+    expect(response.context.result.terminal.status).toBe(expectedMatches ? 'QA_ASSERTION_PASSED' : 'QA_ASSERTION_FAILED');
+    expect(response.context.result.executionRunIds).toHaveLength(2);
+    expect(response.context.result.deferredReplay?.runnerVersion).toBe('9');
+    expect(f.calls.some((call) => call.format === 'agentic_verification_decision_v4')).toBe(false);
+  } finally { await f.close(); }
+});
+test('grounding stop persists bounded authenticated private obligation diagnostic', async () => {
+  const action = check('checkbox'); action.sourceText = 'Click the checkbox near Notice.';
+  const f = await fixture('<input type="checkbox"><span>Notice</span>', [action]);
+  f.extractionOverride((response) => {
+    const draft = response as { kind: string; steps: { targetConstraints?: { kind: string; value: string; polarity: string }[] }[] };
+    draft.steps[0]!.targetConstraints!.push({ kind: 'context', value: 'near Notice', polarity: 'positive' });
+    return draft;
+  });
+  try {
+    const response = await f.run();
+    if (response.kind === 'bridge_error') throw new Error('Bridge');
+    expect(response.context.result.deferredStage?.code).toBe('PENDING_OBLIGATIONS');
+    expect(response.context.result.terminal.stage).toBe('exploration');
+    const store = new DeferredWorkflowStopStoreV1(f.root);
+    const accounting = await store.readPrivateAccounting(response.context.result.testSpecId);
+    expect(accounting.groundingStop).toMatchObject({ diagnosticVersion: '1', stepId: 's1', operation: 'click',
+      pending: [{ kind: 'constraint' }] });
+    expect(accounting.groundingAttempts).toEqual([]);
+    expect(JSON.stringify(response)).not.toContain('groundingStop');
+    const projection = await projectStoredWorkflowReportV2({ reportProjectionVersion: '2', result: response }, f.config);
+    expect(JSON.stringify(projection)).not.toContain('groundingStop');
+    const file = path.join(f.root, 'deferred-workflow-stop-v1', response.context.result.testSpecId, 'terminal.json');
+    const tampered = JSON.parse(await readFile(file, 'utf8'));
+    tampered.accounting.groundingStop.pending[0].kind = 'effect';
+    await writeFile(file, JSON.stringify(tampered));
+    await expect(store.readPrivateAccounting(response.context.result.testSpecId)).rejects.toThrow();
+  } finally { await f.close(); }
+});
+test('private startup diagnostic write failure does not change completed workflow outcome', async () => {
+  const f = await fixture(select, [choose()]), original = DeferredWorkflowStopStoreV1.prototype.writeStartupDiagnostics;
+  DeferredWorkflowStopStoreV1.prototype.writeStartupDiagnostics = async () => { throw new Error('PRIVATE_DIAGNOSTIC_IO'); };
+  try {
+    const response = await f.run(); if (response.kind === 'bridge_error') throw new Error('Bridge');
+    expect(response.context.result.terminal.status).toBe('EXECUTION_REPRODUCED');
+    expect(response.context.result.cleanup).toBe('verified');
+    expect(JSON.stringify(response)).not.toContain('PRIVATE_DIAGNOSTIC_IO');
+  } finally { DeferredWorkflowStopStoreV1.prototype.writeStartupDiagnostics = original; await f.close(); }
 });
 test('successful malformed-primary retry persists authenticated private attempts across restart', async () => {
   const f = await fixture(select, [choose()]); f.malformedFirstPrimary();
@@ -192,8 +266,87 @@ test('two eligible dropdowns stop NON_UNIQUE before mutation or compile', async 
     expect(response.context.result.deferredStage?.code).toBe('NON_UNIQUE'); expect(response.context.result.terminal.stage).toBe('exploration'); expect(opened).toBe(1);
     expect(response.context.result.executionRunIds).toEqual([]); expect(response.context.result).not.toHaveProperty('deferredReplay');
     expect(await new DeferredWorkflowStopStoreV1(f.root).readStop(response.context.result.testSpecId)).toEqual(response.context.result);
+    const diagnostics = (await new DeferredWorkflowStopStoreV1(f.root).readPrivateAccounting(response.context.result.testSpecId)).startupDiagnostics;
+    expect(diagnostics?.map(item => [item.stage, item.status])).toEqual([
+      ['session_open', 'completed'], ['root_navigation', 'completed'], ['initial_observation', 'completed'],
+      ['initial_protected_state', 'completed'], ['first_grounding_decision', 'stopped'],
+    ]);
+    expect((await new DeferredWorkflowStopStoreV1(f.root).readPrivateAccounting(response.context.result.testSpecId)).groundingStop)
+      .toMatchObject({ diagnosticVersion: '1', stepId: 's1', operation: 'select_option', candidateCount: 2, pending: [] });
     await throughPython(f, response, { reportProjectionVersion: '2', kind: 'unavailable', reason: 'REPORT_UNAVAILABLE' });
   } finally { ProtectedContextFactory.prototype.open = original; await f.close(); }
+});
+
+test('private startup diagnostics identify session-open failure without public leakage', async () => {
+  const f = await fixture(select), original = McpExplorationSession.open;
+  McpExplorationSession.open = async () => { throw new Error('PRIVATE_OPEN_DETAIL'); };
+  try {
+    const response = await f.run(); if (response.kind === 'bridge_error') throw new Error('Bridge');
+    expect(response.context.result.deferredStage?.code).toBe('ENVIRONMENT_STOP');
+    expect(response.context.result.cleanup).toBe('not_started');
+    const diagnostics = (await new DeferredWorkflowStopStoreV1(f.root).readPrivateAccounting(response.context.result.testSpecId)).startupDiagnostics;
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics?.[0]).toMatchObject({ stage: 'session_open', status: 'failed', exceptionName: 'Error' });
+    expect(diagnostics?.[0]?.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(response)).not.toContain('startupDiagnostics');
+    expect(JSON.stringify(response)).not.toContain('PRIVATE_OPEN_DETAIL');
+  } finally { McpExplorationSession.open = original; await f.close(); }
+});
+
+test('private startup diagnostics identify root-navigation timeout with verified cleanup', async () => {
+  const f = await fixture(select), original = McpExplorationSession.prototype.navigate;
+  McpExplorationSession.prototype.navigate = async () => {
+    throw new McpToolError('browser_navigate', 'TimeoutError: page.goto: Timeout 5000ms exceeded PRIVATE_URL');
+  };
+  try {
+    const response = await f.run(); if (response.kind === 'bridge_error') throw new Error('Bridge');
+    expect(response.context.result.deferredStage?.code).toBe('ENVIRONMENT_STOP');
+    expect(response.context.result.cleanup).toBe('verified');
+    const diagnostics = (await new DeferredWorkflowStopStoreV1(f.root).readPrivateAccounting(response.context.result.testSpecId)).startupDiagnostics;
+    expect(diagnostics?.map(item => [item.stage, item.status])).toEqual([
+      ['session_open', 'completed'], ['root_navigation', 'failed'],
+    ]);
+    expect(diagnostics?.[1]).toMatchObject({ exceptionName: 'McpToolError', code: 'NAVIGATION_TIMEOUT' });
+    expect(JSON.stringify(diagnostics)).not.toContain('PRIVATE_URL');
+    expect(JSON.stringify(response)).not.toContain('startupDiagnostics');
+    expect(JSON.stringify(response)).not.toContain('PRIVATE_URL');
+  } finally { McpExplorationSession.prototype.navigate = original; await f.close(); }
+});
+
+test('private startup diagnostics distinguish first observation from protected state failure', async () => {
+  const f = await fixture(select), originalState = ActionCandidateGroundingSessionV1.prototype.protectedTraceState;
+  ActionCandidateGroundingSessionV1.prototype.protectedTraceState = async function (aroundObservation) {
+    await aroundObservation?.(async () => { throw new Error('PRIVATE_OBSERVATION_DETAIL'); });
+    return originalState.call(this);
+  };
+  try {
+    const response = await f.run(); if (response.kind === 'bridge_error') throw new Error('Bridge');
+    expect(response.context.result.cleanup).toBe('verified');
+    const diagnostics = (await new DeferredWorkflowStopStoreV1(f.root).readPrivateAccounting(response.context.result.testSpecId)).startupDiagnostics;
+    expect(diagnostics?.map(item => [item.stage, item.status])).toEqual([
+      ['session_open', 'completed'], ['root_navigation', 'completed'], ['initial_observation', 'failed'],
+      ['initial_protected_state', 'failed'],
+    ]);
+    expect(JSON.stringify(response)).not.toContain('PRIVATE_OBSERVATION_DETAIL');
+  } finally { ActionCandidateGroundingSessionV1.prototype.protectedTraceState = originalState; await f.close(); }
+});
+
+test('private startup diagnostics retain completed observation before protected-state failure', async () => {
+  const f = await fixture(select), original = SuccessfulTraceAssemblerV5.create;
+  SuccessfulTraceAssemblerV5.create = async function (input) {
+    await original.call(this, input);
+    throw new Error('PRIVATE_STATE_DETAIL');
+  };
+  try {
+    const response = await f.run(); if (response.kind === 'bridge_error') throw new Error('Bridge');
+    const diagnostics = (await new DeferredWorkflowStopStoreV1(f.root).readPrivateAccounting(response.context.result.testSpecId)).startupDiagnostics;
+    expect(diagnostics?.map(item => [item.stage, item.status])).toEqual([
+      ['session_open', 'completed'], ['root_navigation', 'completed'], ['initial_observation', 'completed'],
+      ['initial_protected_state', 'failed'],
+    ]);
+    expect(response.context.result.cleanup).toBe('verified');
+    expect(JSON.stringify(response)).not.toContain('PRIVATE_STATE_DETAIL');
+  } finally { SuccessfulTraceAssemblerV5.create = original; await f.close(); }
 });
 test('malformed extraction is durably rejected before browser creation and cannot forge stop authority', async () => {
   const f = await fixture(select); f.extractionOverride(() => ({ kind: 'extraction', steps: [] }));

@@ -1,11 +1,7 @@
 import { createRequire } from 'node:module';
-import http from 'node:http';
-import { once } from 'node:events';
-import { isIP } from 'node:net';
 import { chromium, type Browser, type BrowserContext } from '@playwright/test';
 import type { EffectiveProfile, ProfileRef } from './contracts.js';
 import { ProfileCatalog, assertEquivalentEffectiveProfile, profilePresentationMode } from './contracts.js';
-import { ProtectedProxy } from './network.js';
 import { restrictedBrowserEnvironment } from './browser-environment.js';
 import { IsolatedBrowser } from './isolated-browser.js';
 
@@ -16,17 +12,9 @@ export interface AuthStateProvider {
   load(reference: ProfileRef): Promise<StorageState>;
 }
 
-/** Supplied by a trusted operator boundary after review of non-loopback targets. */
+/** Historical extension point; destination approval is unused by the active PoC. */
 export interface ExternalTargetGate {
   authorize(effective: EffectiveProfile): Promise<void>;
-}
-
-export function requiresExternalReview(effective: EffectiveProfile): boolean {
-  return effective.policy.destinations.some((destination) => destination.addresses.some((address) => {
-    if (isIP(address) === 4) return !address.startsWith('127.');
-    if (isIP(address) === 6) return address !== '::1';
-    return true;
-  }));
 }
 
 export interface BrowserVersions {
@@ -49,51 +37,19 @@ export class ProtectedFinalCheckError extends Error {
 const require = createRequire(import.meta.url);
 const playwrightVersion = (require('@playwright/test/package.json') as { version: string }).version;
 
-/** Refuse a session if this browser build bypasses the configured proxy. */
-async function verifyProxyBoundary(browser: Browser, effective: EffectiveProfile): Promise<void> {
-  let reachedDirectly = false;
-  const server = http.createServer((_request, response) => {
-    reachedDirectly = true;
-    response.end('unprotected');
-  });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('Cannot verify browser network policy');
-  const probePort = address.port;
-  let probeContext: BrowserContext | undefined;
-  try {
-    if (effective.policy.destinations.some((item) => item.host === '127.0.0.1' && item.ports.includes(probePort))) {
-      throw new Error('Cannot verify browser network policy with an allowed probe destination');
-    }
-    probeContext = await browser.newContext({ serviceWorkers: 'block' });
-    const page = await probeContext.newPage();
-    const response = await page.goto(`http://127.0.0.1:${probePort}/policy-probe`, { timeout: 5000 });
-    if (reachedDirectly || response?.status() !== 403 || await response.text() !== 'Network policy denied request') {
-      throw new Error('Browser network policy is unenforceable');
-    }
-  } finally {
-    await probeContext?.close();
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-}
-
 export class ProtectedBrowserSession {
   readonly context: BrowserContext;
   readonly effectiveProfile: EffectiveProfile;
   readonly versions: BrowserVersions;
   readonly #browser: Browser;
-  readonly #proxy: ProtectedProxy;
   readonly #isolated: IsolatedBrowser | undefined;
   readonly #closingObservers = new Set<() => void>();
   #closePromise: Promise<void> | undefined;
 
-  constructor(browser: Browser, context: BrowserContext, proxy: ProtectedProxy, effectiveProfile: EffectiveProfile,
+  constructor(browser: Browser, context: BrowserContext, effectiveProfile: EffectiveProfile,
     isolated?: IsolatedBrowser) {
     this.#browser = browser;
     this.context = context;
-    this.#proxy = proxy;
     this.#isolated = isolated;
     this.effectiveProfile = effectiveProfile;
     this.versions = { node: process.version, playwright: playwrightVersion, browser: browser.version() };
@@ -142,7 +98,6 @@ export class ProtectedBrowserSession {
       if (this.#isolated) await this.#isolated.close();
       else await this.#browser.close();
     } catch (error) { errors.push(error); }
-    try { await this.#proxy.close(); } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, 'Protected browser session cleanup failed');
     if (checkFailed) throw new ProtectedFinalCheckError(checkError);
   }
@@ -159,38 +114,22 @@ export class ProtectedContextFactory {
   async open(reference: ProfileRef, expected?: EffectiveProfile, options?: ProtectedSessionOptions): Promise<ProtectedBrowserSession> {
     const effective = this.catalog.resolve(reference);
     if (expected) assertEquivalentEffectiveProfile(expected, effective);
-    if (requiresExternalReview(effective)) {
-      if (!this.externalTargetGate) throw new Error('External target requires security-review approval');
-      await this.externalTargetGate.authorize(effective);
-    }
     if (effective.profile.authStateRef && !this.authProvider) throw new Error('Protected auth-state provider is unavailable');
 
-    const proxy = await ProtectedProxy.start(effective.policy);
     let browser: Browser | undefined;
     let isolated: IsolatedBrowser | undefined;
     try {
-      const external = requiresExternalReview(effective);
-      if (external && !('browserIsolation' in effective.profile && effective.profile.browserIsolation === 'docker')) {
-        throw new Error('External target requires an isolated public browser profile');
-      }
       if ('browserIsolation' in effective.profile && effective.profile.browserIsolation === 'docker') {
-        isolated = await IsolatedBrowser.open(proxy, profilePresentationMode(effective.profile));
+        isolated = await IsolatedBrowser.open(profilePresentationMode(effective.profile));
         browser = isolated.browser;
       } else browser = await chromium.launch({
         headless: profilePresentationMode(effective.profile) === 'headless',
-        ...(requiresExternalReview(effective) ? { env: restrictedBrowserEnvironment(process.env) } : {}),
-        proxy: { server: proxy.url, bypass: '<-loopback>' },
+        env: restrictedBrowserEnvironment(process.env),
         args: [
-          '--proxy-bypass-list=<-loopback>',
           '--disable-background-networking',
           '--disable-quic',
-          '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
         ],
       });
-      browser.on('disconnected', () => {
-        void proxy.close().catch((error: unknown) => process.emitWarning(`Browser proxy cleanup failed: ${String(error)}`));
-      });
-      await verifyProxyBoundary(browser, effective);
       const authState = effective.profile.authStateRef
         ? await this.authProvider!.load(effective.profile.authStateRef)
         : undefined;
@@ -213,12 +152,12 @@ export class ProtectedContextFactory {
       });
       context.setDefaultTimeout(profile.timeoutPolicy.actionMs);
       context.setDefaultNavigationTimeout(profile.timeoutPolicy.navigationMs);
-      return new ProtectedBrowserSession(browser, context, proxy, effective, isolated);
+      return new ProtectedBrowserSession(browser, context, effective, isolated);
     } catch (error) {
       try {
         if (isolated) await isolated.close();
         else await browser?.close();
-      } finally { await proxy.close(); }
+      } finally { /* Browser cleanup is handled above. */ }
       throw error;
     }
   }

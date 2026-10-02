@@ -170,14 +170,53 @@ export class GoalDirectedVerificationControllerV1 {
       : this.#current.source;
     const sourceIndex = source.steps.findIndex((step) => step.id === goal.id);
     const sourceStep = source.steps[sourceIndex];
+    const semanticPoc = 'semanticMode' in source && source.semanticMode === 'poc_v1';
     if (sourceIndex !== stepOrdinal || !sourceStep || sourceStep.type !== 'verification_goal' ||
         'verificationVersion' in sourceStep ||
         normalized(sourceStep.sourceText) !== normalized(goal.sourceText) ||
         (sourceStep.intent && !same(sourceStep.intent, goal.intent)) ||
         (sourceStep.subject && !same(sourceStep.subject, goal.subject)) ||
-        verificationGoalFidelity(goal, source.sourceInstruction,
+        !semanticPoc && verificationGoalFidelity(goal, source.sourceInstruction,
           source.steps.slice(0, sourceIndex).map((step) => step.id)))
       return { conclusion: 'unresolved', reason: 'INTENT_NOT_PRESERVED' };
+    if (semanticPoc) {
+      const preceding = source.steps[stepOrdinal - 1];
+      const urlGoal = /\b(?:url|takes?\s+(?:you\s+)?to)\b/i.test(goal.sourceText);
+      const literals = goal.sourceText.match(/https?:\/\/[^\s<>"']+/g)?.map((value) => value.replace(/[.,;!?]+$/, '')) ?? [];
+      if (urlGoal) {
+        if (literals.length !== 1 || goal.subject || goal.intent || preceding?.type !== 'action_goal' ||
+            goal.dependsOnStepId !== preceding.id || this.#actionOrdinal < 1 ||
+            !source.sourceInstruction.includes(literals[0]!))
+          return { conclusion: 'unresolved', reason: 'INTENT_NOT_PRESERVED' };
+        let expected: string;
+        try {
+          const parsed = new URL(literals[0]!);
+          if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password)
+            return { conclusion: 'unresolved', reason: 'UNSUPPORTED_COMPARISON' };
+          expected = parsed.href;
+        } catch { return { conclusion: 'unresolved', reason: 'UNSUPPORTED_COMPARISON' }; }
+        let fact: TrustedObservationResultV1;
+        try { fact = await this.#observations.observe({ kind: 'current_url' }); }
+        catch { return { conclusion: 'unresolved', reason: 'OBSERVATION_ERROR' }; }
+        if (fact.status !== 'complete' || fact.result.kind !== 'url' ||
+            !(await this.#observations.currentEvidence(fact)))
+          return { conclusion: 'unresolved', reason: 'EVIDENCE_INELIGIBLE' };
+        const comparison: VerificationComparisonV1 = { kind: 'string', observationId: fact.observationId,
+          property: 'url', operator: 'equal', expected };
+        const evaluated = fact.result.value === expected;
+        const data = { strategyVersion: '1', goalStepId: goal.id, observationIds: [fact.observationId],
+          observations: [{ observationId: fact.observationId, request: fact.request, result: fact.result,
+            witnessDigest: fact.witnessDigest, sessionId: fact.sessionId, pageId: fact.pageId,
+            stateEpoch: fact.stateEpoch, mutationEpoch: fact.mutationEpoch,
+            stateDigest: fact.stateDigest, observedAt: fact.observedAt, frame: fact.frame }],
+          comparison, evaluated, conclusion: evaluated ? 'satisfied' as const : 'unsatisfied' as const,
+          testSpecId: fact.testSpecId, explorationAttemptId: fact.explorationAttemptId,
+          sessionId: fact.sessionId, pageId: fact.pageId, actionOrdinal: this.#actionOrdinal };
+        const strategy = parseSuccessfulVerificationStrategyV1({ ...data, strategyDigest: digest(data) });
+        this.#journal.push(structuredClone(strategy));
+        return { conclusion: strategy.conclusion, strategy: structuredClone(strategy) };
+      }
+    }
     const deadline = Date.now() + LIMITS.elapsedMs;
     const facts: TrustedObservationResultV1[] = [];
     const requests = new Map<string, TrustedObservationResultV1>();

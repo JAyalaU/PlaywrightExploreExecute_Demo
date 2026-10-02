@@ -673,8 +673,7 @@ async function runVerificationExploration(factory: ProtectedContextFactory,
         new AgenticExplorationStop(error.reason === 'UNSUPPORTED_OPERATION' ? 'unsupported' : 'path_unresolved',
           error.reason === 'UNSUPPORTED_OPERATION' ? 'UNSUPPORTED_OPERATION' : 'TARGET_NOT_FOUND') :
       error instanceof McpToolError ?
-        new AgenticExplorationStop('environment_failed',
-          error.reason === 'NETWORK_POLICY_DENIED' ? 'NETWORK_POLICY_DENIED' : 'BROWSER_UNAVAILABLE') :
+        new AgenticExplorationStop('environment_failed', 'BROWSER_UNAVAILABLE') :
       error instanceof ModelCompletionFailure ?
         new AgenticExplorationStop(options.signal?.aborted ? 'cancelled' : 'environment_failed',
           options.signal?.aborted ? 'CANCELLED' : error.code === 'PROVIDER_TIMEOUT' ?

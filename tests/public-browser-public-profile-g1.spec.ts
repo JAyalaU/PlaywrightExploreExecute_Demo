@@ -147,13 +147,6 @@ test('G1 public profile proves isolated private control, no credential sentinel,
   expect(await docker(['ps', '-a', '--filter', `id=${containerId!}`, '--format', '{{.ID}}'])).toBe('');
 });
 
-test('G1 fails closed before browser launch if the authoritative proxy is unavailable', async () => {
-  const configuration = trustedPublicConfiguration();
-  const effective = new ProfileCatalog(configuration.profiles, configuration.networkPolicies).resolve(reference);
-  const proxy = await ProtectedProxy.start(effective.policy);
-  await proxy.close();
-  await expect(IsolatedBrowser.open(proxy)).rejects.toThrow('Proxy is closed');
-});
 
 /**
  * This makes exactly one approved HTTPS navigation. It proves transport through

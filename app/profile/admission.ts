@@ -226,7 +226,7 @@ function admissionProfileAndPolicy(candidate: ReturnType<typeof canonicalPublicU
   const profile: ExecutionProfile = {
     id: ref.id, version: ref.version, profileSchemaVersion: '3', presentationMode: 'headless',
     browserIsolation: 'docker', browser: 'chromium', viewport: { width: 1280, height: 800 },
-    locale: 'en-US', timeoutPolicy: { actionMs: 10_000, navigationMs: 30_000,
+    locale: 'en-US', timeoutPolicy: { actionMs: 10_000, navigationMs: 90_000,
       waits: { default: 10_000 } },
     networkPolicyRef: { id: policy.id, version: policy.version },
   };
@@ -246,6 +246,14 @@ function headedAdmissionProfileAndPolicy(candidate: ReturnType<typeof canonicalP
   return { profile, policy };
 }
 
+function matchesGeneratedAdmissionProfile(actual: ExecutionProfile, expected: ExecutionProfile): boolean {
+  // Read approvals created before the active PoC raised its navigation timeout.
+  // This comparison is used only by the historical lookup exchange.
+  return isDeepStrictEqual(actual, expected) || isDeepStrictEqual(actual, {
+    ...expected, timeoutPolicy: { ...expected.timeoutPolicy, navigationMs: 30_000 },
+  });
+}
+
 export function validateAdmittedPublicTargetApproval(approval: AdmittedPublicTargetApproval,
   effective: EffectiveProfile): void {
   try {
@@ -258,9 +266,10 @@ export function validateAdmittedPublicTargetApproval(approval: AdmittedPublicTar
           port: candidate.port, addresses: pins }) ||
         approval.executionProfileRef.id !== expected.profile.id ||
         approval.executionProfileRef.version !== expected.profile.version ||
-        !isDeepStrictEqual(effective.profile, expected.profile) ||
+        !matchesGeneratedAdmissionProfile(effective.profile, expected.profile) ||
         !isDeepStrictEqual(effective.policy, expected.policy) ||
-        effective.fingerprint !== approval.profileFingerprint) {
+        ![effective.fingerprint, digest({ profile: effective.profile, policy: effective.policy })]
+          .includes(approval.profileFingerprint)) {
       throw new Error('Invalid binding');
     }
   } catch { throw new PublicAdmissionError('APPROVAL_INVALID'); }
@@ -278,9 +287,10 @@ export function validateHeadedPublicTargetApproval(approval: HeadedPublicTargetA
           port: candidate.port, addresses: pins }) ||
         !isDeepStrictEqual(approval.executionProfileRef,
           { id: expected.profile.id, version: expected.profile.version }) ||
-        !isDeepStrictEqual(effective.profile, expected.profile) ||
+        !matchesGeneratedAdmissionProfile(effective.profile, expected.profile) ||
         !isDeepStrictEqual(effective.policy, expected.policy) ||
-        effective.fingerprint !== approval.profileFingerprint) throw new Error('Invalid binding');
+        ![effective.fingerprint, digest({ profile: effective.profile, policy: effective.policy })]
+          .includes(approval.profileFingerprint)) throw new Error('Invalid binding');
   } catch { throw new PublicAdmissionError('APPROVAL_INVALID'); }
 }
 

@@ -290,7 +290,7 @@ def _render_live_viewer(viewer: LiveViewerBuffer) -> None:
 
 
 def validate_input(target_url: str, task_text: str) -> UiRequest:
-    """Check form shape only; Node decides public-target admission."""
+    """Check the URL and task shape before invoking the selected workflow."""
     url = target_url.strip()
     task = task_text.strip()
     if not url or any(character.isspace() for character in url):
@@ -304,7 +304,7 @@ def validate_input(target_url: str, task_text: str) -> UiRequest:
     if (parsed is None or parsed.scheme not in {"http", "https"}
             or not parsed.netloc or not parsed.hostname or not valid_port
             or parsed.username is not None or parsed.password is not None):
-        raise ValueError("Enter an absolute HTTP or HTTPS URL without credentials.")
+        raise ValueError("Enter an absolute HTTP or HTTPS URL.")
     if not task:
         raise ValueError("Enter a testing task.")
     return UiRequest(target_url=url, task_text=task)

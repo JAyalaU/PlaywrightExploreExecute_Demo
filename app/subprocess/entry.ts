@@ -1,7 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { TextDecoder } from 'node:util';
 import type { Readable } from 'node:stream';
-import { LocalWorkflowOutcomeSchema, parseTrustedLocalConfiguration,
+import { LocalWorkflowOutcomeSchema, parseTrustedLocalConfiguration, parseActivePocTrustedConfiguration,
   type LocalWorkflowTrustedDependencies } from '../local/contracts.js';
 import { LocalWorkflowError, runLocalWorkflow } from '../local/workflow.js';
 import type { ResultRecord } from '../domain/schema.js';
@@ -56,14 +56,18 @@ export async function readSubprocessRequest(input: Readable, signal?: AbortSigna
 }
 
 /** The path is launch-side trusted input; task JSON never contains it. */
-export async function readSubprocessTrustedConfiguration(file: string): Promise<unknown> {
+export async function readSubprocessTrustedConfiguration(file: string,
+  mode: 'historical' | 'active-poc' = 'historical'): Promise<unknown> {
   try {
     const metadata = await stat(file);
     if (!metadata.isFile() || metadata.size > MAX_CONFIG_BYTES) throw new Error('Invalid configuration');
     const bytes = await readFile(file);
     if (bytes.byteLength > MAX_CONFIG_BYTES) throw new Error('Configuration too large');
     const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    return parseTrustedLocalConfiguration(JSON.parse(decoded) as unknown);
+    const input = JSON.parse(decoded) as unknown;
+    return mode === 'active-poc'
+      ? parseActivePocTrustedConfiguration(input)
+      : parseTrustedLocalConfiguration(input);
   } catch {
     throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
   }

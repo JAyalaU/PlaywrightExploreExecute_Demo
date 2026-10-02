@@ -199,7 +199,9 @@ export class ActionCandidateGroundingSessionV1 {
     return { admission: this.#admission, session: this.#session, attemptId: this.#attempt,
       sessionId: this.sessionId, profileFingerprint: this.#session.browserSession.effectiveProfile.fingerprint };
   }
-  async protectedTraceState(): Promise<State> { return this.#state(); }
+  async protectedTraceState(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
+    return this.#state(aroundObservation);
+  }
   protectedSuccessfulGroundingWitnesses(): readonly ActionGroundingWitnessV1[] {
     this.#owner(); return structuredClone([...this.#groundingWitnesses.values()]);
   }
@@ -247,6 +249,7 @@ export class ActionCandidateGroundingSessionV1 {
       }
       if (mapping.kind === 'unique') valid = obligation.kind === 'constraint' && obligation.constraint === 'uniqueness' &&
         obligation.subject.kind === 'target' && obligation.polarity === 'positive';
+      if (mapping.kind === 'dependency') valid = goal.sourceMode === 'semantic_poc' && obligation.kind === 'prerequisite';
       if (!valid || !eligible.length) stop('UNSUPPORTED_MAPPING');
       if (!pending.includes(obligation.id)) discharged.push(obligation.id);
     }
@@ -255,11 +258,11 @@ export class ActionCandidateGroundingSessionV1 {
       roles: eligible, names }, pending, discharged };
   }
 
-  async #state(): Promise<State> {
-    try { return await this.#captureState(); }
+  async #state(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
+    try { return await this.#captureState(aroundObservation); }
     catch (error) { if (error instanceof ActionCandidateGroundingError) throw error; stop('BROWSER_FAILURE'); }
   }
-  async #captureState(): Promise<State> {
+  async #captureState(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
     this.#owner();
     const navigation = this.#navigationEpoch, mutation = this.#mutationEpoch, revision = this.#session.groundingRevision;
     const pages = this.#session.browserSession.context.pages();
@@ -267,14 +270,18 @@ export class ActionCandidateGroundingSessionV1 {
     const page = pages[0]!, frames = page.frames();
     if (frames.length > 8) stop('RESULT_LIMIT');
     const frameDigests = new Map<Frame, string>();
-    for (const frame of frames) {
-      this.#owner();
-      const content = await frame.content();
-      const aria = await frame.locator('body').ariaSnapshot({ mode: 'ai', timeout: 3000 });
-      if (content.length > 262_144 || aria.length > 131_072) stop('RESULT_LIMIT');
-      frameDigests.set(frame, hash({ content, aria, url: frame.url(),
-        frameId: this.#id(frame, 'frame'), parent: frame.parentFrame() ? this.#id(frame.parentFrame()!, 'frame') : null }));
-    }
+    const readFrames = async () => {
+      for (const frame of frames) {
+        this.#owner();
+        const content = await frame.content();
+        const aria = await frame.locator('body').ariaSnapshot({ mode: 'ai', timeout: 3000 });
+        if (content.length > 262_144 || aria.length > 131_072) stop('RESULT_LIMIT');
+        frameDigests.set(frame, hash({ content, aria, url: frame.url(),
+          frameId: this.#id(frame, 'frame'), parent: frame.parentFrame() ? this.#id(frame.parentFrame()!, 'frame') : null }));
+      }
+    };
+    if (aroundObservation) await aroundObservation(readFrames);
+    else await readFrames();
     this.#owner();
     const afterFrames = page.frames();
     if (navigation !== this.#navigationEpoch || mutation !== this.#mutationEpoch || revision !== this.#session.groundingRevision || page.isClosed() ||
@@ -623,7 +630,7 @@ export class ActionCandidateGroundingSessionV1 {
     if (!capture || !same(capture.record, parent) || parent.status !== 'complete' || parent.goalId !== mapping.goalId) stop('UNTRUSTED_EVIDENCE');
     // The caller cannot supply a smaller old predicate than the total correspondence requires.
     const expectedMapping = mapping.correspondence.map(({ obligation: o, realization: r }) => {
-      if (['effect', 'operation', 'literal', 'unique'].includes(r.kind)) return { obligationId: o.id, kind: r.kind };
+      if (['effect', 'operation', 'literal', 'unique', 'dependency'].includes(r.kind)) return { obligationId: o.id, kind: r.kind };
       if (r.kind === 'role_exact') return { obligationId: o.id, kind: r.kind, role: r.role };
       if (r.kind === 'name_exact') return { obligationId: o.id, kind: r.kind, name: r.name };
       return { obligationId: o.id, kind: 'pending' };
@@ -819,6 +826,8 @@ export class ActionCandidateGroundingSessionV1 {
       return await this.#composeGrounding(preparation.candidateObservation, mapping, preparation.operation, original,
         async (check, current, before, options) => {
           let activation: { role: 'checkbox' | 'radio'; checked: boolean } | undefined;
+          const genericClick = check.operation === 'click' && check.sourceGoal.sourceMode === 'semantic_poc' &&
+            current.candidate.role !== 'checkbox' && current.candidate.role !== 'radio';
           let nativeTextControl: 'input' | 'textarea' | undefined;
           if (check.operation === 'fill') {
             const ref = current.frame.locator(`aria-ref=${check.selectedRef}`);
@@ -826,7 +835,7 @@ export class ActionCandidateGroundingSessionV1 {
               if (await ref.and(current.frame.locator(kind)).count() === 1) nativeTextControl = kind;
             if (!nativeTextControl) stop('UNSUPPORTED_CONTROL');
           }
-          if (check.operation === 'click') {
+          if (check.operation === 'click' && !genericClick) {
             const role = current.candidate.role;
             if (role !== 'checkbox' && role !== 'radio' || await current.frame.locator(`input[type=${role}]`).and(current.frame.locator(`aria-ref=${check.selectedRef}`)).count() !== 1)
               stop('UNSUPPORTED_OPERATION');
@@ -837,6 +846,7 @@ export class ActionCandidateGroundingSessionV1 {
             if (armed.nativeInputType !== role || armed.clicks !== 0) stop('UNSUPPORTED_CONTROL');
           }
           if ((await this.#state()).stateDigest !== before.stateDigest) stop('STALE_STATE');
+          const beforeUrl = before.page.url();
           // Retained node actions cannot retarget a replacement. Force avoids actionability waits;
           // scroll/readiness already ran before the complete conjunction was renewed.
           const invokedAt = new Date(this.#clock()).toISOString();
@@ -847,6 +857,8 @@ export class ActionCandidateGroundingSessionV1 {
           try {
             if (check.operation === 'fill') await current.handle.fill(check.argument!.executableValue, { force: true, timeout: 3000 });
             else if (check.operation === 'select_option') await current.handle.selectOption({ value: check.argument!.executableValue }, { force: true, timeout: 3000 });
+            else if (genericClick) await current.handle.click({ force: true,
+              timeout: Math.max(1, Math.min(30_000, deadline - Date.now())) });
             else await current.handle.click({ force: true, timeout: 3000, noWaitAfter: true });
           } catch {
             this.invalidate();
@@ -858,10 +870,20 @@ export class ActionCandidateGroundingSessionV1 {
           let post: ActionPostEffectV1;
           try {
             const after = await this.#state();
-            if (after.page !== before.page || after.pageId !== before.pageId || !after.frames.includes(current.frame)) stop('STALE_STATE');
-            const target = current.frame.locator(`aria-ref=${check.selectedRef}`), handle = await target.elementHandle({ timeout: 3000 });
-            try { if (!handle || await handle.ownerFrame() !== current.frame || !await handle.evaluate((node, old) => node === old, current.handle)) stop('STALE_STATE'); }
-            finally { await handle?.dispose(); }
+            if (after.page !== before.page || after.pageId !== before.pageId || !genericClick && !after.frames.includes(current.frame)) stop('STALE_STATE');
+            let sameTargetNode = false;
+            if (after.frames.includes(current.frame)) {
+              try {
+                const target = current.frame.locator(`aria-ref=${check.selectedRef}`);
+                if (await target.count() === 1) {
+                  const handle = await target.elementHandle();
+                  try { sameTargetNode = !!handle && await handle.ownerFrame() === current.frame &&
+                    await handle.evaluate((node, old) => node === old, current.handle); }
+                  finally { await handle?.dispose(); }
+                }
+              } catch { if (!genericClick) stop('STALE_STATE'); }
+            }
+            if (!genericClick && !sameTargetNode) stop('STALE_STATE');
             let effect: ActionPostEffectV1['effect'];
             if (check.operation === 'fill') {
               const value = await current.handle.inputValue({ timeout: 3000 });
@@ -882,6 +904,10 @@ export class ActionCandidateGroundingSessionV1 {
                 effect = { kind: 'native_choice', value: selected[0]!.value, selectedOptionId: selected[0]!.optionId,
                   options: { complete: true, count: renewed.count, multiple: false, ownerRef: check.selectedRef, ownerFrameId: check.frameId, options: mapped } };
               } finally { await Promise.all(renewed.handles.map((h) => h.dispose())); }
+            } else if (genericClick) {
+              effect = { kind: 'generic_activation', role: current.candidate.role,
+                beforeUrl, afterUrl: after.page.url(),
+                delivery: { executionId, clicks: 1, targetOwned: true, returned: true } };
             } else {
               const checked = await current.handle.isChecked();
               const receipt = await nativeActivationReceipt(current.handle, executionId, 'read');
@@ -891,13 +917,15 @@ export class ActionCandidateGroundingSessionV1 {
                 trustedClickReceipt: { executionId, clicks: 1, targetOwned: true, nativeInputType: receipt.nativeInputType } };
             }
             if ((await this.#state()).stateDigest !== after.stateDigest) stop('STALE_STATE');
-            const renewedTarget = await current.frame.locator(`aria-ref=${check.selectedRef}`).elementHandle({ timeout: 3000 });
-            try { if (!renewedTarget || !await renewedTarget.evaluate((node, old) => node === old, current.handle)) stop('STALE_STATE'); }
-            finally { await renewedTarget?.dispose(); }
+            if (!genericClick) {
+              const renewedTarget = await current.frame.locator(`aria-ref=${check.selectedRef}`).elementHandle({ timeout: 3000 });
+              try { if (!renewedTarget || !await renewedTarget.evaluate((node, old) => node === old, current.handle)) stop('STALE_STATE'); }
+              finally { await renewedTarget?.dispose(); }
+            }
             const owner = (s: State) => ({ sessionId: this.sessionId, pageId: s.pageId, frameId: check.frameId,
               stateDigest: s.stateDigest, stateEpoch: s.stateEpoch, mutationEpoch: s.mutationEpoch });
             const data = { postEffectVersion: '1', observationId: `grounding-post-effect-${randomUUID()}`, executionId,
-              preparedDigest: check.witnessDigest, selectedRef: check.selectedRef, sameTargetNode: true, complete: true,
+              preparedDigest: check.witnessDigest, selectedRef: check.selectedRef, sameTargetNode, complete: true,
               before: owner(before), after: owner(after), observedAt: new Date(this.#clock()).toISOString(), effect };
             const { witnessDigest: _digest, ...ordered } = ActionPostEffectV1Schema.parse({ ...data, witnessDigest: hash(data) });
             post = parseActionPostEffectV1({ ...ordered, witnessDigest: hash(ordered) });
@@ -932,7 +960,9 @@ export class ActionCandidateGroundingSessionV1 {
     } finally {
       const postState = this.#lastCapturedState;
       this.invalidate();
-      if (preparation.operation === 'click') {
+      if (preparation.operation === 'click' && original.held.some((h) =>
+        h.candidate.selectedRef === preparation.selectedRef && h.candidate.frameId === preparation.frameId &&
+        (h.candidate.role === 'checkbox' || h.candidate.role === 'radio'))) {
         const selected = original.held.find((h) => h.candidate.selectedRef === preparation.selectedRef && h.candidate.frameId === preparation.frameId);
         if (selected) await nativeActivationReceipt(selected.handle, executionId, 'clear').catch(() => {});
       }
@@ -941,18 +971,20 @@ export class ActionCandidateGroundingSessionV1 {
         try {
           await this.#exclusive(async () => {
           const after = await this.#state();
-          const selected = original.held.find((h) => h.candidate.selectedRef === successful.finalCheck.selectedRef && h.candidate.frameId === successful.finalCheck.frameId);
-          const renewed = await selected?.frame.locator(`aria-ref=${successful.finalCheck.selectedRef}`).elementHandle({ timeout: 3000 });
-          try {
-            if (!selected || !renewed || !await renewed.evaluate((node, held) => node === held, selected.handle) ||
-              postState.stateDigest !== successful.postEffect.after.stateDigest || postState.materialDigest !== after.materialDigest ||
-              postState.page !== after.page || postState.frames.some((f, i) => after.frames[i] !== f) || postState.frames.length !== after.frames.length)
-              stop('STALE_STATE');
-            const effect = successful.postEffect.effect;
-            if (effect.kind === 'entered_text' && await selected.handle.inputValue() !== effect.value ||
-              effect.kind === 'native_activation' && await selected.handle.isChecked() !== effect.checked) stop('STALE_STATE');
+           const effect = successful.postEffect.effect;
+           const selected = original.held.find((h) => h.candidate.selectedRef === successful.finalCheck.selectedRef && h.candidate.frameId === successful.finalCheck.frameId);
+           const renewed = effect.kind === 'generic_activation' ? undefined :
+             await selected?.frame.locator(`aria-ref=${successful.finalCheck.selectedRef}`).elementHandle({ timeout: 3000 });
+           try {
+             if ((effect.kind !== 'generic_activation' && (!selected || !renewed || !await renewed.evaluate((node, held) => node === held, selected.handle))) ||
+               postState.stateDigest !== successful.postEffect.after.stateDigest || postState.materialDigest !== after.materialDigest ||
+               postState.page !== after.page || postState.frames.some((f, i) => after.frames[i] !== f) || postState.frames.length !== after.frames.length)
+               stop('STALE_STATE');
+             if (effect.kind === 'generic_activation' && after.page.url() !== effect.afterUrl) stop('STALE_STATE');
+             if (effect.kind === 'entered_text' && await selected!.handle.inputValue() !== effect.value ||
+               effect.kind === 'native_activation' && await selected!.handle.isChecked() !== effect.checked) stop('STALE_STATE');
             if (effect.kind === 'native_choice') {
-              const currentOptions = await this.#nativeOptions(selected, { bindingId: successful.finalCheck.strategyId,
+              const currentOptions = await this.#nativeOptions(selected!, { bindingId: successful.finalCheck.strategyId,
                 selectedRef: successful.finalCheck.selectedRef, frameId: successful.finalCheck.frameId });
               try {
                 if (currentOptions.multiple || currentOptions.count !== effect.options.count) stop('STALE_STATE');
@@ -963,8 +995,8 @@ export class ActionCandidateGroundingSessionV1 {
                 }
               } finally { await Promise.allSettled(currentOptions.handles.map((h) => h.dispose())); }
             }
-            if ((await this.#state()).stateDigest !== after.stateDigest ||
-              !await renewed.evaluate((node, held) => node === held, selected.handle)) stop('STALE_STATE');
+             if ((await this.#state()).stateDigest !== after.stateDigest ||
+               effect.kind !== 'generic_activation' && !await renewed!.evaluate((node, held) => node === held, selected!.handle)) stop('STALE_STATE');
           } finally { await renewed?.dispose(); }
           const data = { retirementVersion: '1', witnessId: successful.witnessId, postEffectDigest: successful.postEffect.witnessDigest,
             before: successful.postEffect.after, after: { sessionId: this.sessionId, pageId: after.pageId, frameId: successful.finalCheck.frameId,

@@ -92,7 +92,8 @@ export class SuccessfulTraceAssemblerV5 {
     }) : () => {};
   }
   static async create(input: { runtime: ActionCandidateGroundingSessionV1; admission: TrustedSemanticAdmissionV2;
-    observations?: TrustedObservationSessionV1; verification?: GoalDirectedVerificationControllerV1; signal?: AbortSignal;nativeObservations?:NativeOptionObservationSessionV2;nativeVerification?:NativeOptionVerificationControllerV2 }): Promise<SuccessfulTraceAssemblerV5> {
+    observations?: TrustedObservationSessionV1; verification?: GoalDirectedVerificationControllerV1; signal?: AbortSignal;nativeObservations?:NativeOptionObservationSessionV2;nativeVerification?:NativeOptionVerificationControllerV2;
+    aroundInitialObservation?: (read: () => Promise<void>) => Promise<void> }): Promise<SuccessfulTraceAssemblerV5> {
     requireTrustedSemanticAdmissionV2(input.admission);
     const owner = ActionCandidateGroundingSessionV1.prototype.protectedTraceOwner.call(input.runtime);
     requireFact(owner.admission === input.admission && !!input.observations === !!input.verification, 'V5 trace owner mismatch');
@@ -101,7 +102,7 @@ export class SuccessfulTraceAssemblerV5 {
     requireFact(!!input.nativeObservations===!!input.nativeVerification,'Native verifier owner pair required');
     if(input.nativeObservations)NativeOptionObservationSessionV2.prototype.owner.call(input.nativeObservations,input.runtime);
     if(input.nativeVerification)NativeOptionVerificationControllerV2.prototype.protectedStrategy.call(input.nativeVerification,input.runtime,'__owner');
-    const initial = await ActionCandidateGroundingSessionV1.prototype.protectedTraceState.call(input.runtime);
+    const initial = await ActionCandidateGroundingSessionV1.prototype.protectedTraceState.call(input.runtime, input.aroundInitialObservation);
     requireFact(initial.page.url() === input.admission.spec.startState.url, 'V5 source start URL differs from protected state');
     requireFact(!ActionCandidateGroundingSessionV1.prototype.protectedSuccessfulGroundingWitnesses.call(input.runtime).length,
       'V5 assembly must capture the successful path from its beginning');

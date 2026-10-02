@@ -24,7 +24,7 @@ const executionProfileFields = {
     navigationMs: milliseconds,
     waits: z.record(ref.shape.id, milliseconds),
   }),
-  networkPolicyRef: ref,
+  networkPolicyRef: ref.optional(),
   authStateRef: ref.optional(),
 };
 
@@ -76,7 +76,7 @@ export const NetworkPolicySchema = z.strictObject({
     host,
     ports: z.array(z.number().int().min(1).max(65535)).min(1),
     addresses: z.array(address).min(1),
-  })).min(1),
+  })),
 }).superRefine((policy, context) => {
   const pairs = new Set<string>();
   for (const [index, destination] of policy.destinations.entries()) {
@@ -100,7 +100,11 @@ export type EffectiveProfile = Readonly<{ profile: ExecutionProfile; policy: Net
 
 function key(refValue: ProfileRef): string { return `${refValue.id}\0${refValue.version}`; }
 function fingerprint(profile: ExecutionProfile, policy: NetworkPolicy): string {
-  return createHash('sha256').update(JSON.stringify({ profile, policy })).digest('hex');
+  // Destination policy is retained only to read older configurations. It is not
+  // runtime authority and must not change the effective browser identity.
+  const { networkPolicyRef: _legacy, ...runtimeProfile } = profile;
+  void policy;
+  return createHash('sha256').update(JSON.stringify(runtimeProfile)).digest('hex');
 }
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === 'object') {
@@ -115,7 +119,7 @@ export class ProfileCatalog {
   readonly #profiles = new Map<string, ExecutionProfile>();
   readonly #policies = new Map<string, NetworkPolicy>();
 
-  constructor(profiles: readonly unknown[], policies: readonly unknown[]) {
+  constructor(profiles: readonly unknown[], policies: readonly unknown[] = []) {
     for (const input of profiles) {
       const profile = ExecutionProfileSchema.parse(input);
       if (this.#profiles.has(key(profile))) throw new Error(`Duplicate execution profile ${profile.id}@${profile.version}`);
@@ -132,8 +136,9 @@ export class ProfileCatalog {
     const reference = ExecutionProfileRefSchema.parse(input);
     const profile = this.#profiles.get(key(reference));
     if (!profile) throw new Error(`Unavailable execution profile ${reference.id}@${reference.version}`);
-    const policy = this.#policies.get(key(profile.networkPolicyRef));
-    if (!policy) throw new Error(`Unavailable network policy ${profile.networkPolicyRef.id}@${profile.networkPolicyRef.version}`);
+    const policy: NetworkPolicy = profile.networkPolicyRef
+      ? this.#policies.get(key(profile.networkPolicyRef)) ?? { id: 'legacy-unused-policy', version: '1', destinations: [] }
+      : { id: 'legacy-unused-policy', version: '1', destinations: [] };
     const copy = deepFreeze(structuredClone(profile));
     const policyCopy = deepFreeze(structuredClone(policy));
     return Object.freeze({ profile: copy, policy: policyCopy, fingerprint: fingerprint(copy, policyCopy) });
@@ -146,6 +151,6 @@ export function assertEquivalentEffectiveProfile(expected: EffectiveProfile, act
       expected.fingerprint !== fingerprint(expected.profile, expected.policy) ||
       actual.fingerprint !== fingerprint(actual.profile, actual.policy) ||
       expected.fingerprint !== actual.fingerprint) {
-    throw new Error('Execution profile settings or network policy changed; use a new profile version');
+    throw new Error('Execution profile settings changed; use a new profile version');
   }
 }

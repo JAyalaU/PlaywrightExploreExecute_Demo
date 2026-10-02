@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ExecutionProfileRefSchema } from './schema.js';
 import { candidateGroundingDigest as hash } from './action-candidate-grounding.js';
+import { ActionCandidateRoleV1Schema } from './action-candidate-grounding.js';
 import { DeterministicVerificationAssertionV1Schema } from './goal-directed-compiler.js';
 import {DeferredVerificationAssertionSchema,NativeOptionProofSchema,validateNativeOptionProof} from './native-option-verification.js';
 const id=z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128),digest=z.string().regex(/^[a-f0-9]{64}$/);
@@ -16,7 +17,9 @@ export type DeferredVerificationFactsV9=z.infer<typeof DeferredVerificationFacts
 export const DeferredEffectV9Schema=z.discriminatedUnion('kind',[
   z.strictObject({kind:z.literal('entered_text'),nativeControl:z.enum(['input','textarea']),value:z.string().max(1024)}),
   z.strictObject({kind:z.literal('native_choice'),complete:z.literal(true),label:z.string().max(1024),value:z.string().max(1024),options:z.array(z.strictObject({label:z.string().max(1024),text:z.string().max(1024),value:z.string().max(1024),disabled:z.boolean(),selected:z.boolean(),owned:z.literal(true)})).max(80)}),
-  z.strictObject({kind:z.literal('native_activation'),executionId:id,nativeInputType:z.enum(['checkbox','radio']),beforeChecked:z.boolean(),checked:z.boolean(),clicks:z.literal(1),targetOwned:z.literal(true)})]);
+  z.strictObject({kind:z.literal('native_activation'),executionId:id,nativeInputType:z.enum(['checkbox','radio']),beforeChecked:z.boolean(),checked:z.boolean(),clicks:z.literal(1),targetOwned:z.literal(true)}),
+  z.strictObject({kind:z.literal('generic_activation'),role:ActionCandidateRoleV1Schema,beforeUrl:z.string().min(1).max(2048),afterUrl:z.string().min(1).max(2048),
+    delivery:z.strictObject({executionId:id,clicks:z.literal(1),targetOwned:z.literal(true),returned:z.literal(true)})})]);
 export const DeferredRunnerRecordV9Schema=z.strictObject({runnerVersion:z.literal('9'),executionRunId:id,startedAt:z.iso.datetime(),finishedAt:z.iso.datetime(),
   provenance:z.strictObject({testSpecId:id,resolvedSpecId:id,resolvedDigest:digest,compilerAttemptId:id,traceDigest:digest,admissionDigest:digest,
     executionProfileRef:ExecutionProfileRefSchema,profileFingerprint:digest,sessionId:id.optional()}).optional(),cleanup:z.enum(['verified','unverified']),
@@ -40,6 +43,8 @@ export function parseDeferredRunnerRecordV9(input:unknown):DeferredRunnerRecordV
     s.mutationMayHaveOccurred!==(s.invocation!=='not_invoked')||s.type==='action_goal'&&s.status==='succeeded'&&(!s.effectDigest||s.invocation!=='returned'||!s.predicateDigest)||
     s.status==='stopped'&&!s.reasonCode||s.status!=='stopped'&&s.afterStateStatus!=='observed'||s.effectDigest!==undefined&&(!s.effect||hash(s.effect)!==s.effectDigest)||s.effect!==undefined&&(s.status!=='succeeded'||s.type!=='action_goal')||
     s.type==='verification_goal'&&s.status!=='stopped'&&(!s.verification||s.verification.evaluated!==(s.status==='assertion_passed')))throw new Error('INVALID_RUN_STEP_V9');
+    if(s.effect?.kind==='generic_activation'&&(s.operation!=='click'||s.invocation!=='returned'||!s.invokedAt||!s.returnedAt||
+      s.effect.beforeUrl.length===0||s.effect.afterUrl.length===0))throw new Error('INVALID_GENERIC_ACTIVATION');
     if(s.verification?.assertion.assertionVersion==='2'){
       const a=s.verification.assertion,p=s.verificationProof;
       if(!p||!['assertion_passed','assertion_failed'].includes(s.status)||s.type!=='verification_goal'||s.invocation!=='not_invoked'||p.sessionId!==s.before.sessionId||p.pageId!==s.before.pageId||p.stateDigest!==s.before.stateDigest||p.stateEpoch!==s.before.stateEpoch||p.mutationEpoch!==s.before.mutationEpoch||hash(s.before)!==hash(s.after))throw new Error('INVALID_NATIVE_VERIFICATION_PROOF_OWNER');

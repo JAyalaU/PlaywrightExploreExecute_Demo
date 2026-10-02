@@ -19,6 +19,7 @@ export const ActionCandidateRequestV1Schema = z.strictObject({
     z.strictObject({ obligationId: id, kind: z.literal('role_exact'), role: ActionCandidateRoleV1Schema }),
     z.strictObject({ obligationId: id, kind: z.literal('name_exact'), name: z.string().min(1).max(512) }),
     z.strictObject({ obligationId: id, kind: z.literal('unique') }),
+    z.strictObject({ obligationId: id, kind: z.literal('dependency') }),
     z.strictObject({ obligationId: id, kind: z.literal('pending') }),
   ])).min(1).max(128),
 });

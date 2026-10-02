@@ -103,6 +103,26 @@ class UiWorkflowTests(unittest.TestCase):
             config_path=ROOT / "config" / "public-challenging-dom.json")
         self.assertEqual(result, {"admissionVersion": "1", "kind": "denied"})
 
+    def test_active_profile_selection_uses_operator_url_without_old_approval_match(self):
+        entry = ROOT / "dist" / "profile" / "admission-cli.js"
+        if not entry.exists():
+            self.skipTest("Run npm run build for built profile selection integration")
+        selected_url = "https://different.example.org/another/path"
+        result = lookup_public_admission(
+            selected_url, node_entry=entry,
+            config_path=ROOT / "config" / "public-challenging-dom.json",
+            selection_only=True)
+        self.assertEqual(result["kind"], "approved")
+        self.assertEqual(result["canonicalUrl"], selected_url)
+        self.assertEqual(result["executionProfileRef"]["id"], "challenging-dom-public-headless")
+        for invalid in ("not-a-url", "file:///tmp/page.html"):
+            with self.subTest(invalid=invalid):
+                denied = lookup_public_admission(
+                    invalid, node_entry=entry,
+                    config_path=ROOT / "config" / "public-challenging-dom.json",
+                    selection_only=True)
+                self.assertEqual(denied["kind"], "denied")
+
     def test_closed_admission_consumer_rejects_extra_fields_and_duplicate_keys(self):
         self.assertEqual(parse_admission_response(json.dumps(APPROVED).encode())["kind"],
                          "approved")

@@ -119,14 +119,12 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
         _diagnostic("admission_unavailable")
         return UiFinalResult("workflow_unavailable" if workflow_version != "legacy" else "admission_unavailable",
                              workflow_version=workflow_version)
+    agentic = workflow_version != "legacy"
     try:
         approval = lookup_public_admission(
             request.target_url, node_entry=admission_entry, config_path=config_path,
-            node_executable=node_executable)
-        # Only trusted Node may decide which versioned approval the selected
-        # config contains. A v1 denial grants nothing; try the distinct v2
-        # exchange before reporting a denial to the operator.
-        if approval["kind"] == "denied":
+            node_executable=node_executable, selection_only=agentic)
+        if not agentic and approval["kind"] == "denied":
             headed = lookup_public_admission(
                 request.target_url, node_entry=admission_entry, config_path=config_path,
                 node_executable=node_executable, admission_version="2")
@@ -144,13 +142,12 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
     if approval["admissionVersion"] == "2" and live_viewer is not None:
         live_viewer.mark_connecting()
     _diagnostic("admission_approved")
-    agentic = workflow_version != "legacy"
     if agentic:
         if live_events is not None: live_events.mark_unavailable()
         if live_images is not None: live_images.set_state("capture_disabled")
         if live_viewer is not None: live_viewer.close()
     wire = {"protocolVersion": "2" if agentic else "1", "request": {
-        "taskText": request.task_text, "targetUrl": approval["canonicalUrl"],
+        "taskText": request.task_text, "targetUrl": request.target_url if agentic else approval["canonicalUrl"],
         "executionProfileRef": approval["executionProfileRef"],
     }}
     _diagnostic("engine_started")

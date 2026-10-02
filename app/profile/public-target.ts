@@ -1,5 +1,6 @@
 import { BlockList, isIP } from 'node:net';
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { ExecutionProfileRefSchema } from '../domain/schema.js';
 import type { EffectiveProfile } from './contracts.js';
 import type { ExternalTargetGate } from './context.js';
@@ -53,7 +54,7 @@ export function validatePublicTargetApproval(approval: PublicTargetApproval,
   const destination = effective.policy.destinations;
   const bindingValid = approval.executionProfileRef.id === profile.id &&
       approval.executionProfileRef.version === profile.version &&
-      approval.profileFingerprint === effective.fingerprint &&
+      approval.profileFingerprint === createHash('sha256').update(JSON.stringify({ profile, policy: effective.policy })).digest('hex') &&
       'browserIsolation' in profile && profile.browserIsolation === 'docker' &&
       profile.presentationMode === 'headless' && !profile.authStateRef;
   const rule = (host: string, addresses?: readonly string[]) => destination.find((item) =>

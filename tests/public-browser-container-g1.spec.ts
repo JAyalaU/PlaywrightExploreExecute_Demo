@@ -14,12 +14,10 @@ test('G1 browser container declares a mountless internal-only compartment', asyn
   expect(compose).not.toMatch(/^\s*ports:/m);
 });
 
-test('G1 browser image requires a proxy and contains no direct-egress fallback', async () => {
+test('G1 browser image uses ordinary networking without destination proxy', async () => {
   const entrypoint = await readFile(new URL('infra/public-browser/entrypoint.sh', root), 'utf8');
   expect(entrypoint).toContain("*/chrome-linux64/chrome");
   expect(entrypoint).toContain("*/chrome-linux/chrome");
-  expect(entrypoint).toContain('PUBLIC_BROWSER_PROXY is required');
-  expect(entrypoint).toContain('--proxy-server=');
-  expect(entrypoint).toContain("--proxy-bypass-list='<-loopback>'");
-  expect(entrypoint).not.toContain('--no-proxy-server');
+  expect(entrypoint).not.toContain('PUBLIC_BROWSER_PROXY');
+  expect(entrypoint).not.toContain('--proxy-server=');
 });

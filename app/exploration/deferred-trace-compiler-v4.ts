@@ -116,6 +116,10 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
       if(result.status!=='succeeded')throw new Stop('POST_EFFECT_UNPROVEN');
       const witness=ActionCandidateGroundingSessionV1.prototype.protectedActionGroundingWitness.call(runtime,result.witness.witnessId);
       mark('execution',!!witness&&same(witness,result.witness),'POST_EFFECT_UNPROVEN',witness);
+      const originalEffect=record.witness.postEffect.effect,freshEffect=result.witness.postEffect.effect;
+      mark('execution',freshEffect.kind===originalEffect.kind&&
+        (freshEffect.kind!=='generic_activation'||originalEffect.kind==='generic_activation'&&freshEffect.role===originalEffect.role),
+        'POST_EFFECT_UNPROVEN');
       const retirement=ActionCandidateGroundingSessionV1.prototype.protectedActionGroundingRetirement.call(runtime,result.witness.witnessId);
       mark('execution',!!retirement,'POST_EFFECT_UNPROVEN',retirement);
       if(!retirement)throw new Stop('POST_EFFECT_UNPROVEN');
@@ -125,7 +129,7 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
       const guard={guardVersion:'1' as const,domain:'all_current_page_frames' as const,candidateLimit:80 as const,frameLimit:8 as const,optionLimit:80 as const,
         sourceGoal:pre.sourceGoal,correspondence:pre.correspondence,request:pre.candidateObservation.request,predicate:pre.candidateObservation.predicate,mappingDigest:pre.mappingDigest,
         frame:durableDeferredFrame(selected!.frame),completeRequired:true as const,eligibleCount:1 as const,nativeEffect:effect.kind,
-        nativeControl:effect.kind==='entered_text'?effect.nativeControl:effect.kind==='native_choice'?'select' as const:effect.nativeInputType,
+        nativeControl:effect.kind==='entered_text'?effect.nativeControl:effect.kind==='native_choice'?'select' as const:effect.kind==='native_activation'?effect.nativeInputType:effect.role,
         labelMode:'proven_native_label_or_aria_labelledby' as const,optionMode:'exact_owned_authored_label_unique_value' as const,
         argumentPolicy:'require_fresh_mapping_equal_compiled_argument' as const};
       steps.push({...base,type:'action_goal',operation:pre.operation,guard,...(pre.argument?{authoredArgument:pre.argument.authoredText,executableArgument:pre.argument.executableValue}:{})});

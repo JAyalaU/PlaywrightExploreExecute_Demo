@@ -24,7 +24,7 @@ try {
     selected === 'structured-action-v1' || selected === 'goal-directed-v1' || selected === 'agentic-exploration-v1'
     ? selected : undefined;
   const response = path && workflowVersion ? await runAgenticSubprocessAdapterV2(process.stdin,
-    () => readSubprocessTrustedConfiguration(path),
+    () => readSubprocessTrustedConfiguration(path, 'active-poc'),
     { provider: { apiKey: () => process.env.OPENAI_API_KEY } },
     { signal: controller.signal, workflowVersion }) :
     { protocolVersion: SUBPROCESS_PROTOCOL_V2, kind: 'bridge_error' as const,

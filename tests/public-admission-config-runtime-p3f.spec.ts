@@ -112,17 +112,6 @@ test('G1 isolation proof loads and exercises the exact operator-approved P3-F co
   console.log(`P3F_EXACT_PROFILE_FINGERPRINT=${effective.fingerprint}`);
 });
 
-test('G1 exact approved proxy failure prevents browser startup', async () => {
-  const config = parseTrustedLocalConfiguration(JSON.parse(await readFile(
-    trustedConfigPath!, 'utf8')) as unknown);
-  const approval = config.publicTargetApproval!;
-  const effective = new ProfileCatalog(config.profiles, config.networkPolicies).resolve(
-    approval.executionProfileRef);
-  const proxy = await ProtectedProxy.start(effective.policy);
-  await proxy.close();
-  await expect(IsolatedBrowser.open(proxy)).rejects.toThrow('Proxy is closed');
-  expect(await residualContainers()).toBe('');
-});
 
 test('G1 exact approved profile closes after a bounded browser timeout', async () => {
   const config = parseTrustedLocalConfiguration(JSON.parse(await readFile(

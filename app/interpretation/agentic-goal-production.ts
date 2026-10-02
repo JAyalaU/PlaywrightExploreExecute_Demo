@@ -49,8 +49,7 @@ export async function runGoalDirectedProductionV1(factory: ProtectedContextFacto
       ...(options.signal ? { signal: options.signal } : {}) });
   if (exploration.kind === 'stopped') {
     const outcome = exploration.status === 'environment_failed'
-      ? parseAgenticOutcomeV1({ boundary: 'environment', status: exploration.reasonCode ===
-        'NETWORK_POLICY_DENIED' ? 'policy_denied' : 'unavailable' })
+      ? parseAgenticOutcomeV1({ boundary: 'environment', status: 'unavailable' })
       : exploration.status === 'cancelled'
         ? parseAgenticOutcomeV1({ boundary: 'environment', status: 'cancelled' })
         : parseAgenticOutcomeV1({ boundary: 'exploration', status: exploration.status });

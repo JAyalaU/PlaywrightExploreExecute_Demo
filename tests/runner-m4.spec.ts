@@ -190,7 +190,7 @@ test('M4-B classifies binding facts by operation and stops dependent steps', asy
   } finally { await server.close(); }
 });
 
-test('M4 browser boundary rejects denied navigation and leaves a later clean run usable', async () => {
+test('M4 browser reaches a former denied destination and leaves a later clean run usable', async () => {
   const allowed = await fixtureServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end('<button>Ready</button>'); });
   const denied = await fixtureServer((_req, res) => { res.end('unexpected'); });
   try {
@@ -199,7 +199,7 @@ test('M4 browser boundary rejects denied navigation and leaves a later clean run
       [authored('s1', 'navigate', { url: denied.url })],
       [step('s1', 'navigate', { url: denied.url })]);
     const blockedRun = await executeResolvedTestSpec(guarded, blocked.source, blocked.resolved);
-    expect(blockedRun.outcomes[0]).toMatchObject({ status: 'BROWSER_EXECUTION_FAILED', reason: 'NETWORK_POLICY_DENIED' });
+    expect(blockedRun.outcomes[0]).toMatchObject({ status: 'OPERATION_SUCCEEDED' });
 
     const clean = bundle(allowed.url,
       [authored('s1', 'navigate', { url: allowed.url }), authored('s2', 'assert_visible', { target: target('Ready') })],

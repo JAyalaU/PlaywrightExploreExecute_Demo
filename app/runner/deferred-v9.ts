@@ -96,7 +96,9 @@ class FreshRunner {
       else if(action.operation==='select_option'){if(facts.tag!=='select'||action.guard.nativeControl!=='select'||facts.multiple)stop('UNSUPPORTED_CAPABILITY');
         const matches=facts.options.filter(o=>o.label===action.authoredArgument);if(matches.length!==1||matches[0]!.disabled||facts.options.filter(o=>o.value===matches[0]!.value).length!==1||matches[0]!.value!==action.executableArgument)stop('OPTION_MAPPING_MISMATCH');
         options.push(...await target.handle.$$('runner_v9_owned_options='));if(options.length!==facts.options.length||options.length>80)stop('INCOMPLETE_EVIDENCE');}
-      else{if(facts.tag!=='input'||!['checkbox','radio'].includes(facts.inputType)||facts.inputType!==action.guard.nativeControl||!post&&facts.inputType==='radio'&&facts.checked)stop('UNSUPPORTED_CAPABILITY');}
+      else if(action.guard.nativeEffect==='generic_activation'){
+        if(target.role!==action.guard.nativeControl)stop('UNSUPPORTED_CAPABILITY');
+      }else{if(facts.tag!=='input'||!['checkbox','radio'].includes(facts.inputType)||facts.inputType!==action.guard.nativeControl||!post&&facts.inputType==='radio'&&facts.checked)stop('UNSUPPORTED_CAPABILITY');}
       const digest=hash({guard:action.guard,operation:action.operation,authoredArgument:action.authoredArgument,executableArgument:action.executableArgument,
         roles:eligible.map(c=>c.role),frame:await this.framePath(target.frame),facts});return{target,all,labels,options,facts,digest};
     }catch(e){await Promise.allSettled([...all.map(c=>c.handle),...labels,...options].map(h=>h.dispose()));throw e;}}
@@ -109,12 +111,22 @@ class FreshRunner {
       // Preparation can scroll/mutate; renew the entire predicate and retain identity afterwards.
       await initial.target.handle.scrollIntoViewIfNeeded({timeout:3000});renewed=await this.prove(action);await this.sameProof(initial,renewed);
       const finalState=await this.state();if(!same(finalState,before))stop('STALE_EVIDENCE');predicateDigest=renewed.digest;
-      const executionId=`execution-${randomUUID()}`;if(action.operation==='click'){activationId=executionId;const armed=await nativeActivationReceipt(renewed.target.handle,executionId,'arm');if(armed.clicks!==0)stop('POST_EFFECT_UNPROVEN');}
+      const executionId=`execution-${randomUUID()}`,genericClick=action.operation==='click'&&action.guard.nativeEffect==='generic_activation';
+      if(action.operation==='click'&&!genericClick){activationId=executionId;const armed=await nativeActivationReceipt(renewed.target.handle,executionId,'arm');if(armed.clicks!==0)stop('POST_EFFECT_UNPROVEN');}
       if(!same(await this.state(),finalState))stop('STALE_EVIDENCE');this.bounded();invokedAt=new Date().toISOString();invocation='threw';this.mutated();
+      const beforeUrl=this.page.url();
       try{if(action.operation==='fill')await renewed.target.handle.fill(action.executableArgument!,{force:true,timeout:3000});
         else if(action.operation==='select_option')await renewed.target.handle.selectOption({value:action.executableArgument!},{force:true,timeout:3000});
+        else if(genericClick)await renewed.target.handle.click({force:true,timeout:Math.max(1,Math.min(this.session.effectiveProfile.profile.timeoutPolicy.navigationMs,this.deadline-Date.now()))});
         else await renewed.target.handle.click({force:true,timeout:3000,noWaitAfter:true});}
       catch{stop('ACTION_FAILED_PARTIAL_OR_UNKNOWN');}invocation='returned';returnedAt=new Date().toISOString();
+      if(genericClick){
+        const effectState=await this.state(),afterUrl=this.page.url();
+        if(!same(effectState,await this.state())||afterUrl!==this.page.url())stop('POST_EFFECT_UNPROVEN');
+        effect={kind:'generic_activation',role:renewed.target.role,beforeUrl,afterUrl,
+          delivery:{executionId,clicks:1,targetOwned:true,returned:true}};
+        after=effectState;effectDigest=hash(effect);
+      }else{
       const effectState=await this.state(),current=await this.facts(renewed.target.handle);if(await renewed.target.handle.ownerFrame()!==renewed.target.frame||!same(await this.framePath(renewed.target.frame),action.guard.frame))stop('POST_EFFECT_UNPROVEN');
       const postProof=await this.prove(action,true);
       try{if(!same(current,postProof.facts)||!await identical(postProof.target.handle,renewed.target.handle)||!same(effectState,await this.state()))stop('POST_EFFECT_UNPROVEN');
@@ -127,6 +139,7 @@ class FreshRunner {
         if(!same(current,await this.facts(renewed.target.handle)))stop('POST_EFFECT_UNPROVEN');
         after=await this.state();if(!same(effectState,after)||!same(after,await this.state()))stop('POST_EFFECT_UNPROVEN');effectDigest=hash(effect);
       }finally{if(postProof)await dispose(postProof);}
+      }
     }catch(e){reasonCode=e instanceof Stop?e.reason:invocation==='returned'?'POST_EFFECT_UNPROVEN':'ENVIRONMENT_FAILURE';effectDigest=undefined;effect=undefined;try{after=await this.state();}catch{afterStateStatus='unavailable';/* after retains only the last known point */}}
     finally{if(activationId&&renewed)await nativeActivationReceipt(renewed.target.handle,activationId,'clear').catch(()=>{});if(initial)await dispose(initial);if(renewed)await dispose(renewed);}
     return{stepId:action.id,traceRecordId:action.traceRecordId,originStepId:action.originStepId,type:'action_goal',status:reasonCode?'stopped':'succeeded',before,after,afterStateStatus,operation:action.operation,

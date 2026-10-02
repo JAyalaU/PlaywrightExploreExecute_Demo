@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline/promises';
 import { inspectPublicUrl, approvePublicInspection, approveHeadedPublicInspection,
   lookupAdmittedPublicTarget, lookupHeadedPublicTarget,
   AdmissionLookupRequestSchema, HeadedAdmissionLookupRequestSchema, PublicAdmissionError } from './admission.js';
-import { parseTrustedLocalConfiguration } from '../local/contracts.js';
+import { parseTrustedLocalConfiguration, parseActivePocTrustedConfiguration } from '../local/contracts.js';
 import { ProfileCatalog } from './contracts.js';
 
 const MAX_INSPECTION_BYTES = 16 * 1024;
@@ -25,6 +25,32 @@ async function readLookupRequest(): Promise<unknown> {
 }
 
 async function main(args: string[]): Promise<void> {
+  if (args[0] === 'select' && args.length === 2) {
+    const request = AdmissionLookupRequestSchema.parse(await readLookupRequest());
+    let valid = false;
+    try {
+      const url = new URL(request.targetUrl);
+      valid = url.protocol === 'http:' || url.protocol === 'https:';
+    } catch { /* An invalid URL has no browser navigation authority. */ }
+    if (!valid) {
+      process.stdout.write(`${JSON.stringify({ admissionVersion: '1', kind: 'denied' })}\n`);
+      return;
+    }
+    const metadata = await stat(args[1]!);
+    if (!metadata.isFile() || metadata.size > MAX_CONFIG_BYTES) throw new PublicAdmissionError('APPROVAL_INVALID');
+    const bytes = await readFile(args[1]!);
+    if (bytes.byteLength > MAX_CONFIG_BYTES) throw new PublicAdmissionError('APPROVAL_INVALID');
+    const config = parseActivePocTrustedConfiguration(JSON.parse(bytes.toString('utf8')) as unknown);
+    const preferred = config.publicTargetApproval?.executionProfileRef;
+    const selected = preferred && config.profiles.some((profile) =>
+      profile.id === preferred.id && profile.version === preferred.version)
+      ? preferred : { id: config.profiles[0]!.id, version: config.profiles[0]!.version };
+    const effective = new ProfileCatalog(config.profiles, config.networkPolicies).resolve(selected);
+    process.stdout.write(`${JSON.stringify({ admissionVersion: '1', kind: 'approved',
+      canonicalUrl: request.targetUrl, executionProfileRef: selected,
+      profileFingerprint: effective.fingerprint })}\n`);
+    return;
+  }
   if (args[0] === 'lookup' && args.length === 2) {
     const request = await readLookupRequest();
     const metadata = await stat(args[1]!);

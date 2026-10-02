@@ -17,9 +17,8 @@ if [ -z "$chromium" ]; then
   exit 78
 fi
 
-# Chromium has no provider configuration, no host mount, and no direct route.
-# The network namespace is supplied by compose/run configuration; a missing
-# proxy must fail page loads rather than fall back to direct egress.
+# Chromium has no provider configuration or host mount. Docker supplies
+# ordinary outbound networking for the operator-selected destination.
 exec "$chromium" \
   --headless=new \
   --remote-debugging-address=0.0.0.0 \
@@ -29,7 +28,4 @@ exec "$chromium" \
   --no-default-browser-check \
   --disable-background-networking \
   --disable-quic \
-  --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-  --proxy-server="${PUBLIC_BROWSER_PROXY:?PUBLIC_BROWSER_PROXY is required}" \
-  --proxy-bypass-list='<-loopback>' \
   "$@"

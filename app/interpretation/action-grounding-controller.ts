@@ -1,5 +1,5 @@
 import { ActionGroundingDecisionV5Schema, IndependentGroundingExtractionV1Schema, admitGroundingMappingV1,
-  correspondenceNeedsEndorsement, validateGroundingCorrespondenceV1, GroundingCorrespondenceError, type PreparedActionGroundingV1 } from '../domain/action-grounding-strategy.js';
+  correspondenceNeedsEndorsement, pocGroundingCorrespondenceV1, validateGroundingCorrespondenceV1, GroundingCorrespondenceError, type PreparedActionGroundingV1 } from '../domain/action-grounding-strategy.js';
 import { buildActionObligationHandoffV2, requireTrustedSemanticAdmissionV2, type TrustedSemanticAdmissionV2 } from '../domain/action-semantic-admission.js';
 import { ActionCandidateRequestV1Schema, type ActionCandidateObservationV1 } from '../domain/action-candidate-grounding.js';
 import { ActionCandidateGroundingError, type ActionCandidateGroundingSessionV1 } from '../exploration/action-candidate-grounding.js';
@@ -24,7 +24,8 @@ export interface IndependentGroundingModelV1 {
 export type ActionGroundingOutcomeV1 =
   | { status: 'prepared'; strategy: PreparedActionGroundingV1; attempts: number }
   | { status: 'stop'; category: 'structural' | 'semantic_disagreement' | 'unsupported' | 'unresolved' | 'provider_environment';
-      reason: string; attempts: number };
+      reason: string; attempts: number; diagnostic?: { goalId: string; operation?: 'click' | 'fill' | 'select_option';
+        pending: { obligationId: string; kind: string }[]; candidateCount?: number } };
 type GroundingRuntime = Pick<ActionCandidateGroundingSessionV1, 'query' | 'prepareGrounding' | 'protectedPreparedGrounding'>;
 async function bounded(call: (signal: AbortSignal) => Promise<string>, deadline: number): Promise<unknown> {
   const controller = new AbortController();
@@ -45,6 +46,44 @@ export async function prepareActionGoalGroundingV1(input: { admission: TrustedSe
   if (!goal || goal.type !== 'action_goal') return { status: 'stop', category: 'structural', reason: 'INVALID_GOAL', attempts: 0 };
   const deadline = Math.min(Date.now() + ACTION_GROUNDING_STRATEGY_LIMITS.elapsedMs, input.deadline ?? Number.POSITIVE_INFINITY);
   const handoff = buildActionObligationHandoffV2(input.admission);
+  if (input.admission.spec.semanticMode === 'poc_v1') {
+    const effect = goal.obligations.find((item) => item.kind === 'effect');
+    const operation: 'click' | 'fill' | 'select_option' | undefined = effect?.kind === 'effect' ? effect.effect === 'activate' ? 'click' :
+      effect.effect === 'enter_text' ? 'fill' : 'select_option' : undefined;
+    const diagnostic = (pending: { obligationId: string; kind: string }[] = [], candidateCount?: number) => ({
+      goalId: goal.id, ...(operation ? { operation } : {}), pending: pending.slice(0, 128),
+      ...(candidateCount !== undefined ? { candidateCount } : {}) });
+    let candidate: ActionCandidateObservationV1 | undefined;
+    try {
+      if (!operation) return { status: 'stop', category: 'structural', reason: 'INVALID_GOAL', attempts: 0, diagnostic: diagnostic() };
+      const correspondence = pocGroundingCorrespondenceV1(input.admission, goal.id);
+      const pending = correspondence.filter((entry) => entry.realization.kind === 'pending').map((entry) => ({
+        obligationId: entry.obligation.id, kind: entry.obligation.kind }));
+      if (pending.length) return { status: 'stop', category: 'unsupported', reason: 'PENDING_OBLIGATIONS', attempts: 0,
+        diagnostic: diagnostic(pending) };
+      const mapping = admitGroundingMappingV1(input.admission, goal.id, correspondence);
+      const request = ActionCandidateRequestV1Schema.parse({ groundingVersion: '1', goalId: goal.id, handoff,
+        mapping: mapping.correspondence.map(({ obligation: o, realization: r }) => {
+          if (['effect', 'operation', 'literal', 'unique', 'dependency'].includes(r.kind)) return { obligationId: o.id, kind: r.kind };
+          if (r.kind === 'role_exact') return { obligationId: o.id, kind: r.kind, role: r.role };
+          if (r.kind === 'name_exact') return { obligationId: o.id, kind: r.kind, name: r.name };
+          return { obligationId: o.id, kind: 'pending' };
+        }) });
+      candidate = await input.runtime.query(request, deadline);
+      if (candidate.status === 'error') throw new ActionCandidateGroundingError(candidate.reason);
+      const strategy = await input.runtime.prepareGrounding(candidate, mapping, operation, deadline);
+      if (JSON.stringify(input.runtime.protectedPreparedGrounding(strategy.strategyId)) !== JSON.stringify(strategy))
+        throw new ActionCandidateGroundingError('UNTRUSTED_EVIDENCE');
+      return { status: 'prepared', strategy, attempts: 0 };
+    } catch (error) {
+      const reason = error instanceof ActionCandidateGroundingError ? error.reason :
+        error instanceof GroundingCorrespondenceError ? error.reason : 'QUERY_UNEVALUABLE';
+      return { status: 'stop', category: ['PENDING_OBLIGATIONS', 'UNSUPPORTED_MAPPING', 'UNSUPPORTED_CONTROL', 'UNSUPPORTED_OPERATION'].includes(reason) ? 'unsupported' :
+        ['NO_CANDIDATES', 'NON_UNIQUE', 'OPTION_ABSENT', 'OPTION_NON_UNIQUE', 'VALUE_NON_UNIQUE', 'OPTION_DISABLED', 'NOT_ACTIONABLE'].includes(reason) ? 'unresolved' :
+          ['OBLIGATION_MAPPING_MISMATCH', 'UNTRUSTED_EVIDENCE'].includes(reason) ? 'structural' : 'provider_environment',
+      reason, attempts: 0, diagnostic: diagnostic([], candidate?.status === 'complete' ? candidate.count : undefined) };
+    }
+  }
   const sourceContext = { mappingExtractionVersion: '1', sourceInstruction: input.admission.spec.sourceInstruction,
     goal, admissionRecord: input.admission.record, handoff, vocabulary: ACTION_GROUNDING_MAPPING_VOCABULARY };
   let lastReason: string | undefined;

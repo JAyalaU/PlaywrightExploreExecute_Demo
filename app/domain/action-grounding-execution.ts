@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { candidateGroundingDigest as hash } from './action-candidate-grounding.js';
+import { ActionCandidateRoleV1Schema, candidateGroundingDigest as hash } from './action-candidate-grounding.js';
 import { PreparedActionGroundingV1Schema, parsePreparedActionGroundingV1 } from './action-grounding-strategy.js';
 import type { PocSemanticValidationContextV2 } from './action-semantic-admission.js';
 
@@ -9,7 +9,7 @@ const state = z.strictObject({ sessionId: id, pageId: id, frameId: id,
   stateDigest: digest, stateEpoch: z.number().int().nonnegative(), mutationEpoch: z.number().int().nonnegative() });
 export const ActionPostEffectV1Schema = z.strictObject({
   postEffectVersion: z.literal('1'), observationId: id, executionId: id, preparedDigest: digest,
-  selectedRef: id, sameTargetNode: z.literal(true), complete: z.literal(true),
+  selectedRef: id, sameTargetNode: z.boolean(), complete: z.literal(true),
   before: state, after: state, observedAt: z.iso.datetime(),
   effect: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('entered_text'), nativeControl: z.enum(['input', 'textarea']), value: z.string().max(1024) }),
@@ -17,6 +17,9 @@ export const ActionPostEffectV1Schema = z.strictObject({
       options: PreparedActionGroundingV1Schema.shape.nativeOptionEvidence.unwrap() }),
     z.strictObject({ kind: z.literal('native_activation'), role: z.enum(['checkbox', 'radio']), nativeInputType: z.enum(['checkbox', 'radio']), beforeChecked: z.boolean(), checked: z.boolean(),
       trustedClickReceipt: z.strictObject({ executionId: id, clicks: z.literal(1), targetOwned: z.literal(true), nativeInputType: z.enum(['checkbox', 'radio']) }) }),
+    z.strictObject({ kind: z.literal('generic_activation'), role: ActionCandidateRoleV1Schema,
+      beforeUrl: z.string().min(1).max(2048), afterUrl: z.string().min(1).max(2048),
+      delivery: z.strictObject({ executionId: id, clicks: z.literal(1), targetOwned: z.literal(true), returned: z.literal(true) }) }),
   ]), witnessDigest: digest,
 });
 export type ActionPostEffectV1 = z.infer<typeof ActionPostEffectV1Schema>;
@@ -67,6 +70,11 @@ export function parseActionPostEffectV1(input: unknown): ActionPostEffectV1 {
     record.effect.trustedClickReceipt.executionId !== record.executionId || record.effect.trustedClickReceipt.nativeInputType !== record.effect.role ||
     record.effect.role === 'checkbox' && record.effect.checked === record.effect.beforeChecked ||
     record.effect.role === 'radio' && (!record.effect.checked || record.effect.beforeChecked))) throw new Error('INVALID_ACTION_POST_EFFECT');
+  if (record.effect.kind === 'generic_activation') {
+    if (record.effect.delivery.executionId !== record.executionId) throw new Error('INVALID_ACTION_POST_EFFECT');
+    try { new URL(record.effect.beforeUrl); new URL(record.effect.afterUrl); }
+    catch { throw new Error('INVALID_ACTION_POST_EFFECT'); }
+  } else if (!record.sameTargetNode) throw new Error('INVALID_ACTION_POST_EFFECT');
   return record;
 }
 export const ActionGroundingWitnessV1Schema = z.strictObject({
@@ -107,10 +115,12 @@ export function parseActionGroundingWitnessV1(input: unknown,
   if (check.operation === 'fill' && (effect.kind !== 'entered_text' || effect.value !== check.argument?.authoredText) ||
     check.operation === 'select_option' && (effect.kind !== 'native_choice' || effect.value !== check.argument?.executableValue ||
       effect.selectedOptionId !== check.argument.selectedOptionId) ||
-    check.operation === 'click' && (effect.kind !== 'native_activation' || effect.nativeInputType !== effect.role ||
+    check.operation === 'click' && (effect.kind !== 'native_activation' && effect.kind !== 'generic_activation' ||
       effect.role !== (parent.status === 'complete' ? parent.candidates.find((c) => c.selectedRef === check.selectedRef && c.frameId === check.frameId)?.role : undefined) ||
-      effect.role === 'checkbox' && effect.checked === effect.beforeChecked ||
-      effect.role === 'radio' && (!effect.checked || effect.beforeChecked))) throw new Error('INVALID_ACTION_GROUNDING_WITNESS');
+      effect.kind === 'native_activation' && (effect.nativeInputType !== effect.role ||
+        effect.role === 'checkbox' && effect.checked === effect.beforeChecked ||
+        effect.role === 'radio' && (!effect.checked || effect.beforeChecked)) ||
+      effect.kind === 'generic_activation' && effect.delivery.executionId !== execution.executionId)) throw new Error('INVALID_ACTION_GROUNDING_WITNESS');
   if (effect.kind === 'native_choice') {
     const before = check.nativeOptionEvidence!;
     const comparable = (v: typeof before) => v.options.map(({ selected: _selected, ...facts }) => facts);

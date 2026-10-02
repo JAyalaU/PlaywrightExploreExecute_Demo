@@ -44,6 +44,10 @@ export function validateDeferredReplayRunsV1(runs: readonly DeferredRunnerRecord
         throw new Error('DEFERRED_ORDER_MISMATCH');
       if (e.type === 'verification_goal' && s.status !== 'stopped' && !same(s.verification?.assertion, e.assertion)) throw new Error('DEFERRED_ASSERTION_MISMATCH');
       if (e.type === 'action_goal' && (s.operation !== e.operation || s.argument !== e.executableArgument)) throw new Error('DEFERRED_ARGUMENT_MISMATCH');
+      if (e.type === 'action_goal' && s.status === 'succeeded' &&
+        (s.effect?.kind !== e.guard.nativeEffect || s.effect.kind === 'generic_activation' &&
+          (s.effect.role !== e.guard.nativeControl || s.operation !== 'click')))
+        throw new Error('DEFERRED_EFFECT_MISMATCH');
       if (s.status === 'stopped' && index !== run.steps.length - 1) throw new Error('DEFERRED_STOP_CONTINUATION');
     }
   }

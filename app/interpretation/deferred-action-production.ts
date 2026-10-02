@@ -2,14 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { parseResultRecordV2, safeAgenticReasonV2, type ResultRecordV2 } from '../domain/agentic-result-v2.js';
 import { candidateGroundingDigest as hash } from '../domain/action-candidate-grounding.js';
 import { buildActionObligationHandoffV2 } from '../domain/action-semantic-admission.js';
-import { safeDeferredWorkflowStopCode, type DeferredWorkflowStageV1 } from '../domain/deferred-workflow.js';
+import { DeferredWorkflowStopCodeV1Schema, safeDeferredWorkflowStopCode, type DeferredWorkflowStageV1 } from '../domain/deferred-workflow.js';
+import { DeferredStartupDiagnosticV1Schema, type DeferredStartupDiagnosticV1 } from '../domain/deferred-startup-diagnostics.js';
 import type { InterpretationRequest } from './interpret.js';
 import { interpretDeferredActionTaskPoc, type PocSemanticModels } from './deferred-action-poc-interpret.js';
-import type { ActionGroundingModelV5, IndependentGroundingModelV1 } from './action-grounding-controller.js';
+import type { ActionGroundingModelV5, IndependentGroundingModelV1, ActionGroundingOutcomeV1 } from './action-grounding-controller.js';
 import { executeActionGoalGroundingV1 } from './action-grounding-execution-controller.js';
 import { GoalDirectedVerificationControllerV1, type AgenticVerificationModelV4 } from './verification-strategy.js';
-import { McpExplorationSession } from '../exploration/mcp.js';
-import { ActionCandidateGroundingSessionV1 } from '../exploration/action-candidate-grounding.js';
+import { McpExplorationSession, McpToolError } from '../exploration/mcp.js';
+import { ActionCandidateGroundingSessionV1, ActionCandidateGroundingError } from '../exploration/action-candidate-grounding.js';
 import { TrustedObservationSessionV1 } from '../exploration/trusted-observation.js';
 import { SuccessfulTraceAssemblerV5 } from '../exploration/trace-assembly-v5.js';
 import { compileDeferredSuccessfulTraceV5, requireTrustedDeferredCompilationV4 } from '../exploration/deferred-trace-compiler-v4.js';
@@ -20,7 +21,7 @@ import { DeferredReplayV9Store, requireTrustedDeferredReplayReadbackV1 } from '.
 import { DeferredWorkflowStopStoreV1 } from '../evidence/deferred-workflow-store.js';
 import { DeferredInterpretationAttemptStoreV1 } from '../evidence/deferred-interpretation-attempt-store.js';
 import { runDeferredTwoFreshReplaysV1, requireTrustedDeferredReplayV1 } from './deferred-action-replay.js';
-import { DeferredWorkflowPrivateAccountingV1Schema } from '../domain/deferred-workflow-accounting.js';
+import { DeferredGroundingStopDiagnosticV1Schema, DeferredWorkflowPrivateAccountingV1Schema } from '../domain/deferred-workflow-accounting.js';
 import { z } from 'zod';
 import { projectDeferredReportV2 } from '../subprocess/deferred-report-projection-v2.js';
 import { ProtectedContextFactory, profilePresentationMode } from '../profile/index.js';
@@ -68,6 +69,40 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
   let explorationAttemptId: string | undefined, successfulTraceId: string | undefined, compilerAttemptId: string | undefined;
   let session: McpExplorationSession | undefined, cleanup: 'not_started' | 'verified' | 'unverified' = 'not_started';
   const accounting: z.infer<typeof DeferredWorkflowPrivateAccountingV1Schema> = { groundingAttempts: [], successfulWitnesses: [] };
+  const startupDiagnostics: DeferredStartupDiagnosticV1[] = [];
+  accounting.startupDiagnostics = startupDiagnostics;
+  const safeException = (error: unknown): DeferredStartupDiagnosticV1['exceptionName'] => {
+    const name = error instanceof Error ? error.name : undefined;
+    return DeferredStartupDiagnosticV1Schema.shape.exceptionName.unwrap().safeParse(name).success
+      ? name as DeferredStartupDiagnosticV1['exceptionName'] : 'OtherError';
+  };
+  const safeCode = (error: unknown, step: DeferredStartupDiagnosticV1['stage']): DeferredStartupDiagnosticV1['code'] | undefined => {
+    if (error instanceof McpToolError) return step === 'root_navigation' &&
+      /(?:^|\n)(?:Error:\s*)?(?:page\.goto:\s*)?TimeoutError\b|\bpage\.goto:\s*Timeout \d+ms exceeded\b/i.test(error.reason)
+      ? 'NAVIGATION_TIMEOUT' : 'MCP_TOOL_ERROR';
+    if (error instanceof ActionCandidateGroundingError) return DeferredWorkflowStopCodeV1Schema.safeParse(error.reason).success
+      ? error.reason as DeferredStartupDiagnosticV1['code'] : undefined;
+    if (error instanceof StageStop) return DeferredWorkflowStopCodeV1Schema.safeParse(error.code).success
+      ? error.code as DeferredStartupDiagnosticV1['code'] : undefined;
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+    return ['ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(String(code))
+      ? code as DeferredStartupDiagnosticV1['code'] : undefined;
+  };
+  const recordStartup = async <T>(step: DeferredStartupDiagnosticV1['stage'], run: () => Promise<T>): Promise<T> => {
+    const startedAt = new Date().toISOString(), started = performance.now();
+    try {
+      const value = await run();
+      startupDiagnostics.push({ stage: step, startedAt,
+        endedAt: new Date().toISOString(), elapsedMs: Math.max(0, Math.min(86_400_000, Math.round(performance.now() - started))), status: 'completed' });
+      return value;
+    } catch (error) {
+      const code = safeCode(error, step);
+      startupDiagnostics.push({ stage: step, startedAt,
+        endedAt: new Date().toISOString(), elapsedMs: Math.max(0, Math.min(86_400_000, Math.round(performance.now() - started))),
+        status: 'failed', exceptionName: safeException(error), ...(code ? { code } : {}) });
+      throw error;
+    }
+  };
   const cancelled = () => { if (options.signal?.aborted) throw new StageStop('cancellation', 'cancelled', 'CANCELLED'); };
   const finishStop = async (stop: StageStop) => {
     if (session) { try { await session.close(); if (cleanup !== 'unverified') cleanup = 'verified'; } catch { cleanup = 'unverified'; } session = undefined; }
@@ -114,22 +149,49 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
       catch { throw new StageStop('interpretation', 'persistence', 'PERSISTENCE_FAILED'); }
     }
     stage = 'grounding'; explorationAttemptId = `exploration-${randomUUID()}`;
-    session = await McpExplorationSession.open(factory, source.executionProfileRef, profile, explorationAttemptId);
+    session = await recordStartup('session_open', () => McpExplorationSession.open(factory, source.executionProfileRef, profile, explorationAttemptId));
     cleanup = 'verified';
-    await session.navigate(source.startState.url); cancelled();
+    await recordStartup('root_navigation', () => session!.navigate(source.startState.url)); cancelled();
     const runtime = new ActionCandidateGroundingSessionV1(session, admission, explorationAttemptId);
     const observations = new TrustedObservationSessionV1(session, runtime);
     const verification = new GoalDirectedVerificationControllerV1(observations, runtime, models.verification);
     const nativeObservations=models.nativeVerification?new NativeOptionObservationSessionV2(session,runtime):undefined;
     const nativeVerification=nativeObservations?new NativeOptionVerificationControllerV2(nativeObservations,runtime,models.nativeVerification!):undefined;
-    const builder = await SuccessfulTraceAssemblerV5.create({ admission, runtime, observations, verification,...(nativeObservations?{nativeObservations,nativeVerification:nativeVerification!}:{}), ...options });
+    const builder = await recordStartup('initial_protected_state', () => SuccessfulTraceAssemblerV5.create({ admission, runtime, observations, verification,
+      aroundInitialObservation: (read) => recordStartup('initial_observation', read),
+      ...(nativeObservations?{nativeObservations,nativeVerification:nativeVerification!}:{}), ...options }));
+    let firstGroundingDecision = true;
     for (const [ordinal, goal] of source.steps.entries()) {
       cancelled();
       if (goal.type === 'action_goal') {
         const outcome = await executeActionGoalGroundingV1({ admission, runtime, goalId: goal.id,
-          model: models.grounding, independentModel: models.independentGrounding });
+          model: models.grounding, independentModel: models.independentGrounding,
+          ...(firstGroundingDecision ? { aroundFirstDecision: async (prepare: () => Promise<ActionGroundingOutcomeV1>) => {
+            const decision = await recordStartup('first_grounding_decision', prepare);
+            if (decision.status === 'stop') {
+              const diagnostic = startupDiagnostics[startupDiagnostics.length - 1]!;
+              diagnostic.status = 'stopped';
+              const code = DeferredWorkflowStopCodeV1Schema.safeParse(decision.reason);
+              if (code.success) diagnostic.code = code.data;
+            }
+            return decision;
+          } } : {}) });
+        firstGroundingDecision = false;
         accounting.groundingAttempts.push(...outcome.executionAttempts);
-        if (outcome.status !== 'succeeded') throw new StageStop('grounding', outcome.category, outcome.reason);
+        if (outcome.status !== 'succeeded') {
+          if (outcome.diagnostic) {
+            const privateDiagnostic = DeferredGroundingStopDiagnosticV1Schema.safeParse({
+              diagnosticVersion: '1', stepId: outcome.diagnostic.goalId,
+              ...(outcome.diagnostic.operation ? { operation: outcome.diagnostic.operation } : {}),
+              pending: outcome.diagnostic.pending,
+              ...(outcome.diagnostic.candidateCount !== undefined ?
+                { candidateCount: outcome.diagnostic.candidateCount } : {}),
+            });
+            if (privateDiagnostic.success && privateDiagnostic.data.stepId === goal.id)
+              accounting.groundingStop = privateDiagnostic.data;
+          }
+          throw new StageStop('grounding', outcome.category, outcome.reason);
+        }
         accounting.successfulWitnesses.push(outcome.witness);
         builder.appendActionGroundingWitness(outcome.witness); verification.noteSuccessfulGroundingWitness(outcome.witness);
       } else if (goal.type === 'navigate') {
@@ -172,6 +234,11 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
     catch { throw new StageStop('environment', 'persistence', 'PERSISTENCE_FAILED'); }
     const { result } = requireTrustedDeferredReplayReadbackV1(stored);
     projectDeferredReportV2(stored);
+    // Diagnostics never change a completed QA result if their private write fails.
+    if (explorationAttemptId && startupDiagnostics.length) {
+      try { await new DeferredWorkflowStopStoreV1(artifactRoot).writeStartupDiagnostics(request.testSpecId,
+        explorationAttemptId, profile.fingerprint, startupDiagnostics); } catch { /* Best-effort private diagnostics. */ }
+    }
     return { result, reportAvailable: true };
   } catch (error) {
     return finishStop(options.signal?.aborted ? new StageStop('cancellation', 'cancelled', 'CANCELLED') :

@@ -7,7 +7,7 @@ import type { InterpretationRequest } from '../interpretation/interpret.js';
 import type { OpenAIResponsesConfig } from '../interpretation/openai-responses.js';
 import {
   ExecutionProfileSchema, NetworkPolicySchema, ProfileCatalog,
-  PublicTargetApprovalSchema, validatePublicTargetApproval,
+  PublicTargetApprovalSchema,
   type AuthStateProvider, type ExternalTargetGate, type PresentationMode,
 } from '../profile/index.js';
 
@@ -15,9 +15,8 @@ const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
 const fingerprint = z.string().regex(/^[a-f0-9]{64}$/);
 const url = z.string().url().refine((value) => {
   const parsed = new URL(value);
-  return (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-    !parsed.username && !parsed.password && !value.includes('*');
-}, 'Expected an absolute HTTP(S) URL without credentials');
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+}, 'Expected an absolute HTTP(S) URL');
 
 /** Untrusted task input cannot carry egress, evidence, credential, or browser settings. */
 export const LocalWorkflowRequestSchema = z.strictObject({
@@ -65,7 +64,7 @@ export type LiveViewerPolicy = z.infer<typeof LiveViewerPolicySchema>;
 /** Serializable trusted settings. Secret values and approval callbacks stay external. */
 export const TrustedLocalConfigurationSchema = z.strictObject({
   profiles: z.array(ExecutionProfileSchema).min(1),
-  networkPolicies: z.array(NetworkPolicySchema).min(1),
+  networkPolicies: z.array(NetworkPolicySchema).default([]),
   evidencePolicy: LocalEvidencePolicySchema,
   liveImagePolicy: LiveImagePolicySchema.optional(),
   liveViewerPolicy: LiveViewerPolicySchema.optional(),
@@ -79,11 +78,21 @@ export function parseTrustedLocalConfiguration(input: unknown): TrustedLocalConf
   const config = TrustedLocalConfigurationSchema.parse(input);
   const catalog = new ProfileCatalog(config.profiles, config.networkPolicies);
   for (const profile of config.profiles) catalog.resolve({ id: profile.id, version: profile.version });
-  if (config.publicTargetApproval) {
-    validatePublicTargetApproval(config.publicTargetApproval,
-      catalog.resolve(config.publicTargetApproval.executionProfileRef));
-  }
   return config;
+}
+
+/** Active PoC runtime setting. Historical reads retain their stored profile. */
+export const ACTIVE_POC_NAVIGATION_MS = 90_000;
+
+export function parseActivePocTrustedConfiguration(input: unknown): TrustedLocalConfiguration {
+  const config = parseTrustedLocalConfiguration(input);
+  return {
+    ...config,
+    profiles: config.profiles.map((profile) => ({
+      ...profile,
+      timeoutPolicy: { ...profile.timeoutPolicy, navigationMs: ACTIVE_POC_NAVIGATION_MS },
+    })),
+  };
 }
 
 /** Trusted dependencies are not serializable request fields or evidence. */

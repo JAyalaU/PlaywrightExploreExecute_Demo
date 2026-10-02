@@ -76,10 +76,7 @@ function urlMatches(actual: string, expected: string, mode: 'exact' | 'pattern')
 }
 
 async function navigate(page: Page, url: string, timeout: number): Promise<Outcome> {
-  const response = await page.goto(url, { timeout });
-  if (response?.status() === 403 && await response.text() === 'Network policy denied request') {
-    return failure('BROWSER_EXECUTION_FAILED', 'NETWORK_POLICY_DENIED');
-  }
+  await page.goto(url, { timeout });
   return success('OPERATION_SUCCEEDED');
 }
 

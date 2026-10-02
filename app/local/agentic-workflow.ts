@@ -7,8 +7,7 @@ import { finalizeAgenticOutcomeV2, runAgenticProductionV1, runGoalDirectedProduc
   createOpenAIVerificationDecisionModel,
   type AgenticDecisionModelV3, type AgenticVerificationModelV4,
   type InterpretationModel } from '../interpretation/index.js';
-import { ProfileCatalog, ProtectedContextFactory, publicTargetGate,
-  requiresExternalReview, resolveApprovedAddress, profilePresentationMode,
+import { ProfileCatalog, ProtectedContextFactory, profilePresentationMode,
   type EffectiveProfile, type ProfileRef, type ProtectedBrowserSession,
   type ProtectedSessionOptions } from '../profile/index.js';
 import { envelopeForAgenticTerminalV2, type SubprocessResponseV2 } from '../subprocess/protocol-v2.js';
@@ -40,20 +39,7 @@ export async function runAgenticLocalWorkflow(requestInput: unknown, configInput
   try { effective = catalog.resolve(request.executionProfileRef); }
   catch { throw new LocalWorkflowError('PROFILE_UNAVAILABLE'); }
   if (options.signal?.aborted) throw new LocalWorkflowError('CANCELLED');
-  const approval = config.publicTargetApproval;
-  const selectedApproval = approval &&
-    approval.executionProfileRef.id === request.executionProfileRef.id &&
-    approval.executionProfileRef.version === request.executionProfileRef.version;
-  if ((selectedApproval && request.targetUrl !== approval.targetUrl) ||
-    (requiresExternalReview(effective) && !selectedApproval && !dependencies.externalTargetGate))
-    throw new LocalWorkflowError('DESTINATION_DENIED');
-  const gate = selectedApproval ? publicTargetGate(approval) : dependencies.externalTargetGate;
-  if (requiresExternalReview(effective)) {
-    try { await gate!.authorize(effective); }
-    catch { throw new LocalWorkflowError('DESTINATION_DENIED'); }
-  }
-  try { await resolveApprovedAddress(new URL(request.targetUrl), effective.policy); }
-  catch { throw new LocalWorkflowError('DESTINATION_DENIED'); }
+  const gate = undefined;
 
   if (workflowVersion === 'deferred-action-v1') return runDeferredLocalWorkflowV1(request, config, catalog, gate, dependencies, options);
 

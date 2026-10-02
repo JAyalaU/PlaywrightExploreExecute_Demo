@@ -6,7 +6,6 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { execFile, spawn } from 'node:child_process';
-import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { ProtectedContextFactory } from '../app/profile/index.js';
 import { runAgenticLocalWorkflow } from '../app/local/agentic-workflow.js';
 import { runAgenticSubprocessAdapterV2 } from '../app/subprocess/agentic-entry.js';
@@ -39,7 +38,7 @@ import {readNativeOwnedOptionState,nativeOptionIdentityJournal} from '../app/bro
 import {nativeOptionPredicate} from '../app/domain/native-option-verification.js';
 import {parseProtectedTraceCaptureBundleV5} from '../app/domain/trace-capture-v5.js';
 import {successfulTraceDigestV5} from '../app/domain/agentic-trace-v5.js';
-import {semanticAdmissionDigestV2,NATIVE_OPTION_ADMISSION_VERSIONS_V2} from '../app/domain/action-semantic-admission.js';
+import {semanticAdmissionDigestV2,POC_SEMANTIC_ADMISSION_VERSIONS_V2} from '../app/domain/action-semantic-admission.js';
 test.describe.configure({mode:'serial'});
 const gate='PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE';
 async function fixture(html: string, authored: TestSpecV6V2['steps'] = [choose()],
@@ -68,9 +67,34 @@ async function fixture(html: string, authored: TestSpecV6V2['steps'] = [choose()
   const fetchImpl: typeof fetch = async (_url, init) => {
     const body = JSON.parse(String(init!.body)), format = body.text.format.name as string;
     if(nativeProviderFailure&&format==='agentic_native_option_verification_decision_v6')return new Response(JSON.stringify({error:{message:'PRIVATE_PROVIDER_FAILURE'}}),{status:500});
-    calls.push({ format, input: format.includes('interpretation') || format === 'qa_deferred_action_source_first_v6' ? body.input : JSON.parse(body.input) });
+    calls.push({ format, input: format.includes('interpretation') || format === 'qa_deferred_action_source_first_v6' ||
+      format === 'qa_deferred_semantic_poc_primary_v1' ? body.input : JSON.parse(body.input) });
     let response: unknown;
-    if (format === 'qa_deferred_action_interpretation_v10' || format === 'qa_deferred_action_source_first_v6') {
+    if (format === 'qa_deferred_semantic_poc_primary_v1') {
+      response = { kind: 'extraction', steps: steps.map((step) => {
+        if (step.type === 'navigate') return { id: step.id, type: 'navigate', url: step.url };
+        if (step.type === 'action_goal') {
+          const effect = step.obligations.find((item) => item.kind === 'effect');
+          const operation = step.obligations.find((item) => item.kind === 'operation');
+          const argument = step.obligations.find((item) => item.kind === 'argument');
+          return { id: step.id, type: 'action_goal',
+            effect: effect?.kind === 'effect' ? effect.effect : 'choose',
+            explicitOperation: operation?.kind === 'operation' ? operation.operation : null,
+            argument: argument?.kind === 'argument' ? { purpose: argument.purpose, value: argument.authoredText } : null,
+            targetConstraints: step.obligations.flatMap((item) => item.kind === 'constraint' && item.subject.kind === 'target' ?
+              [{ kind: item.constraint, value: item.authoredText, polarity: item.polarity }] : []),
+            dependsOnStepId: null };
+        }
+        return 'verificationVersion' in step ? { id: step.id, type: 'verification_goal', verificationVersion: '2',
+          optionLabel: step.claim.optionLabel, expectedSelected: step.claim.expectedSelected,
+          controlConstraints: step.claim.controlConstraints.map(({ kind, text }) => ({ kind, text })),
+          dependsOnStepId: step.dependsOnStepId ?? null } :
+          { id: step.id, type: 'verification_goal', verificationVersion: null, instruction: step.instruction,
+            subject: step.subject ?? null, intent: step.intent ?? null, dependsOnStepId: step.dependsOnStepId ?? null };
+      }) };
+    } else if (format === 'qa_deferred_semantic_poc_fidelity_v1') {
+      response = { verdict: 'faithful', issues: [] };
+    } else if (format === 'qa_deferred_action_interpretation_v10' || format === 'qa_deferred_action_source_first_v6') {
       const wire = steps.map(unspannedStep);
       const accounting = forwardInstructionAccounting(instructionAccounting);
       response = format === 'qa_deferred_action_interpretation_v10' ? { kind: 'extraction', steps: wire, instructionAccounting: accounting } :
@@ -111,14 +135,7 @@ test('exact authored public live-gate source completes through a protected loopb
  const publicUrl='https://the-internet.herokuapp.com/dropdown',task=`Go to ${publicUrl}. Select Option 1. Verify that Option 1 is selected.`,
   authored=[{id:'navigation',type:'navigate' as const,sourceText:`Go to ${publicUrl}.`,url:publicUrl,sourceInstructionSpan:{start:0,end:`Go to ${publicUrl}.`.length}},choose(),selected()],
   f=await fixture(options,authored,{preserveNavigation:true,requestTargetUrl:publicUrl,policyHost:'the-internet.herokuapp.com',policyPort:443});
- const dns=createRequire(import.meta.url)('node:dns/promises') as {lookup:(hostname:string,...args:unknown[])=>Promise<unknown>},originalLookup=dns.lookup,
-  originalOpen=ProtectedContextFactory.prototype.open,routed:string[]=[],denied:string[]=[],lookups:string[]=[],openedContexts:object[]=[],routedContexts:object[]=[];
- dns.lookup=async function(hostname:string,...args:unknown[]){
-  if(hostname==='the-internet.herokuapp.com'){lookups.push(hostname);return [{address:'127.0.0.1',family:4}];}
-  if(hostname==='127.0.0.1'||hostname==='localhost'||hostname==='::1')return [{address:'127.0.0.1',family:4}];
-  throw new Error(`Unexpected DNS lookup blocked by exact-source regression: ${hostname}`);
- };
- syncBuiltinESMExports();
+ const originalOpen=ProtectedContextFactory.prototype.open,routed:string[]=[],denied:string[]=[],openedContexts:object[]=[],routedContexts:object[]=[];
  ProtectedContextFactory.prototype.open=async function(...args){
   const session=await originalOpen.apply(this,args);
   openedContexts.push(session.context);
@@ -138,21 +155,22 @@ test('exact authored public live-gate source completes through a protected loopb
   const result=await f.run();expect(result.kind,JSON.stringify(result)).toBe('success');if(result.kind==='bridge_error')throw Error('bridge');
   expect(result.context.result.terminal.status).toBe('QA_ASSERTION_PASSED');
   expect(result.context.result.executionRunIds).toHaveLength(2);
-  expect(f.calls.slice(0,2).map(call=>call.format)).toEqual(['qa_deferred_action_interpretation_v10','qa_deferred_action_source_first_v6']);
-  expect(f.calls.slice(0,2).map(call=>call.input)).toEqual([task,task]);
+  expect(f.calls.slice(0,2).map(call=>call.format)).toEqual(['qa_deferred_semantic_poc_primary_v1','qa_deferred_semantic_poc_fidelity_v1']);
+  expect(f.calls[0]!.input).toBe(task);
+  expect(f.calls[1]!.input).toMatchObject({originalInstruction:task});
   const trace=await new SuccessfulTraceV5Store(f.root).readSuccessfulExplorationV5(result.context.result.testSpecId,result.context.result.explorationAttemptId!),data=trace.protectedArtifact().trace;
   expect(data.source.sourceInstruction).toBe(task);
   expect(data.semanticAdmission.sourceDigest).toBe(semanticAdmissionDigestV2(task));
-  expect(data.semanticAdmission.versions).toMatchObject(NATIVE_OPTION_ADMISSION_VERSIONS_V2);
+  expect(data.semanticAdmission.versions).toMatchObject(POC_SEMANTIC_ADMISSION_VERSIONS_V2);
   expect(data.source.startState.url).toBe(publicUrl);
   const navigation=data.source.steps.find(step=>step.type==='navigate');
-  expect(navigation).toMatchObject({type:'navigate',url:publicUrl,sourceText:`Go to ${publicUrl}.`});
-  expect(navigation?.sourceInstructionSpan).toEqual({start:0,end:`Go to ${publicUrl}.`.length});
+  expect(navigation).toMatchObject({type:'navigate',url:publicUrl,sourceText:`Go to ${publicUrl}`});
+  expect(navigation?.sourceInstructionSpan).toEqual({start:0,end:task.length});
   expect(data.successfulPath.find(step=>step.type==='navigate')).toMatchObject({url:publicUrl});
   expect(openedContexts.length).toBeGreaterThanOrEqual(4);expect(new Set(openedContexts).size).toBe(openedContexts.length);
   expect(new Set(routedContexts).size).toBeGreaterThanOrEqual(4);
   expect(routed.length).toBeGreaterThan(0);expect(new Set(routed)).toEqual(new Set([publicUrl]));expect(denied).toEqual([]);
-  expect(lookups.length).toBeGreaterThan(0);expect(f.fixtureRequests()).toBeGreaterThan(0);
+  expect(f.fixtureRequests()).toBeGreaterThan(0);
   const compiler=await new DeferredCompilerV4Store(f.root).readResolvedV9(result.context.result.testSpecId,result.context.result.compilerAttemptId!,trace),
    pair=await new DeferredReplayV9Store(f.root).readReplayV1(result.context.result.testSpecId,result.context.result.deferredReplay!.orchestrationId,compiler),
    replay=requireTrustedDeferredReplayReadbackV1(pair).record;
@@ -160,13 +178,16 @@ test('exact authored public live-gate source completes through a protected loopb
   expect(new Set(replay.runs.map(run=>run.provenance?.sessionId)).size).toBe(2);
   for(const run of replay.runs){const assertion=run.steps.find(step=>step.type==='verification_goal')?.verification;expect(run.result.kind).toBe('completed');expect(run.cleanup).toBe('verified');expect(assertion).toMatchObject({actual:true,evaluated:true});}
  }finally{
-  ProtectedContextFactory.prototype.open=originalOpen;dns.lookup=originalLookup;syncBuiltinESMExports();await f.close();
+  ProtectedContextFactory.prototype.open=originalOpen;await f.close();
  }
 });
 test('primary complete three-step path admits unnamed select and deterministic selected-state verification',async()=>{
  const f=await fixture(options,[{id:'navigation',type:'navigate',sourceText:'Go to http://127.0.0.1/.',url:'http://127.0.0.1/',sourceInstructionSpan:{start:0,end:25}},choose(),selected()]);try{
   const r=await f.run();expect(r.kind,JSON.stringify(r)).toBe('success');if(r.kind==='bridge_error')throw Error('bridge');expect(r.context.result.terminal.status).toBe('QA_ASSERTION_PASSED');expect(r.context.result.executionRunIds).toHaveLength(2);
-  expect(f.calls.slice(0,2).map(c=>c.input)).toEqual([f.request.taskText,f.request.taskText]);expect(f.calls.map(c=>c.format)).toContain('agentic_native_option_verification_decision_v6');
+  expect(f.calls.slice(0,2).map(c=>c.format)).toEqual(['qa_deferred_semantic_poc_primary_v1','qa_deferred_semantic_poc_fidelity_v1']);
+  expect(f.calls[0]!.input).toBe(f.request.taskText);
+  expect(f.calls[1]!.input).toMatchObject({originalInstruction:f.request.taskText});
+  expect(f.calls.map(c=>c.format)).toContain('agentic_native_option_verification_decision_v6');
   const trace=await new SuccessfulTraceV5Store(f.root).readSuccessfulExplorationV5(r.context.result.testSpecId,r.context.result.explorationAttemptId!);const data=trace.protectedArtifact().trace;
   const goal=data.source.steps.find(g=>g.type==='action_goal');expect(goal?.type==='action_goal'&&goal.obligations.filter(o=>o.kind==='constraint')).toEqual([]);
   const native=data.successfulPath.find(p=>p.type==='verification_goal');expect(native&&'verificationVersion'in native).toBeTruthy();

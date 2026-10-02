@@ -5,10 +5,15 @@ import { z } from 'zod';
 import { parseResultRecordV2, ResultRecordV2Schema } from '../domain/agentic-result-v2.js';
 import type { TrustedDeferredWorkflowStopV1 } from '../interpretation/deferred-action-production.js';
 import { DeferredWorkflowPrivateAccountingV1Schema } from '../domain/deferred-workflow-accounting.js';
+import { DeferredStartupDiagnosticV1Schema, type DeferredStartupDiagnosticV1 } from '../domain/deferred-startup-diagnostics.js';
 
 const namespace = 'deferred-workflow-stop-v1', id = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
 const envelope = z.strictObject({ storageVersion: z.literal('1'), namespace: z.literal(namespace),
   testSpecId: id, result: ResultRecordV2Schema, accounting: DeferredWorkflowPrivateAccountingV1Schema, authentication: z.string().regex(/^[a-f0-9]{64}$/) });
+const startupNamespace = 'deferred-startup-diagnostics-v1';
+const startupEnvelope = z.strictObject({ storageVersion: z.literal('1'), namespace: z.literal(startupNamespace),
+  testSpecId: id, explorationAttemptId: id, profileFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  diagnostics: z.array(DeferredStartupDiagnosticV1Schema).min(1).max(5), authentication: z.string().regex(/^[a-f0-9]{64}$/) });
 async function regular(file: string, limit: number) {
   const info = await lstat(file);
   if (!info.isFile() || info.isSymbolicLink() || info.size > limit) throw new Error('Invalid workflow stop file');
@@ -39,6 +44,30 @@ export class DeferredWorkflowStopStoreV1 {
     return this.#key;
   }
   #file(testSpecId: string) { return path.join(this.#root, namespace, id.parse(testSpecId), 'terminal.json'); }
+  #startupFile(testSpecId: string) { return path.join(this.#root, startupNamespace, id.parse(testSpecId), 'startup.json'); }
+  /** Successful runs have no stop envelope. This record grants no execution or QA authority. */
+  async writeStartupDiagnostics(testSpecId: string, explorationAttemptId: string, profileFingerprint: string,
+    diagnostics: readonly DeferredStartupDiagnosticV1[]) {
+    const data = { storageVersion: '1' as const, namespace: startupNamespace, testSpecId, explorationAttemptId,
+      profileFingerprint, diagnostics: structuredClone(diagnostics) };
+    startupEnvelope.omit({ authentication: true }).parse(data);
+    const authentication = createHmac('sha256', await this.#authority()).update(JSON.stringify(data)).digest('hex');
+    const file = this.#startupFile(testSpecId); await this.#directory(path.dirname(file), true);
+    const temporary = path.join(path.dirname(file), `.pending-${randomUUID()}`), handle = await open(temporary, 'wx', 0o600);
+    try { await handle.writeFile(JSON.stringify({ ...data, authentication })); await handle.sync(); }
+    catch (error) { await handle.close(); await unlink(temporary); throw error; }
+    await handle.close(); try { await link(temporary, file); } finally { await unlink(temporary); }
+    return this.readStartupDiagnostics(testSpecId, explorationAttemptId, profileFingerprint);
+  }
+  async readStartupDiagnostics(testSpecId: string, explorationAttemptId: string, profileFingerprint: string) {
+    const file = this.#startupFile(testSpecId); await this.#directory(path.dirname(file), false);
+    const { authentication, ...data } = startupEnvelope.parse(JSON.parse((await regular(file, 64 * 1024)).toString('utf8')));
+    const expected = createHmac('sha256', await this.#authority()).update(JSON.stringify(data)).digest();
+    if (!timingSafeEqual(expected, Buffer.from(authentication, 'hex')) || data.testSpecId !== testSpecId ||
+      data.explorationAttemptId !== explorationAttemptId || data.profileFingerprint !== profileFingerprint)
+      throw new Error('Startup diagnostic authentication mismatch');
+    return data.diagnostics;
+  }
   async writeStop(input: TrustedDeferredWorkflowStopV1) {
     const { requireTrustedDeferredWorkflowStopV1, requireTrustedDeferredWorkflowStopAccountingV1 } = await import('../interpretation/deferred-action-production.js');
     const result = requireTrustedDeferredWorkflowStopV1(input);

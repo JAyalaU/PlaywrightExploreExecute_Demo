@@ -182,7 +182,7 @@ test('M8-A keeps frame replay declarative and records a denied navigation as a t
   }
 });
 
-test('M8-A retains a network-policy denial as MCP evidence rather than a QA assertion', async () => {
+test('M8-A retains a real navigation failure as MCP evidence rather than a QA assertion', async () => {
   const allowedPort = 6553;
   const directory = await mkdtemp(path.join(tmpdir(), 'qa-m8-denied-'));
   const store = new LocalArtifactStore(directory);
@@ -197,7 +197,7 @@ test('M8-A retains a network-policy denial as MCP evidence rather than a QA asse
     expect(outcome.kind).toBe('stopped');
     if (outcome.kind !== 'stopped') return;
     expect(outcome.result).toMatchObject({ phase: 'exploration', status: 'MCP_EXPLORATION_FAILED' });
-    expect(outcome.result.reason).toContain('NETWORK_POLICY_DENIED');
+    expect(outcome.result.reason).not.toContain('NETWORK_POLICY_DENIED');
     const attempt = await store.readAttempt(source.testSpecId, outcome.attemptId!);
     expect(attempt.status).toBe('unresolved');
     expect(attempt.evidenceRefs.length).toBeGreaterThan(0);

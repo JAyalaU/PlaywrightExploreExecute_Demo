@@ -1,14 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import net from 'node:net';
 import { chromium, type Browser } from '@playwright/test';
 import type { ConnectOverCDPTransport } from 'playwright-core';
 import { restrictedBrowserEnvironment } from './browser-environment.js';
-import type { ProtectedProxy } from './network.js';
 
 const IMAGE = 'playwright-demo-public-browser:1.63.0';
 const HEADED_IMAGE = 'playwright-demo-public-browser-headed:1.63.0-p4-3a';
-const PROXY_PORT = 3333;
 const MAX_FRAME = 8 * 1024 * 1024;
 const MAX_DOCKER_OUTPUT = 1024 * 1024;
 
@@ -91,38 +88,6 @@ function lineReader(stream: NodeJS.ReadableStream, onLine: (line: string) => voi
   });
 }
 
-const proxyScript = String.raw`
-const net = require('node:net');
-const readline = require('node:readline');
-const sockets = new Map(); let nextId = 1;
-function emit(value, source) {
-  if (!process.stdout.write(JSON.stringify(value) + '\n') && source) {
-    source.pause(); process.stdout.once('drain', () => source.resume());
-  }
-}
-const server = net.createServer(socket => {
-  const id = nextId++; sockets.set(id, socket);
-  emit({type:'open',id});
-  socket.on('data', data => emit({type:'data',id,data:data.toString('base64')}, socket));
-  socket.on('close', () => { sockets.delete(id); emit({type:'close',id}); });
-  socket.on('error', () => socket.destroy());
-});
-server.listen(${PROXY_PORT}, '127.0.0.1', () => emit({type:'ready',token:process.env.PUBLIC_BROWSER_CONTROL_TOKEN}));
-readline.createInterface({input:process.stdin}).on('line', line => {
-  try {
-    const frame = JSON.parse(line), socket = sockets.get(frame.id);
-    if (!socket) return;
-    if (frame.type === 'close') socket.destroy();
-    if (frame.type === 'data') {
-      const data = Buffer.from(frame.data, 'base64');
-      if (data.length > 16384) throw Error('Oversized proxy frame');
-      if (!socket.write(data)) process.stdin.pause(), socket.once('drain', () => process.stdin.resume());
-    }
-  } catch { process.exit(78); }
-});
-process.stdin.on('end', () => server.close());
-`;
-
 const controlScript = String.raw`
 const readline = require('node:readline');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -174,80 +139,36 @@ function awaitReady(child: ChildProcessWithoutNullStreams, onFrame: (frame: Reco
   });
 }
 
-function startProxyBridge(container: string, proxy: ProtectedProxy, token: string): Promise<ChildProcessWithoutNullStreams> {
-  const child = dockerStream(container, proxyScript);
-  const sockets = new Map<number, net.Socket>();
-  child.once('exit', () => { for (const socket of sockets.values()) socket.destroy(); sockets.clear(); });
-  const handle = (frame: Record<string, unknown>): void => {
-    const id = frame.id;
-    if (!Number.isSafeInteger(id) || Number(id) < 1) throw new Error('Invalid proxy bridge frame');
-    const key = Number(id);
-    if (frame.type === 'open') {
-      if (sockets.has(key)) throw new Error('Duplicate proxy bridge stream');
-      const address = new URL(proxy.url);
-      const socket = net.connect(Number(address.port), '127.0.0.1');
-      sockets.set(key, socket);
-      socket.on('data', (data) => {
-        for (let offset = 0; offset < data.length; offset += 16384) {
-          if (!child.stdin.write(JSON.stringify({ type: 'data', id: key,
-            data: data.subarray(offset, offset + 16384).toString('base64') }) + '\n')) {
-            socket.pause(); child.stdin.once('drain', () => socket.resume());
-          }
-        }
-      });
-      socket.on('close', () => { sockets.delete(key); child.stdin.write(JSON.stringify({ type: 'close', id: key }) + '\n'); });
-      socket.on('error', () => socket.destroy());
-    } else if (frame.type === 'data') {
-      const socket = sockets.get(key);
-      if (!socket || typeof frame.data !== 'string') throw new Error('Invalid proxy bridge data');
-      const data = Buffer.from(frame.data, 'base64');
-      if (data.length > 16384) throw new Error('Oversized proxy bridge data');
-      if (!socket.write(data)) child.stdout.pause(), socket.once('drain', () => child.stdout.resume());
-    } else if (frame.type === 'close') {
-      sockets.get(key)?.destroy();
-    } else throw new Error('Unexpected proxy bridge frame');
-  };
-  return awaitReady(child, (frame) => { try { handle(frame); } catch { child.kill(); } }, 10_000, token)
-    .then(() => child);
-}
-
 export class IsolatedBrowser {
   readonly browser: Browser;
   readonly #container: string;
-  readonly #proxyBridge: ChildProcessWithoutNullStreams;
   readonly #control: ChildProcessWithoutNullStreams;
   readonly #headed: boolean;
   #closePromise: Promise<void> | undefined;
 
-  private constructor(browser: Browser, container: string, proxyBridge: ChildProcessWithoutNullStreams,
+  private constructor(browser: Browser, container: string,
     control: ChildProcessWithoutNullStreams, headed: boolean) {
     this.browser = browser; this.#container = container;
-    this.#proxyBridge = proxyBridge; this.#control = control; this.#headed = headed;
+    this.#control = control; this.#headed = headed;
   }
 
   /** Runtime proof only; never persist this Docker identity in TestSpec artifacts. */
   get containerId(): string { return this.#container; }
 
-  static async open(proxy: ProtectedProxy, presentationMode: 'headless' | 'headed' = 'headless'): Promise<IsolatedBrowser> {
-    // Fail before creating a compartment when the sole authoritative egress
-    // path is already unavailable. Later loss is caught by the proxy-boundary
-    // probe, but a closed proxy must never permit browser startup.
-    void proxy.url;
+  static async open(presentationMode: 'headless' | 'headed' = 'headless'): Promise<IsolatedBrowser> {
     const name = `public-browser-g1-${randomUUID().replaceAll('-', '')}`;
     const token = randomUUID();
     let container: string | undefined;
-    let bridge: ChildProcessWithoutNullStreams | undefined;
     let control: ChildProcessWithoutNullStreams | undefined;
     try {
       container = name;
       const started = await docker([
-        'run', '-d', '--rm', '--name', name, '--init', '--network', 'none', '--read-only',
+        'run', '-d', '--rm', '--name', name, '--init', '--network', 'bridge', '--read-only',
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
         '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=512m', '--shm-size', '256m',
         '-e', 'HOME=/tmp', '-e', 'XDG_CACHE_HOME=/tmp',
         '-e', 'XDG_CONFIG_HOME=/tmp', '-e', 'XDG_RUNTIME_DIR=/tmp',
         '-e', `PUBLIC_BROWSER_CONTROL_TOKEN=${token}`,
-        '-e', `PUBLIC_BROWSER_PROXY=http://127.0.0.1:${PROXY_PORT}`,
         // Docker Desktop's default user-namespace policy cannot start Chrome's
         // inner sandbox under the required cap-drop/no-new-privileges boundary.
         // The disposable container is the reviewed host isolation boundary.
@@ -255,7 +176,6 @@ export class IsolatedBrowser {
       ]);
       if (!/^[a-f0-9]{64}$/.test(started)) throw new Error('Invalid isolated browser container identity');
       container = started;
-      bridge = await startProxyBridge(container, proxy, token);
       control = dockerStream(container, controlScript);
       const transport: ConnectOverCDPTransport = {
         open(): void {},
@@ -284,9 +204,9 @@ export class IsolatedBrowser {
         isLocal: false, timeout: 10_000,
         ...(presentationMode === 'headed' ? { slowMo: 750 } : {}),
       });
-      return new IsolatedBrowser(browser, container, bridge, control, presentationMode === 'headed');
+      return new IsolatedBrowser(browser, container, control, presentationMode === 'headed');
     } catch (error) {
-      bridge?.kill(); control?.kill();
+      control?.kill();
       if (container) await disposeContainer(container).catch(() => {
         throw new AggregateError([error], 'Isolated browser startup and cleanup failed');
       });
@@ -318,7 +238,7 @@ process.stdout.on('error', () => socket.destroy());
   async #close(): Promise<void> {
     const errors: unknown[] = [];
     try { await this.browser.close(); } catch (error) { errors.push(error); }
-    this.#control.kill(); this.#proxyBridge.kill();
+    this.#control.kill();
     try { await disposeContainer(this.#container); } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, 'Isolated browser cleanup unverified');
   }

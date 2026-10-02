@@ -37,7 +37,7 @@ test('P2-2A untrusted request is closed and maps its original text and URL only 
     { apiKey: 'secret' }, { artifactRoot: 'jobs' }, { evidencePolicy },
     { networkPolicy: policy }, { headless: false },
   ]) expect(() => LocalWorkflowRequestSchema.parse({ ...request, ...extra })).toThrow();
-  for (const targetUrl of ['file:///etc/passwd', 'http://user:pass@127.0.0.1/', 'not a URL']) {
+  for (const targetUrl of ['file:///etc/passwd', 'not a URL']) {
     expect(() => LocalWorkflowRequestSchema.parse({ ...request, targetUrl })).toThrow();
   }
 });
@@ -45,9 +45,20 @@ test('P2-2A untrusted request is closed and maps its original text and URL only 
 test('P2-2A trusted settings validate policy references and evidence approval separately', () => {
   const config = { profiles: [legacyProfile], networkPolicies: [policy], evidencePolicy, artifactRoot: 'jobs', retentionDays: 7 };
   expect(parseTrustedLocalConfiguration(config)).toEqual(config);
-  expect(() => parseTrustedLocalConfiguration({ ...config, networkPolicies: [] })).toThrow();
+  expect(parseTrustedLocalConfiguration({ ...config, networkPolicies: [] }).networkPolicies).toEqual([]);
   expect(() => parseTrustedLocalConfiguration({ ...config, evidencePolicy: { ...evidencePolicy, failureTrace: true } })).toThrow();
   expect(() => parseTrustedLocalConfiguration({ ...config, apiKey: 'secret' })).toThrow();
+});
+
+test('PoC profile requires no policy reference, pins, or approved destination', () => {
+  const { networkPolicyRef: _legacy, ...runtimeProfile } = legacyProfile;
+  const config = parseTrustedLocalConfiguration({ profiles: [runtimeProfile], evidencePolicy,
+    artifactRoot: 'jobs', retentionDays: 7 });
+  expect(config.networkPolicies).toEqual([]);
+  const effective = new ProfileCatalog(config.profiles, config.networkPolicies)
+    .resolve({ id: runtimeProfile.id, version: runtimeProfile.version });
+  expect(effective.policy.destinations).toEqual([]);
+  expect(effective.fingerprint).toBe(createHash('sha256').update(JSON.stringify(runtimeProfile)).digest('hex'));
 });
 
 test('P2-2A profile versions preserve legacy fingerprint/readback and distinguish headed mode', async () => {
@@ -56,7 +67,8 @@ test('P2-2A profile versions preserve legacy fingerprint/readback and distinguis
   const headed = { ...v2Base, id: 'desktop-headed', presentationMode: 'headed' as const };
   const catalog = new ProfileCatalog([legacyProfile, headless, headed], [policy]);
   const legacy = catalog.resolve({ id: 'desktop', version: '1' });
-  const expectedLegacyFingerprint = createHash('sha256').update(JSON.stringify({ profile: legacyProfile, policy })).digest('hex');
+  const { networkPolicyRef: _legacy, ...runtimeProfile } = legacyProfile;
+  const expectedLegacyFingerprint = createHash('sha256').update(JSON.stringify(runtimeProfile)).digest('hex');
   expect(legacy.fingerprint).toBe(expectedLegacyFingerprint);
   expect(profilePresentationMode(legacy.profile)).toBe('headless');
   expect('presentationMode' in legacy.profile).toBe(false);
@@ -73,7 +85,8 @@ test('P2-2A profile versions preserve legacy fingerprint/readback and distinguis
   const legacyCustomVersion = { ...legacyProfile, id: 'prior-custom', version: '2' };
   const custom = new ProfileCatalog([legacyCustomVersion], [policy]).resolve({ id: 'prior-custom', version: '2' });
   expect(custom.profile).toEqual(legacyCustomVersion);
-  expect(custom.fingerprint).toBe(createHash('sha256').update(JSON.stringify({ profile: legacyCustomVersion, policy })).digest('hex'));
+  const { networkPolicyRef: _customPolicy, ...customRuntime } = legacyCustomVersion;
+  expect(custom.fingerprint).toBe(createHash('sha256').update(JSON.stringify(customRuntime)).digest('hex'));
   expect(() => new ProfileCatalog([{ ...v2Base }], [policy])).toThrow();
 
   const root = await mkdtemp(path.join(tmpdir(), 'p2-2a-'));

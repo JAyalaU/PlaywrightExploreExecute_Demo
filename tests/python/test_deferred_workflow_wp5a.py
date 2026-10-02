@@ -97,10 +97,12 @@ class DeferredBoundaryTests(unittest.TestCase):
             for relative in ("dist/profile/admission-cli.js", "dist/subprocess/agentic-cli.js",
                              "dist/subprocess/deferred-report-projection-cli.js", "dist/subprocess/report-projection-v2-cli.js"):
                 p = root / relative; p.parent.mkdir(parents=True, exist_ok=True); p.touch()
-            approval = {"kind": "approved", "admissionVersion": "1", "canonicalUrl": request.target_url, "executionProfileRef": REF, "profileFingerprint": "a" * 64}
-            with patch.dict(os.environ, {"PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE": "offline-review"}), patch("playwright_demo.ui_workflow.lookup_public_admission", return_value=approval), patch("playwright_demo.ui_workflow.call_node", return_value=HostCallResult(value)) as child, patch("playwright_demo.ui_workflow.call_report_projection_v2", return_value=HostCallResult(projection(value))) as project:
+            approval = {"kind": "approved", "admissionVersion": "1", "canonicalUrl": "https://different.example.org/", "executionProfileRef": REF, "profileFingerprint": "a" * 64}
+            with patch.dict(os.environ, {"PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE": "offline-review"}), patch("playwright_demo.ui_workflow.lookup_public_admission", return_value=approval) as selection, patch("playwright_demo.ui_workflow.call_node", return_value=HostCallResult(value)) as child, patch("playwright_demo.ui_workflow.call_report_projection_v2", return_value=HostCallResult(projection(value))) as project:
                 final = run_ui_workflow(request, config_path="trusted", build_root=root, workflow_version="deferred-action-v1")
                 self.assertEqual(final.projection, projection(value))
+                self.assertTrue(selection.call_args.kwargs["selection_only"])
+                self.assertEqual(child.call_args.args[0]["request"]["targetUrl"], request.target_url)
                 self.assertEqual(child.call_args.kwargs["environment"]["PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE"], "offline-review")
                 self.assertEqual(child.call_args.kwargs["deadline_ms"], 1_200_000)
                 self.assertEqual(project.call_args.kwargs["node_entry"].name, "deferred-report-projection-cli.js")

@@ -205,8 +205,8 @@ test('P2-2B rejects invalid request, absent profile, denied URL, and invalid pro
     await expected(runLocalWorkflow(request(site.url), { ...config, profiles: [] }, dependencies), 'INVALID_TRUSTED_CONFIGURATION');
     await expected(runLocalWorkflow({ ...request(site.url), executionProfileRef: { id: 'missing', version: '1' } },
       config, dependencies), 'PROFILE_UNAVAILABLE');
-    await expected(runLocalWorkflow({ ...request(site.url), targetUrl: 'http://127.0.0.1:1/' },
-      config, dependencies), 'DESTINATION_DENIED');
+    await expected(runLocalWorkflow({ ...request(site.url), targetUrl: 'file:///tmp/x' },
+      config, dependencies), 'INVALID_REQUEST');
     await expected(runLocalWorkflow(request(site.url), config,
       { provider: { apiKey: () => 'secret', model: 'invalid model' } }), 'PROVIDER_CONFIGURATION_ERROR');
     expect(await site.connections()).toBe(0);

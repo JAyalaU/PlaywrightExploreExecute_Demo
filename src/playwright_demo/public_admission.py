@@ -50,8 +50,7 @@ def parse_admission_response(data: bytes) -> dict[str, Any]:
     try:
         parsed_url = urlsplit(value["canonicalUrl"])
         valid_url = (parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
-                     and bool(parsed_url.hostname) and parsed_url.username is None
-                     and parsed_url.password is None and not parsed_url.fragment)
+                     and bool(parsed_url.hostname))
     except ValueError:
         valid_url = False
     if (not valid_url or
@@ -71,10 +70,13 @@ def lookup_public_admission(
     node_executable: str | Path = "node", deadline_ms: int = 10_000,
     environment: Mapping[str, str] | None = None,
     admission_version: str = "1",
+    selection_only: bool = False,
 ) -> dict[str, Any]:
-    """Return approved/denied/unavailable; an unavailable lookup grants nothing."""
+    """Return a legacy approval lookup or active PoC profile selection."""
     if admission_version not in {"1", "2"}:
         raise ValueError("Invalid admission version")
+    if selection_only and admission_version != "1":
+        raise ValueError("Profile selection uses the v1 wire shape")
     unavailable = {"admissionVersion": admission_version, "kind": "unavailable"}
     if type(deadline_ms) is not int or not 0 < deadline_ms <= 30_000:
         raise ValueError("Invalid admission deadline")
@@ -86,7 +88,8 @@ def lookup_public_admission(
         return {"admissionVersion": admission_version, "kind": "denied"}
     try:
         process = subprocess.Popen(
-            [str(node_executable), str(node_entry), "lookup", str(config_path)],
+            [str(node_executable), str(node_entry),
+             "select" if selection_only else "lookup", str(config_path)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=dict(environment) if environment is not None else None,
             start_new_session=os.name != "nt",

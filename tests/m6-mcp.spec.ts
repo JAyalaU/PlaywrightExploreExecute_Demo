@@ -101,7 +101,7 @@ test('M6-C checks live uniqueness and exact selected-target identity', async () 
   }
 });
 
-test('M6-A uses M3 policy for MCP navigation and secondary browser traffic', async () => {
+test('M6-A allows navigation and secondary browser traffic beyond old destination pins', async () => {
   let deniedHits = 0;
   const denied = http.createServer((_request, response) => { deniedHits++; response.end('unexpected'); });
   denied.listen(0, '127.0.0.1');
@@ -115,8 +115,11 @@ test('M6-A uses M3 policy for MCP navigation and secondary browser traffic', asy
   try {
     await session.navigate(allowed.url);
     expect(await session.snapshot()).toContain('Save');
-    await expect(session.navigate(deniedUrl)).rejects.toThrow('NETWORK_POLICY_DENIED');
-    expect(deniedHits).toBe(0);
+    await session.navigate(deniedUrl);
+    expect(deniedHits).toBeGreaterThan(0);
+    await expect(session.navigate('not a URL')).rejects.toThrow('Invalid navigation URL');
+    await expect(session.navigate('file:///tmp/example')).rejects.toThrow('Unsupported navigation URL scheme');
+    await expect(session.navigate('http://127.0.0.1:1/')).rejects.not.toThrow('NETWORK_POLICY_DENIED');
     expect(session.browserSession.context.pages()).toHaveLength(1);
   } finally {
     await session.close();

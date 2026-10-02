@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createConnection } from '@playwright/mcp';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { type EffectiveProfile, ProtectedContextFactory, type ProtectedBrowserSession, resolveApprovedAddress } from '../profile/index.js';
+import { type EffectiveProfile, ProtectedContextFactory, type ProtectedBrowserSession } from '../profile/index.js';
 
 const require = createRequire(import.meta.url);
 export const MCP_VERSION = (require('@playwright/mcp/package.json') as { version: string }).version;
@@ -117,16 +117,6 @@ export class McpExplorationSession {
     this.#activeCalls++;
     const callId = `mcp-${randomUUID()}`;
     try { this.#observeCall?.({ callId, tool: name, state: 'started' }); } catch { /* Observation is non-authoritative. */ }
-    const mainFrameDenials: Promise<boolean>[] = [];
-    const onResponse = (response: import('@playwright/test').Response): void => {
-      if (response.status() !== 403 || !response.request().isNavigationRequest()) return;
-      try {
-        if (response.frame().parentFrame() === null) {
-          mainFrameDenials.push(response.text().then((body) => body === 'Network policy denied request').catch(() => false));
-        }
-      } catch { /* A detached frame cannot establish a main-frame denial. */ }
-    };
-    this.browserSession.context.on('response', onResponse);
     try {
       const timeout = name === 'browser_navigate'
         ? this.browserSession.effectiveProfile.profile.timeoutPolicy.navigationMs + 5_000
@@ -139,7 +129,6 @@ export class McpExplorationSession {
       if (response.length > 131_072) throw new McpToolError(name, 'Tool response exceeds bounded size');
       this.calls.push({ name, arguments: args, response });
       if (result.isError) throw new McpToolError(name, response || 'Tool returned an error');
-      if ((await Promise.all(mainFrameDenials)).some(Boolean)) throw new McpToolError(name, 'NETWORK_POLICY_DENIED');
       try { this.#observeCall?.({ callId, tool: name, state: 'completed' }); } catch { /* Observation is non-authoritative. */ }
       return response;
     } catch (error) {
@@ -147,15 +136,17 @@ export class McpExplorationSession {
       if (error instanceof McpToolError) throw error;
       throw new McpToolError(name, error instanceof Error ? error.message : String(error));
     } finally {
-      this.browserSession.context.off('response', onResponse);
       this.#activeCalls--;
       this.#groundingRevision++;
     }
   }
 
   async navigate(url: string): Promise<string> {
-    try { await resolveApprovedAddress(new URL(url), this.browserSession.effectiveProfile.policy); }
-    catch { throw new McpToolError('browser_navigate', 'NETWORK_POLICY_DENIED'); }
+    let parsed: URL;
+    try { parsed = new URL(url); }
+    catch { throw new McpToolError('browser_navigate', 'Invalid navigation URL'); }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+      throw new McpToolError('browser_navigate', 'Unsupported navigation URL scheme');
     return this.#call('browser_navigate', { url });
   }
   snapshot(): Promise<string> { return this.#call('browser_snapshot', {}); }

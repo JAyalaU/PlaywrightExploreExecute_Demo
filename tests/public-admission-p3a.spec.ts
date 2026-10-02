@@ -80,34 +80,22 @@ test('P3-A changed DNS invalidates approval, and a fresh inspection yields a new
   expect(() => parseTrustedLocalConfiguration(configuration(restored))).not.toThrow();
 });
 
-test('P3-A fails closed on start URL, fingerprint, redirect host and secondary host', async () => {
+test('Active PoC ignores old destination pins and exact approval URL', async () => {
   const bundle = await approvePublicInspection(await inspectPublicUrl(firstUrl, firstDns), firstUrl, firstDns);
   const config = configuration(bundle);
-  const otherPath = { taskText: 'Check the page', targetUrl: 'https://www.first-public-site.org/other',
+  const changed = structuredClone(config);
+  changed.networkPolicies[0]!.destinations[0]!.addresses = ['8.8.8.8'];
+  const selected = { taskText: 'Check the page', targetUrl: secondUrl,
     executionProfileRef: bundle.approval.executionProfileRef };
-  await expect(runLocalWorkflow(otherPath, config, noCredential,
-    { modelAdapters: unavailableModels })).rejects.toMatchObject({ code: 'DESTINATION_DENIED' });
-  const tampered = structuredClone(config);
-  tampered.networkPolicies[0]!.destinations.push({
-    host: 'other-public-site.org', ports: [443], addresses: ['8.8.8.8'],
-  });
-  expect(() => parseTrustedLocalConfiguration(tampered)).toThrow();
-  const changedSettings = structuredClone(config);
-  changedSettings.profiles[0]!.viewport.width = 1440;
-  changedSettings.publicTargetApproval.profileFingerprint = new ProfileCatalog(
-    changedSettings.profiles, changedSettings.networkPolicies,
-  ).resolve(bundle.approval.executionProfileRef).fingerprint;
-  expect(() => parseTrustedLocalConfiguration(changedSettings)).toThrow();
-  const policy = new ProfileCatalog([bundle.profile], [bundle.policy])
-    .resolve(bundle.approval.executionProfileRef).policy;
-  await expect(resolveApprovedAddress(new URL('https://redirect.other-public-site.org/'), policy,
-    async () => ['8.8.8.8'])).rejects.toThrow('Destination denied');
-  await expect(resolveApprovedAddress(new URL('https://cdn.other-public-site.org/a.js'), policy,
-    async () => ['8.8.8.8'])).rejects.toThrow('Destination denied');
-  await expect(resolveApprovedAddress(new URL(firstUrl), policy,
-    async () => ['93.184.215.15'])).rejects.toThrow('Destination address denied');
-  await expect(resolveApprovedAddress(new URL(firstUrl), policy,
-    firstDns)).resolves.toBe('93.184.215.14');
+  const outcome = await runLocalWorkflow(selected, changed, noCredential,
+    { modelAdapters: unavailableModels });
+  expect(outcome.handoff.kind).toBe('stopped');
+  expect(outcome.handoff.kind === 'stopped' && outcome.handoff.result.reason).toBe('MODEL_ERROR');
+  const baseline = new ProfileCatalog(config.profiles, config.networkPolicies)
+    .resolve(bundle.approval.executionProfileRef);
+  const afterPinChange = new ProfileCatalog(changed.profiles, changed.networkPolicies)
+    .resolve(bundle.approval.executionProfileRef);
+  expect(afterPinChange.fingerprint).toBe(baseline.fingerprint);
 });
 
 test('P3-A versioned read-only lookup returns only a correlated approval or denial', async () => {

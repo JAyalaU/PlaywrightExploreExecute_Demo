@@ -3,6 +3,7 @@ import { ExecutionProfileRefSchema, ApprovedAbsoluteUrlSchema } from './schema.j
 import { ActionGoalV2Schema } from './action-goal-v2.js';
 import { GroundingCorrespondenceV1Schema } from './action-grounding-strategy.js';
 import { ActionCandidateRequestV1Schema, ActionCandidatePredicateV1Schema, candidateGroundingDigest as hash } from './action-candidate-grounding.js';
+import { ActionCandidateRoleV1Schema } from './action-candidate-grounding.js';
 import { ActionGroundingWitnessV1Schema, parseActionGroundingWitnessV1 } from './action-grounding-execution.js';
 import { ActionGroundingRetirementV1Schema, parseActionGroundingRetirementV1 } from './action-grounding-execution.js';
 import { ActionExecutionAttemptV1Schema, parseActionExecutionAttemptV1 } from './action-grounding-execution.js';
@@ -28,8 +29,8 @@ export const DeferredActionGuardV1Schema = z.strictObject({ guardVersion: z.lite
   sourceGoal: ActionGoalV2Schema, correspondence: GroundingCorrespondenceV1Schema,
   request: ActionCandidateRequestV1Schema, predicate: ActionCandidatePredicateV1Schema, mappingDigest: digest,
   frame: DurableDeferredFrameV1Schema, completeRequired: z.literal(true), eligibleCount: z.literal(1),
-  nativeEffect: z.enum(['entered_text', 'native_choice', 'native_activation']),
-  nativeControl: z.enum(['input', 'textarea', 'select', 'checkbox', 'radio']),
+  nativeEffect: z.enum(['entered_text', 'native_choice', 'native_activation', 'generic_activation']),
+  nativeControl: z.union([z.enum(['input', 'textarea', 'select']), ActionCandidateRoleV1Schema]),
   labelMode: z.literal('proven_native_label_or_aria_labelledby'),
   optionMode: z.literal('exact_owned_authored_label_unique_value'),
   argumentPolicy: z.literal('require_fresh_mapping_equal_compiled_argument') });
@@ -168,7 +169,7 @@ export function parseResolvedTestSpecV9(input: unknown, trace: SuccessfulExplora
       const fresh=compiler.freshActions.find(a=>a.traceRecordId===record.recordId)?.witness;
       if (!fresh) throw new Error('MISSING_FRESH_WITNESS');
       const p=fresh.finalCheck,candidate=p.candidateObservation.status==='complete'&&p.candidateObservation.candidates.find(c=>c.selectedRef===p.selectedRef&&c.frameId===p.frameId),effect=fresh.postEffect.effect;
-      const control=effect.kind==='entered_text'?effect.nativeControl:effect.kind==='native_choice'?'select':effect.nativeInputType;
+      const control=effect.kind==='entered_text'?effect.nativeControl:effect.kind==='native_choice'?'select':effect.kind==='native_activation'?effect.nativeInputType:effect.role;
       if (!candidate || !same(s.guard.sourceGoal,p.sourceGoal) || !same(s.guard.correspondence,p.correspondence) || !same(s.guard.request,p.candidateObservation.request) ||
         !same(s.guard.predicate,p.candidateObservation.predicate) || s.guard.mappingDigest!==p.mappingDigest || !same(s.guard.frame,durableDeferredFrame(candidate.frame)) ||
         s.operation!==p.operation || s.authoredArgument!==p.argument?.authoredText || s.executableArgument!==p.argument?.executableValue ||

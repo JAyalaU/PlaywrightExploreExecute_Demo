@@ -2,7 +2,6 @@
 set -eu
 
 : "${PUBLIC_BROWSER_CONTROL_TOKEN:?PUBLIC_BROWSER_CONTROL_TOKEN is required}"
-: "${PUBLIC_BROWSER_PROXY:?PUBLIC_BROWSER_PROXY is required}"
 
 chromium="$(find /ms-playwright -type f \
   \( -path '*/chrome-linux64/chrome' -o -path '*/chrome-linux/chrome' \) \
@@ -73,9 +72,6 @@ fi
   --no-default-browser-check \
   --disable-background-networking \
   --disable-quic \
-  --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
-  --proxy-server="$PUBLIC_BROWSER_PROXY" \
-  --proxy-bypass-list='<-loopback>' \
   "$@" &
 chromium_pid=$!
 set +e

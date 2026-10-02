@@ -6,8 +6,7 @@ import {
   type InterpretationModel, type StepDecisionModel,
 } from '../interpretation/index.js';
 import {
-  ProfileCatalog, ProtectedContextFactory, profilePresentationMode, resolveApprovedAddress,
-  publicTargetGate, requiresExternalReview,
+  ProfileCatalog, ProtectedContextFactory, profilePresentationMode,
   type EffectiveProfile, type ProfileRef, type ProtectedBrowserSession, type ProtectedSessionOptions,
 } from '../profile/index.js';
 import {
@@ -177,21 +176,7 @@ export async function runLocalWorkflow(
   catch { throw new LocalWorkflowError('PROFILE_UNAVAILABLE'); }
 
   if (options.signal?.aborted) throw new LocalWorkflowError('CANCELLED');
-  const approval = config.publicTargetApproval;
-  const selectedApproval = approval &&
-    approval.executionProfileRef.id === request.executionProfileRef.id &&
-    approval.executionProfileRef.version === request.executionProfileRef.version;
-  if ((selectedApproval && request.targetUrl !== approval.targetUrl) ||
-      (requiresExternalReview(effective) && !selectedApproval &&
-        !trustedDependencies.externalTargetGate)) throw new LocalWorkflowError('DESTINATION_DENIED');
-  const externalGate = selectedApproval ? publicTargetGate(approval)
-    : trustedDependencies.externalTargetGate;
-  if (requiresExternalReview(effective)) {
-    try { await externalGate!.authorize(effective); }
-    catch { throw new LocalWorkflowError('DESTINATION_DENIED'); }
-  }
-  try { await resolveApprovedAddress(new URL(request.targetUrl), effective.policy); }
-  catch { throw new LocalWorkflowError('DESTINATION_DENIED'); }
+  const externalGate = undefined;
 
   let models: NonNullable<LocalWorkflowOptions['modelAdapters']>;
   try { models = options.modelAdapters ?? createOpenAIModelAdapters(trustedDependencies.provider); }
