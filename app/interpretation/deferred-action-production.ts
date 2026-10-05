@@ -21,6 +21,7 @@ import { DeferredReplayV9Store, requireTrustedDeferredReplayReadbackV1 } from '.
 import { DeferredWorkflowStopStoreV1 } from '../evidence/deferred-workflow-store.js';
 import { DeferredInterpretationAttemptStoreV1 } from '../evidence/deferred-interpretation-attempt-store.js';
 import { runDeferredTwoFreshReplaysV1, requireTrustedDeferredReplayV1 } from './deferred-action-replay.js';
+import { DeferredViewerPreflightError, type DeferredViewerPhase } from '../observability/deferred-viewer-channel.js';
 import { DeferredGroundingStopDiagnosticV1Schema, DeferredWorkflowPrivateAccountingV1Schema } from '../domain/deferred-workflow-accounting.js';
 import { z } from 'zod';
 import { projectDeferredReportV2 } from '../subprocess/deferred-report-projection-v2.js';
@@ -63,7 +64,8 @@ class StageStop extends Error {
 }
 /** Single family composition. Every downstream stage receives the actual capability issued by its predecessor. */
 export async function runDeferredActionProductionV1(factory: ProtectedContextFactory, artifactRoot: string,
-  request: InterpretationRequest, models: DeferredProductionModelsV1, options: { signal?: AbortSignal } = {}): Promise<{
+  request: InterpretationRequest, models: DeferredProductionModelsV1,
+  options: { signal?: AbortSignal; onBrowserPhase?: (phase: DeferredViewerPhase) => void } = {}): Promise<{
     result: ResultRecordV2; reportAvailable: boolean;
   }> {
   const profile = factory.catalog.resolve(request.executionProfileRef);
@@ -153,7 +155,13 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
       catch { throw new StageStop('interpretation', 'persistence', 'PERSISTENCE_FAILED'); }
     }
     stage = 'grounding'; explorationAttemptId = `exploration-${randomUUID()}`;
-    session = await recordStartup('session_open', () => McpExplorationSession.open(factory, source.executionProfileRef, profile, explorationAttemptId));
+    options.onBrowserPhase?.('exploration');
+    try {
+      session = await recordStartup('session_open', () => McpExplorationSession.open(factory, source.executionProfileRef, profile, explorationAttemptId));
+    } catch (error) {
+      if (error instanceof DeferredViewerPreflightError) cleanup = error.cleanup;
+      throw error;
+    }
     cleanup = 'verified';
     await recordStartup('root_navigation', () => session!.navigate(source.startState.url)); cancelled();
     const runtime = new ActionCandidateGroundingSessionV1(session, admission, explorationAttemptId);
@@ -287,6 +295,7 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
     successfulTraceId = trace.protectedArtifact().trace.successfulTraceId; traceDigest = trace.protectedArtifact().trace.traceDigest;
     try { await session.close(); } catch { cleanup = 'unverified'; throw new StageStop('trace', 'environment', 'SESSION_CLEANUP_FAILED'); }
     session = undefined; cancelled(); stage = 'compilation';
+    options.onBrowserPhase?.('compilation');
     const compiled = await compileDeferredSuccessfulTraceV5(factory, trace);
     accounting.compilerAttempt = parseCompilerAttemptV4(requireTrustedDeferredCompilationV4(compiled.artifact).compiler,
       requireTrustedSuccessfulTraceReadbackV5(trace).trace);
@@ -301,7 +310,8 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
       compiled.compiler.result.status === 'rejected' ? compiled.compiler.result.reasonCode : 'SOURCE_CORRESPONDENCE');
     cancelled(); stage = 'environment';
     // Exact unchanged WP4B handoff: authenticated v9 -> runtime pair -> authenticated pair/result -> safe projection.
-    const pair = await runDeferredTwoFreshReplaysV1(factory, v9);
+    const pair = await runDeferredTwoFreshReplaysV1(factory, v9,
+      ordinal => options.onBrowserPhase?.(ordinal === 1 ? 'replay_1' : 'replay_2'));
     accounting.replay = requireTrustedDeferredReplayV1(pair);
     let stored;
     try { stored = await new DeferredReplayV9Store(artifactRoot).writeReplayV1(pair, v9); }

@@ -7,6 +7,7 @@ import type { TrustedObservationResultV1 } from '../domain/observation-contracts
 import { requireTrustedSuccessfulTraceReadbackV5, type TrustedSuccessfulTraceReadbackV5 } from '../evidence/trace-store-v5.js';
 import { ProtectedContextFactory, assertEquivalentEffectiveProfile } from '../profile/index.js';
 import { McpExplorationSession, MCP_VERSION } from './mcp.js';
+import { DeferredViewerPreflightError } from '../observability/deferred-viewer-channel.js';
 import { ActionCandidateGroundingSessionV1, ActionCandidateGroundingError } from './action-candidate-grounding.js';
 import { TrustedObservationSessionV1 } from './trusted-observation.js';
 import { evaluateDeferredAssertionV1 as evaluation } from '../domain/deferred-action-compiler.js';
@@ -214,7 +215,8 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
       freshFinalState={sessionId:runtime.sessionId,pageId:state.pageId,stateDigest:state.stateDigest,
         stateEpoch:state.stateEpoch,mutationEpoch:state.mutationEpoch};
     }else freshFinalState=await point();
-  }catch(error){reason=error instanceof Stop?error.reason:observationThrew?
+  }catch(error){if(error instanceof DeferredViewerPreflightError&&error.cleanup==='unverified')cleanup='unverified';
+    reason=cleanup==='unverified'?'CLEANUP_UNVERIFIED':error instanceof Stop?error.reason:observationThrew?
       error instanceof ActionCandidateGroundingError&&error.reason==='STALE_STATE'?'STALE_EVIDENCE':
       error instanceof ActionCandidateGroundingError&&error.reason==='RESULT_LIMIT'?'INCOMPLETE_EVIDENCE':'ENVIRONMENT_FAILURE':
       error instanceof ActionCandidateGroundingError?reasonFor(error):'ENVIRONMENT_FAILURE';

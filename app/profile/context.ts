@@ -29,6 +29,11 @@ export interface ProtectedSessionOptions {
   observationOwner?: { kind: 'attempt' | 'run'; id: string };
 }
 
+/** Trusted presentation choice. It does not alter the execution profile or QA artifacts. */
+export interface ProtectedFactoryPresentationOptions {
+  viewOnlyHeaded?: boolean;
+}
+
 /** Cleanup completed, but the trusted final read before teardown failed. */
 export class ProtectedFinalCheckError extends Error {
   constructor(readonly checkError: unknown) { super('Protected final read failed'); }
@@ -57,9 +62,11 @@ export class ProtectedBrowserSession {
 
   /** Used only by restricted runtime proofs; never part of persisted TestSpec data. */
   get isolationContainerId(): string | undefined { return this.#isolated?.containerId; }
-  /** Private viewer bridge requires a separately approved headed session. */
+  /** The viewer can observe only the same physically headed isolated Chromium. */
+  get isViewerHeaded(): boolean { return !this.isClosed && this.#isolated?.isHeaded === true; }
+  /** Private viewer bridge requires a physically headed isolated session. */
   openRfbBridge(): ReturnType<IsolatedBrowser['openRfbBridge']> {
-    if (this.isClosed || profilePresentationMode(this.effectiveProfile.profile) !== 'headed' || !this.#isolated) {
+    if (!this.isViewerHeaded || !this.#isolated) {
       throw new Error('Headed RFB session unavailable');
     }
     return this.#isolated.openRfbBridge();
@@ -105,7 +112,8 @@ export class ProtectedBrowserSession {
 
 export class ProtectedContextFactory {
   constructor(readonly catalog: ProfileCatalog, readonly authProvider?: AuthStateProvider,
-    readonly externalTargetGate?: ExternalTargetGate) {}
+    readonly externalTargetGate?: ExternalTargetGate,
+    readonly presentationOptions: ProtectedFactoryPresentationOptions = {}) {}
 
   /** Optional bounded presentation pause; ordinary and headless factories do nothing. */
   async pauseForObservation(_session: ProtectedBrowserSession): Promise<void> {}
@@ -115,12 +123,18 @@ export class ProtectedContextFactory {
     const effective = this.catalog.resolve(reference);
     if (expected) assertEquivalentEffectiveProfile(expected, effective);
     if (effective.profile.authStateRef && !this.authProvider) throw new Error('Protected auth-state provider is unavailable');
+    if (this.presentationOptions.viewOnlyHeaded &&
+        (!('browserIsolation' in effective.profile) || effective.profile.browserIsolation !== 'docker')) {
+      throw new Error('View-only headed presentation requires an isolated browser');
+    }
 
     let browser: Browser | undefined;
     let isolated: IsolatedBrowser | undefined;
     try {
       if ('browserIsolation' in effective.profile && effective.profile.browserIsolation === 'docker') {
-        isolated = await IsolatedBrowser.open(profilePresentationMode(effective.profile));
+        isolated = await IsolatedBrowser.open(this.presentationOptions.viewOnlyHeaded
+          ? 'headed' : profilePresentationMode(effective.profile),
+        { observationalSlowMo: !this.presentationOptions.viewOnlyHeaded });
         browser = isolated.browser;
       } else browser = await chromium.launch({
         headless: profilePresentationMode(effective.profile) === 'headless',

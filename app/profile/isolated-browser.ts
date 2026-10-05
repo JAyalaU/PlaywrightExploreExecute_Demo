@@ -154,8 +154,11 @@ export class IsolatedBrowser {
 
   /** Runtime proof only; never persist this Docker identity in TestSpec artifacts. */
   get containerId(): string { return this.#container; }
+  /** Physical display mode of this isolated Chromium, independent of profile metadata. */
+  get isHeaded(): boolean { return this.#headed; }
 
-  static async open(presentationMode: 'headless' | 'headed' = 'headless'): Promise<IsolatedBrowser> {
+  static async open(presentationMode: 'headless' | 'headed' = 'headless',
+    options: { observationalSlowMo?: boolean } = {}): Promise<IsolatedBrowser> {
     const name = `public-browser-g1-${randomUUID().replaceAll('-', '')}`;
     const token = randomUUID();
     let container: string | undefined;
@@ -202,7 +205,7 @@ export class IsolatedBrowser {
       // keeps its original timing and remains the autonomous result.
       const browser = await chromium.connectOverCDP(transport, {
         isLocal: false, timeout: 10_000,
-        ...(presentationMode === 'headed' ? { slowMo: 750 } : {}),
+        ...(presentationMode === 'headed' && options.observationalSlowMo !== false ? { slowMo: 750 } : {}),
       });
       return new IsolatedBrowser(browser, container, control, presentationMode === 'headed');
     } catch (error) {

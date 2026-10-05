@@ -10,6 +10,8 @@ import { envelopeForAgenticTerminalV2 } from '../subprocess/protocol-v2.js';
 import { toInterpretationRequest, type LocalWorkflowRequest, type TrustedLocalConfiguration,
   type LocalWorkflowTrustedDependencies } from './contracts.js';
 import { LocalWorkflowError } from './workflow.js';
+import { DeferredViewerLifecycle, DeferredViewerPreflightError,
+  type DeferredViewerPhase } from '../observability/deferred-viewer-channel.js';
 
 /** Trusted offline-review gate is launch state. Neither the task nor wire request selects it. */
 export function deferredWorkflowOfflineReviewEnabled(): boolean {
@@ -27,12 +29,29 @@ export async function runDeferredLocalWorkflowV1(request: LocalWorkflowRequest, 
       grounding: mapping!.primary, independentGrounding: mapping!.independent,
       verification: createOpenAIVerificationDecisionModel(dependencies.provider),nativeVerification:createOpenAINativeOptionVerificationModelV6(dependencies.provider) };
   } catch { throw new LocalWorkflowError('PROVIDER_CONFIGURATION_ERROR'); }
+  const requestForModel = toInterpretationRequest(request, `local-${randomUUID()}`);
+  const viewOnlyHeaded = process.env.PLAYWRIGHT_DEMO_LIVE_VIEW === '1';
+  let viewer: DeferredViewerLifecycle | undefined;
+  if (viewOnlyHeaded) {
+    try { viewer = await DeferredViewerLifecycle.connect(requestForModel.testSpecId); }
+    catch { throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION'); }
+  }
+  let browserPhase: DeferredViewerPhase | undefined;
   const sessions = new Set<ProtectedBrowserSession>();
   class ManagedFactory extends ProtectedContextFactory {
     override async open(ref: ProfileRef, expected?: EffectiveProfile, sessionOptions?: ProtectedSessionOptions) {
       if (options.signal?.aborted) throw new LocalWorkflowError('CANCELLED');
       const session = await super.open(ref, expected, sessionOptions); sessions.add(session);
       if (options.signal?.aborted) { await session.close(); throw new LocalWorkflowError('CANCELLED'); }
+      if (viewer) {
+        try {
+          if (!browserPhase || !sessionOptions?.observationOwner) throw new Error('Deferred viewer phase owner unavailable');
+          await viewer.open(session, browserPhase, sessionOptions.observationOwner.id);
+        } catch {
+          try { await session.close(); } catch { throw new DeferredViewerPreflightError('unverified'); }
+          throw new DeferredViewerPreflightError('verified');
+        }
+      }
       return session;
     }
   }
@@ -45,15 +64,16 @@ export async function runDeferredLocalWorkflowV1(request: LocalWorkflowRequest, 
   const aborted = () => { cancellationCleanup = close(); void cancellationCleanup.catch(() => undefined); };
   options.signal?.addEventListener('abort', aborted, { once: true });
   try {
-    const outcome = await runDeferredActionProductionV1(new ManagedFactory(catalog, dependencies.authProvider, gate),
-      config.artifactRoot, toInterpretationRequest(request, `local-${randomUUID()}`), models,
-      options.signal ? { signal: options.signal } : {});
+    const outcome = await runDeferredActionProductionV1(new ManagedFactory(catalog, dependencies.authProvider, gate,
+      { viewOnlyHeaded }), config.artifactRoot, requestForModel, models,
+      { ...(options.signal ? { signal: options.signal } : {}),
+        ...(viewer ? { onBrowserPhase: (phase: DeferredViewerPhase) => { browserPhase = phase; } } : {}) });
     await cancellationCleanup; await close();
     if (options.signal?.aborted) return { protocolVersion: '2' as const, kind: 'bridge_error' as const,
       code: 'CANCELLED' as const, cleanup: outcome.result.cleanup === 'unverified' ? 'unverified' as const : 'verified' as const };
     return envelopeForAgenticTerminalV2(outcome.result, outcome.reportAvailable);
   } finally {
     options.signal?.removeEventListener('abort', aborted);
-    try { await close(); } finally { sessions.clear(); }
+    try { await close(); } finally { sessions.clear(); viewer?.close(); }
   }
 }

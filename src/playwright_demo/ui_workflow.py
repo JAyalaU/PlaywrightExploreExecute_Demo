@@ -18,6 +18,7 @@ from .host import (
 from .live_events import LiveEventBuffer
 from .live_images import LiveImageBuffer
 from .live_viewer import LiveViewerBuffer
+from .deferred_live_viewer import DeferredViewerBuffer
 from .public_admission import lookup_public_admission
 from .protocol import DEFAULT_DEADLINE_MS, REASONS, STATUSES
 from .report_projection import call_report_projection
@@ -88,6 +89,7 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
                     live_events: LiveEventBuffer | None = None,
                     live_images: LiveImageBuffer | None = None,
                     live_viewer: LiveViewerBuffer | None = None,
+                    deferred_viewer: DeferredViewerBuffer | None = None,
                     cancel_event: threading.Event | None = None,
                     workflow_version: Literal["legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"] = "legacy") -> UiFinalResult:
     """Select trusted authority, execute one v1 request, then fetch safe metadata.
@@ -98,6 +100,9 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
         raise ValueError("Unsupported trusted workflow selection")
     if workflow_version == "deferred-action-v1" and os.environ.get("PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE") != "offline-review":
         return UiFinalResult("workflow_unavailable", workflow_version=workflow_version)
+    if deferred_viewer is not None and (workflow_version != "deferred-action-v1" or
+                                        os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") != "1"):
+        raise ValueError("Deferred viewer requires trusted live-view selection")
     # Trusted workflow selection, not task/form input, chooses the gated demo default.
     # An explicit host deadline remains an operator/test override validated by call_node.
     host_deadline_ms = deadline_ms if deadline_ms is not None else (
@@ -141,6 +146,8 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
         return UiFinalResult("admission_unavailable")
     if approval["admissionVersion"] == "2" and live_viewer is not None:
         live_viewer.mark_connecting()
+    if deferred_viewer is not None:
+        deferred_viewer.mark_connecting()
     _diagnostic("admission_approved")
     if agentic:
         if live_events is not None: live_events.mark_unavailable()
@@ -152,7 +159,7 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
     }}
     _diagnostic("engine_started")
     try:
-        options = {"protocol_version": "2"} if agentic else {
+        options = {"protocol_version": "2", "deferred_viewer": deferred_viewer} if agentic else {
             "live_events": live_events, "live_images": live_images,
             "live_viewer": live_viewer if approval["admissionVersion"] == "2" else None}
         result = call_node(wire, node_entry=engine_entry, config_path=config_path,
@@ -207,11 +214,13 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
 def run_local_ui_request(request: UiRequest, *, live_events: LiveEventBuffer | None = None,
                          live_images: LiveImageBuffer | None = None,
                          live_viewer: LiveViewerBuffer | None = None,
+                         deferred_viewer: DeferredViewerBuffer | None = None,
                          cancel_event: threading.Event | None = None) -> UiFinalResult:
     """Guarded Streamlit entry: trusted launch environment chooses the config."""
     return run_ui_workflow(request, config_path=os.environ.get("PLAYWRIGHT_DEMO_TRUSTED_CONFIG"),
                            live_events=live_events, live_images=live_images,
                            live_viewer=live_viewer,
+                           deferred_viewer=deferred_viewer,
                            cancel_event=cancel_event,
                            workflow_version=os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION", "legacy"))
 

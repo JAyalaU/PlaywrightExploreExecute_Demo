@@ -11,6 +11,7 @@ const MAX_RFB_MESSAGE = 8 * 1024 * 1024;
 const MAX_ASSET = 1024 * 1024;
 const TOKEN_MS = 60_000;
 const MAX_SESSION_MS = 10 * 60_000;
+const MAX_DEFERRED_SESSION_MS = 20 * 60_000;
 const ORIGIN = 'http://127.0.0.1:8501';
 const assetScript = String.raw`
 const fs = require('node:fs/promises'), path = require('node:path');
@@ -235,6 +236,7 @@ export class ViewerGateway {
   readonly #port: number;
   readonly #deadline: ReturnType<typeof setTimeout>;
   readonly #onVacant: (() => void) | undefined;
+  readonly #onUnavailable: (() => void) | undefined;
   #capability = randomBytes(32).toString('hex');
   #expiresAt = Date.now() + TOKEN_MS;
   #active: Duplex | undefined;
@@ -242,10 +244,10 @@ export class ViewerGateway {
   #closed = false;
 
   private constructor(session: ProtectedBrowserSession, server: http.Server, port: number,
-    onVacant?: () => void) {
+    onVacant?: () => void, options: { sessionLifetimeMs?: number; onUnavailable?: () => void } = {}) {
     this.#session = session; this.#server = server; this.#port = port;
-    this.#onVacant = onVacant;
-    this.#deadline = setTimeout(() => this.close(), MAX_SESSION_MS);
+    this.#onVacant = onVacant; this.#onUnavailable = options.onUnavailable;
+    this.#deadline = setTimeout(() => this.#unavailable(), options.sessionLifetimeMs ?? MAX_SESSION_MS);
   }
 
   get port(): number { return this.#port; }
@@ -253,10 +255,14 @@ export class ViewerGateway {
   get expiresAt(): string { return new Date(this.#expiresAt).toISOString(); }
   get path(): '/rfb' { return '/rfb'; }
 
-  static async start(session: ProtectedBrowserSession, onVacant?: () => void): Promise<ViewerGateway> {
-    if (!('profileSchemaVersion' in session.effectiveProfile.profile) ||
-        session.effectiveProfile.profile.profileSchemaVersion !== '4' || !session.isolationContainerId)
-      throw new Error('Approved headed isolated session required');
+  static async start(session: ProtectedBrowserSession, onVacant?: () => void,
+    options: { sessionLifetimeMs?: number; onUnavailable?: () => void } = {}): Promise<ViewerGateway> {
+    if (!session.isViewerHeaded || !session.isolationContainerId)
+      throw new Error('Headed isolated session required');
+    if (options.sessionLifetimeMs !== undefined &&
+        (!Number.isSafeInteger(options.sessionLifetimeMs) || options.sessionLifetimeMs < 1 ||
+          options.sessionLifetimeMs > MAX_DEFERRED_SESSION_MS))
+      throw new Error('Viewer lifetime invalid');
     // The view-only server must already be live before the task uses Chromium.
     // This private preflight never publishes a port or forwards RFB to a client.
     await new Promise<void>((resolve, reject) => {
@@ -284,10 +290,17 @@ export class ViewerGateway {
         else resolve(address.port);
       });
     });
-    const gateway = new ViewerGateway(session, server, ready, onVacant);
+    const gateway = new ViewerGateway(session, server, ready, onVacant, options);
     server.on('request', (request, response) => { void gateway.#serve(request, response); });
     server.on('upgrade', (request, socket, head) => gateway.#upgrade(request, socket, head));
+    server.on('error', () => gateway.#unavailable());
     return gateway;
+  }
+
+  #unavailable(): void {
+    if (this.#closed) return;
+    this.close();
+    try { this.#onUnavailable?.(); } catch { /* Viewer failure has no QA authority. */ }
   }
 
   #headers(): Record<string, string> {
@@ -403,8 +416,8 @@ export class ViewerGateway {
       } catch { reconnectAllowed = false; dispose(); }
     });
     socket.once('close', dispose); socket.once('error', dispose);
-    bridge.once('close', () => { reconnectAllowed = false; dispose(); });
-    bridge.once('error', () => { reconnectAllowed = false; dispose(); });
+    bridge.once('close', () => { if (disposed) return; reconnectAllowed = false; dispose(); this.#unavailable(); });
+    bridge.once('error', () => { if (disposed) return; reconnectAllowed = false; dispose(); this.#unavailable(); });
   }
 
   /** A reconnect requires a fresh capability from the authenticated lifecycle channel. */

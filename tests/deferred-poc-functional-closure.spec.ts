@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { ProtectedContextFactory } from '../app/profile/index.js';
 import { runAgenticSubprocessAdapterV2 } from '../app/subprocess/agentic-entry.js';
@@ -14,6 +16,7 @@ import { successfulTraceDigestV5 } from '../app/domain/agentic-trace-v5.js';
 import { candidateGroundingDigest as hash } from '../app/domain/action-candidate-grounding.js';
 import { parseDeferredRunnerRecordV9 } from '../app/domain/deferred-action-runner.js';
 import { deferredFiveStepSource } from './helpers/deferred-five-step-source.js';
+import { DeferredViewerNoticeSchema, type DeferredViewerNotice } from '../app/observability/deferred-viewer-channel.js';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -28,14 +31,17 @@ const optionMarkup = '<select><option value="">Please select an option</option>'
   '<option value="1">Option 1</option><option value="2">Option 2</option></select>';
 type Case = 'normal' | 'duplicate_links' | 'wrong_url' | 'duplicate_selects' | 'missing_option' |
   'replay_disagreement' | 'next_observation_unavailable' | 'compiler_url_snapshot_unavailable' |
-  'runner_url_snapshot_unavailable' | 'runner_no_page' | 'runner_closed_page' | 'direct_action';
+  'runner_url_snapshot_unavailable' | 'runner_no_page' | 'runner_closed_page' | 'direct_action' |
+  'runner_unrelated_drift' | 'runner_missing_select' | 'runner_duplicate_selects' |
+  'runner_missing_option' | 'runner_changed_option' | 'runner_frame_drift';
 
-async function fixture(mode: Case) {
+async function fixture(mode: Case, isolated = false) {
   const artifactRoot = await mkdtemp(path.join(tmpdir(), 'deferred-poc-closure-'));
   const config = {
     profiles: [{ id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 },
       locale: 'en-US', timeoutPolicy: { actionMs: 5000, navigationMs: 5000, waits: { default: 3000 } },
-      networkPolicyRef: { id: 'fixture', version: '1' } }],
+      networkPolicyRef: { id: 'fixture', version: '1' },
+      ...(isolated ? { profileSchemaVersion: '3', presentationMode: 'headless', browserIsolation: 'docker' } : {}) }],
     networkPolicies: [{ id: 'fixture', version: '1', destinations: [{ host: 'the-internet.herokuapp.com',
       ports: [443], addresses: ['127.0.0.1'] }] }],
     evidencePolicy: { finalScreenshot: false, failureScreenshot: false, failureTrace: false,
@@ -89,6 +95,7 @@ async function fixture(mode: Case) {
 
   const originalOpen = ProtectedContextFactory.prototype.open;
   const routed: string[] = [], denied: string[] = [], openedContexts: object[] = [];
+  let runnerDrifts = 0;
   ProtectedContextFactory.prototype.open = async function (...args) {
     const browser = await originalOpen.apply(this, args);
     const ordinal = openedContexts.push(browser.context);
@@ -105,6 +112,20 @@ async function fixture(mode: Case) {
         if (mode === 'runner_no_page') browser.context.pages = () => [];
         else page.isClosed = () => true;
       }));
+    if (mode === 'runner_unrelated_drift' && ordinal >= 3)
+      browser.context.on('page', (page) => page.on('framenavigated', (frame) => {
+        if (frame !== page.mainFrame() || frame.url() !== dropdownUrl) return;
+        const content = frame.content.bind(frame); let drifted = false;
+        frame.content = async () => {
+          const snapshot = await content();
+          if (!drifted) {
+            drifted = true;
+            await page.evaluate(() => { document.body.appendChild(document.createElement('aside')); });
+            runnerDrifts++;
+          }
+          return snapshot;
+        };
+      }));
     await browser.context.route('**/*', async (route) => {
       const url = route.request().url();
       routed.push(url);
@@ -116,9 +137,14 @@ async function fixture(mode: Case) {
         await route.fulfill({ status: 200, contentType: 'text/html',
           body: mode === 'duplicate_links' ? links + links : links });
       } else if (url === dropdownUrl || url === wrongUrl) {
-        const options = mode === 'missing_option' ? '<select><option>Option 2</option></select>' : optionMarkup;
+        const runner = ordinal >= 3;
+        const options = mode === 'missing_option' || runner && mode === 'runner_missing_option' ?
+          '<select><option>Option 2</option></select>' : runner && mode === 'runner_changed_option' ?
+          optionMarkup.replace('value="1"', 'value="changed"') : optionMarkup;
         await route.fulfill({ status: 200, contentType: 'text/html',
-          body: mode === 'duplicate_selects' ? options + options : options });
+          body: runner && mode === 'runner_missing_select' ? '<main></main>' :
+            runner && mode === 'runner_frame_drift' ? `<iframe title="Other" srcdoc='${options}'></iframe>` :
+            mode === 'duplicate_selects' || runner && mode === 'runner_duplicate_selects' ? options + options : options });
       } else { denied.push(url); await route.abort('blockedbyclient'); }
     });
     return browser;
@@ -126,6 +152,7 @@ async function fixture(mode: Case) {
   const oldGate = process.env[gate]; process.env[gate] = 'offline-review';
   return {
     artifactRoot, config, request, providerFormats, routed, denied, openedContexts,
+    runnerDrifts: () => runnerDrifts,
     run: () => runAgenticSubprocessAdapterV2(Readable.from([JSON.stringify({ protocolVersion: '2', request })]),
       async () => config, { provider: { apiKey: () => 'MOCK_ONLY', fetchImpl } },
       { workflowVersion: 'deferred-action-v1' }),
@@ -252,6 +279,84 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
   } finally { await f.close(); }
 });
 
+test('trusted live view follows the same four protected sessions and preserves five-step QA', async () => {
+  test.setTimeout(180_000);
+  const baseline = await fixture('normal', true);
+  let baselineStatus: string;
+  try {
+    const response = await baseline.run();
+    if (response.kind === 'bridge_error') throw new Error('Baseline bridge error');
+    baselineStatus = response.context.result.terminal.status;
+    expect(baselineStatus).toBe('QA_ASSERTION_PASSED');
+  } finally { await baseline.close(); }
+
+  const streamId = randomUUID(), capability = randomBytes(32).toString('hex');
+  const notices: DeferredViewerNotice[] = [];
+  let wireError: unknown;
+  let finishWire!: () => void;
+  const wireEnded = new Promise<void>(resolve => { finishWire = resolve; });
+  const wireSockets = new Set<net.Socket>();
+  const server = net.createServer(socket => {
+    wireSockets.add(socket);
+    let pending = '', greeted = false;
+    socket.on('data', bytes => {
+      pending += bytes.toString('utf8');
+      let end: number;
+      while ((end = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, end); pending = pending.slice(end + 1);
+        try {
+          const value: unknown = JSON.parse(line);
+          if (!greeted) {
+            expect(value).toEqual({ deferredViewerVersion: '1', kind: 'hello', streamId, capability });
+            greeted = true;
+            socket.write(JSON.stringify({ deferredViewerVersion: '1', kind: 'ready', streamId }) + '\n');
+          } else notices.push(DeferredViewerNoticeSchema.parse(value));
+        } catch (error) { wireError = error; socket.destroy(); }
+      }
+    });
+    socket.on('close', () => { wireSockets.delete(socket); finishWire(); });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('No loopback listener');
+  const envKeys = ['PLAYWRIGHT_DEMO_LIVE_VIEW', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT',
+    'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_STREAM_ID', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_CAPABILITY'] as const;
+  const oldEnv = envKeys.map(key => process.env[key]);
+  process.env[envKeys[0]] = '1'; process.env[envKeys[1]] = String(address.port);
+  process.env[envKeys[2]] = streamId; process.env[envKeys[3]] = capability;
+  const live = await fixture('normal', true);
+  try {
+    const response = await live.run();
+    if (response.kind === 'bridge_error') throw new Error(`Live-view bridge error: ${response.code}`);
+    await Promise.race([wireEnded, new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error('Viewer channel did not close')), 5000))]);
+    if (wireError) throw wireError;
+    const result = response.context.result;
+    expect(result.terminal.status, JSON.stringify({ result, notices })).toBe(baselineStatus);
+    expect(result.cleanup).toBe('verified');
+    expect(result.presentationMode).toBe('headless'); // Accepted profile mode; live rendering is view-only.
+    expect(result.observation).toBe('unobserved');
+    expect(result.executionRunIds).toHaveLength(2);
+    expect(new Set(live.openedContexts).size).toBe(4);
+    expect(live.denied).toEqual([]);
+    const phases = ['exploration', 'compilation', 'replay_1', 'replay_2'];
+    const expectedOwners = [result.explorationAttemptId, result.compilerAttemptId,
+      ...result.executionRunIds];
+    expect(notices.filter(n => n.kind === 'ready').map(n => n.phase)).toEqual(phases);
+    expect(notices.filter(n => n.kind === 'ready').map(n => n.ownerId)).toEqual(expectedOwners);
+    expect(notices.filter(n => n.kind === 'closed').map(n => n.phase)).toEqual(phases);
+    expect(notices.filter(n => n.kind === 'transition').map(n => n.phase)).toEqual(phases.slice(0, 3));
+    expect(notices.map(n => n.sequence)).toEqual(notices.map((_n, index) => index + 1));
+    expect(new Set(notices.map(n => n.testSpecId))).toEqual(new Set([result.testSpecId]));
+    expect(notices.some(n => n.kind === 'unavailable')).toBe(false);
+  } finally {
+    await live.close();
+    envKeys.forEach((key, index) => { if (oldEnv[index] === undefined) delete process.env[key]; else process.env[key] = oldEnv[index]; });
+    wireSockets.forEach(socket => socket.destroy());
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 for (const mode of ['duplicate_links', 'duplicate_selects', 'missing_option'] as const) {
   test(`${mode} stops before authoritative QA`, async () => {
     const f = await fixture(mode);
@@ -358,6 +463,62 @@ test('runner URL assertion succeeds without a document snapshot; the next DOM ac
         .toMatchObject({status:'assertion_passed',verification:{actual:dropdownUrl,evaluated:true}});
       expect(run.result).toMatchObject({kind:'non_qa_stop',failedStepId:expect.any(String)});
     }
+  } finally { await f.close(); }
+});
+
+test('poc replay freshly binds the select after unrelated page digest drift', async () => {
+  const f = await fixture('runner_unrelated_drift');
+  try {
+    const response = await f.run();
+    if (response.kind === 'bridge_error') throw new Error('Bridge error');
+    const result = response.context.result;
+    expect(result.terminal.status, JSON.stringify(response)).toBe('QA_ASSERTION_PASSED');
+    expect(f.runnerDrifts()).toBe(2);
+    const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+      .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+    const compiled = await new DeferredCompilerV4Store(f.artifactRoot)
+      .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+    const pair = await new DeferredReplayV9Store(f.artifactRoot)
+      .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiled);
+    const replays = requireTrustedDeferredReplayReadbackV1(pair).record.runs;
+    expect(replays).toHaveLength(2);
+    for (const replay of replays) {
+      expect(replay.result).toEqual({kind:'completed',assertions:2,passed:true});
+      expect(replay.steps.find(step => step.originStepId === 's3')?.status).toBe('assertion_passed');
+      expect(replay.steps.find(step => step.originStepId === 's4')).toMatchObject({
+        status:'succeeded',invocation:'returned',effect:{kind:'native_choice',label:'Option 1',value:'1'},
+      });
+    }
+  } finally { await f.close(); }
+});
+
+for (const [mode, reason] of [
+  ['runner_missing_select', 'TARGET_MISMATCH'],
+  ['runner_duplicate_selects', 'NON_UNIQUE_MATCH'],
+  ['runner_missing_option', 'OPTION_MAPPING_MISMATCH'],
+  ['runner_changed_option', 'OPTION_MAPPING_MISMATCH'],
+  ['runner_frame_drift', 'FRAME_MISMATCH'],
+] as const) test(`${mode} stops on fresh target proof after the URL assertion`, async () => {
+  const f = await fixture(mode);
+  try {
+    const response = await f.run();
+    if (response.kind === 'bridge_error') throw new Error('Bridge error');
+    const result = response.context.result;
+    expect(result.terminal.status, JSON.stringify(response)).toBe('REPLAY_EXECUTION_FAILED');
+    expect(result.cleanup).toBe('verified');
+    const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+      .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+    const compiled = await new DeferredCompilerV4Store(f.artifactRoot)
+      .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+    const pair = await new DeferredReplayV9Store(f.artifactRoot)
+      .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiled);
+    const replays = requireTrustedDeferredReplayReadbackV1(pair).record.runs;
+    expect(replays).toHaveLength(1);
+    expect(replays[0]!.steps.find(step => step.originStepId === 's3')?.status).toBe('assertion_passed');
+    expect(replays[0]!.steps.find(step => step.originStepId === 's4')).toMatchObject({
+      status:'stopped',invocation:'not_invoked',reasonCode:reason,
+    });
+    expect(replays[0]!.result).toMatchObject({kind:'non_qa_stop',reasonCode:reason});
   } finally { await f.close(); }
 });
 

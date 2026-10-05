@@ -22,7 +22,8 @@ export function requireTrustedDeferredReplayV1(input: TrustedDeferredReplayV1): 
   return TrustedDeferredReplayV1.prototype.protectedRecord.call(input);
 }
 /** Sequential fresh replays; each invocation owns and closes its protected session. No retry or repair. */
-export async function runDeferredTwoFreshReplaysV1(factory: ProtectedContextFactory, input: TrustedResolvedTestReadbackV9): Promise<TrustedDeferredReplayV1> {
+export async function runDeferredTwoFreshReplaysV1(factory: ProtectedContextFactory, input: TrustedResolvedTestReadbackV9,
+  onRunStart?: (ordinal: 1 | 2) => void): Promise<TrustedDeferredReplayV1> {
   const artifact = requireTrustedResolvedTestReadbackV9(input);
   // Approval, profile matching and fresh session launch remain entirely with the runner.
   let presentationMode: 'headless' | 'headed' = 'headless';
@@ -32,7 +33,10 @@ export async function runDeferredTwoFreshReplaysV1(factory: ProtectedContextFact
   let hostStop: DeferredReplayRecordV1['hostStop'];
   for (let index = 0; index < 2; index++) {
     let run: DeferredRunnerRecordV9;
-    try { run = requireTrustedDeferredRunV9(await runDeferredResolvedTestV9(factory, input)); }
+    try {
+      onRunStart?.(index === 0 ? 1 : 2);
+      run = requireTrustedDeferredRunV9(await runDeferredResolvedTestV9(factory, input));
+    }
     catch { hostStop = 'RUNNER_ENVIRONMENT_FAILURE'; break; }
     runs.push(run);
     if (run.cleanup !== 'verified' || run.result.kind !== 'completed') break;

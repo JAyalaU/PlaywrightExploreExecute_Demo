@@ -10,6 +10,7 @@ import { DeferredRunnerRecordV9Schema, parseDeferredRunnerRecordV9, type Deferre
 import { readOwnedLabelSourcesFromLocator } from '../browser-action/label-association.js';
 import { nativeActivationReceipt } from '../browser-action/native-activation.js';
 import { executeVerificationAssertionV9 } from './verification-v9.js';
+import { DeferredViewerPreflightError } from '../observability/deferred-viewer-channel.js';
 
 type Action=Extract<ResolvedTestSpecV9['executionSteps'][number],{type:'action_goal'}>;
 type Step=DeferredRunnerRecordV9['steps'][number];
@@ -120,16 +121,16 @@ class FreshRunner {
     }catch(e){await Promise.allSettled([...all.map(c=>c.handle),...labels,...options].map(h=>h.dispose()));throw e;}}
   async sameProof(a:Proof,b:Proof){if(a.digest!==b.digest||a.all.length!==b.all.length||a.labels.length!==b.labels.length||a.options.length!==b.options.length||a.target.frame!==b.target.frame||!await identical(a.target.handle,b.target.handle))stop('STALE_EVIDENCE');
     for(const [left,right] of [[a.all.map(c=>c.handle),b.all.map(c=>c.handle)],[a.labels,b.labels],[a.options,b.options]])for(let i=0;i<left!.length;i++)if(!await identical(left![i]!,right![i]!))stop('STALE_EVIDENCE');}
-  async execute(action:Action,before:DeferredRunStateV9):Promise<Step>{return this.exclusive(async()=>{
+  async execute(action:Action,before:DeferredRunStateV9,pocSemantic=false):Promise<Step>{return this.exclusive(async()=>{
     let initial:Proof|undefined,renewed:Proof|undefined;let invocation:Step['invocation']='not_invoked',predicateDigest:string|undefined,effectDigest:string|undefined,reasonCode:DeferredRunnerStopV9|undefined,invokedAt:string|undefined,returnedAt:string|undefined;
     let after=before,effect:Step['effect'],activationId:string|undefined,afterStateStatus:Step['afterStateStatus']='observed',genericClick=false;
-    try{if(!same(await this.state(),before))stop('STATE_CONTINUITY_MISMATCH');initial=await this.prove(action);
+    try{if(!pocSemantic&&!same(await this.state(),before))stop('STATE_CONTINUITY_MISMATCH');initial=await this.prove(action);
       // Preparation can scroll/mutate; renew the entire predicate and retain identity afterwards.
       await initial.target.handle.scrollIntoViewIfNeeded({timeout:3000});renewed=await this.prove(action);await this.sameProof(initial,renewed);
-      const finalState=await this.state();if(!same(finalState,before))stop('STALE_EVIDENCE');predicateDigest=renewed.digest;
+      if(!pocSemantic&&!same(await this.state(),before))stop('STALE_EVIDENCE');predicateDigest=renewed.digest;
       const executionId=`execution-${randomUUID()}`;genericClick=action.operation==='click'&&action.guard.nativeEffect==='generic_activation';
       if(action.operation==='click'&&!genericClick){activationId=executionId;const armed=await nativeActivationReceipt(renewed.target.handle,executionId,'arm');if(armed.clicks!==0)stop('POST_EFFECT_UNPROVEN');}
-      if(!same(await this.state(),finalState))stop('STALE_EVIDENCE');this.bounded();invokedAt=new Date().toISOString();invocation='threw';this.mutated();
+      if(!pocSemantic&&!same(await this.state(),before))stop('STALE_EVIDENCE');this.bounded();invokedAt=new Date().toISOString();invocation='threw';this.mutated();
       const dispatchStarted=Date.now();
       try{if(action.operation==='fill')await renewed.target.handle.fill(action.executableArgument!,{force:true,timeout:3000});
         else if(action.operation==='select_option')await renewed.target.handle.selectOption({value:action.executableArgument!},{force:true,timeout:3000});
@@ -192,9 +193,12 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
         'kind'in preceding.verification.assertion&&preceding.verification.assertion.kind==='url'){
         const next=await runtime.state();
         if(!same(next,current)){stateRefresh={kind:'rich_after_url',from:current};current=next;}}
-      else if(!same(await runtime.state(),current))stop('STATE_CONTINUITY_MISMATCH');
+      // PoC actions prove their own unique, fresh target immediately before dispatch;
+      // unrelated page content can change after the preceding observation.
+      else if(!(artifact.trace.source.semanticMode==='poc_v1'&&s.type==='action_goal')&&
+        !same(await runtime.state(),current))stop('STATE_CONTINUITY_MISMATCH');
       let entry:Step;
-      if(s.type==='action_goal')entry=await runtime.execute(s,current);
+      if(s.type==='action_goal')entry=await runtime.execute(s,current,artifact.trace.source.semanticMode==='poc_v1');
       else{const base={stepId:s.id,traceRecordId:s.traceRecordId,originStepId:s.originStepId,type:s.type,before:current};
         entry=await runtime.exclusive(async()=>{if(s.type==='navigate'){let invocation:Step['invocation']='not_invoked';try{runtime!.mutated();invocation='threw';const response=await page.goto(s.url,{timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
               if(response?.status()===403&&await response.text()==='Network policy denied request')stop('ENVIRONMENT_FAILURE');invocation='returned';if(page.url()!==new URL(s.url).href)stop('TARGET_MISMATCH');
@@ -216,7 +220,8 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
     if(last?.status==='succeeded'&&last.effect?.kind==='generic_activation'&&last.afterStateStatus==='unavailable')
       current=finalState;
     if(!same(current,finalState))stop('STATE_CONTINUITY_MISMATCH');failedStepId=undefined;
-  }catch(e){reason=e instanceof Stop?e.reason:'ENVIRONMENT_FAILURE';}
+  }catch(e){if(e instanceof DeferredViewerPreflightError&&e.cleanup==='unverified')cleanup='unverified';
+    reason=cleanup==='unverified'?'CLEANUP_UNVERIFIED':e instanceof Stop?e.reason:'ENVIRONMENT_FAILURE';}
   finally{if(session)try{if(runtime&&finalState)await session.closeWithFinalCheck(async()=>{const lastExecution=artifact?.resolved.executionSteps.at(-1);
       const lastPocUrl=artifact?.trace.source.semanticMode==='poc_v1'&&lastExecution?.type==='verification_goal'&&
         'kind'in lastExecution.assertion&&lastExecution.assertion.kind==='url';

@@ -1,5 +1,11 @@
 # Current status
 
+Deferred live viewing uses a physically headed Chromium session for observation while retaining the accepted headless execution-profile metadata; the Streamlit panel states this distinction without changing QA authority.
+
+## Deferred PoC replay target freshness (offline)
+
+For `poc_v1` deterministic replay, a DOM action now proceeds from its freshly reconstructed, unique, actionable target proof without requiring an unrelated whole-page digest to match the preceding observation. The runner still checks page/frame ownership, role/name/label constraints, option identity, target stability through preparation, and native post-action effects; historical strict replay retains its prior continuity checks. Protected five-step fixtures pass with unrelated DOM drift between the URL assertion and select, while missing/ambiguous selects, changed/missing Option 1, and frame drift stop before dispatch. Validation passed: `npm test` (188), five-step closure (19, with the Docker viewer case run outside the command sandbox), typecheck, and build. Focused runner v9 passed 38/39; the one failure is the documented pre-existing profile-fingerprint fixture mismatch. No provider or public-site workflow ran.
+
 ## Deferred PoC runner URL-only replay observation (offline)
 
 For `semanticMode: poc_v1`, runner v9 now observes a resulting-URL assertion through one owned, open active page and its URL. The post-click URL read and exact comparison do not require an immediate frame-content or control-state snapshot. A wrong URL remains a false assertion; an unusable or ambiguous page remains a non-QA environment stop. Before a following DOM action, the runner obtains fresh full state and records an explicit URL-only-to-rich-state transition with the same session/page and increasing state epoch. Native action and selected-option proofs, deterministic locators, and two-replay QA authority are unchanged. Focused closure tests prove agreeing URL true/false outcomes, no-page/closed-page non-QA stops, and that unavailable frame content stops at the subsequent DOM action rather than invalidating the URL assertion.

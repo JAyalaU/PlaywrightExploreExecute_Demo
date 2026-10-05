@@ -23,6 +23,7 @@ import streamlit as st
 from .live_events import LiveEventBuffer
 from .live_images import LiveImageBuffer
 from .live_viewer import LiveViewerBuffer
+from .deferred_live_viewer import DeferredViewerBuffer
 
 if TYPE_CHECKING:
     from .ui_workflow import UiFinalResult
@@ -53,6 +54,7 @@ _live_runs: set["UiRun"] = set()
 # Viewer capabilities stay in this process's volatile host buffer, never in
 # Streamlit session state or a reusable media endpoint.
 _viewer_buffers: WeakKeyDictionary["UiRun", LiveViewerBuffer] = WeakKeyDictionary()
+_deferred_viewer_buffers: WeakKeyDictionary["UiRun", DeferredViewerBuffer] = WeakKeyDictionary()
 _VIEWER_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _VIEWER_TOKEN = re.compile(r"^[a-f0-9]{64}$")
 _VIEWER_EXPIRY = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$")
@@ -63,10 +65,13 @@ class UiRun:
 
     def __init__(self, request: UiRequest, execute: Callable[..., UiFinalResult | None]):
         self.request = request
+        self.deferred_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") == "deferred-action-v1"
         self.agentic = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"}
         self.events = LiveEventBuffer()
         self.images = LiveImageBuffer(self.events)
         _viewer_buffers[self] = LiveViewerBuffer(self.events)
+        if self.deferred_workflow and os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") == "1":
+            _deferred_viewer_buffers[self] = DeferredViewerBuffer()
         if self.agentic:
             self.events.mark_unavailable()
             self.images.set_state("capture_disabled")
@@ -95,11 +100,18 @@ class UiRun:
                 for parameter in signature.parameters.values()
             ):
                 arguments["live_viewer"] = _viewer_buffers[self]
+            if self in _deferred_viewer_buffers and ("deferred_viewer" in signature.parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )):
+                arguments["deferred_viewer"] = _deferred_viewer_buffers[self]
             self.result = self._execute(self.request, **arguments)
             if self.result is None or self.result.kind != "engine":
                 self.images.set_state("capture_disabled")
                 if _viewer_buffers[self].snapshot()[0] != "not_started":
                     _viewer_buffers[self].close()
+                if self in _deferred_viewer_buffers:
+                    _deferred_viewer_buffers[self].close()
         except Exception:
             self.failed = True
         finally:
@@ -107,6 +119,8 @@ class UiRun:
             # even if the child lifecycle channel omitted its closed notice.
             if _viewer_buffers[self].snapshot()[0] != "not_started":
                 _viewer_buffers[self].close()
+            if self in _deferred_viewer_buffers:
+                _deferred_viewer_buffers[self].close()
             self.done.set()
             _live_runs.discard(self)
             _active_run.release()
@@ -117,6 +131,8 @@ def _shutdown_live_runs() -> None:
     for run in tuple(_live_runs): run.thread.join(timeout=5)
     for run in tuple(_live_runs): run.images.clear()
     for run in tuple(_live_runs): _viewer_buffers[run].close()
+    for run in tuple(_live_runs):
+        if run in _deferred_viewer_buffers: _deferred_viewer_buffers[run].close()
 
 
 atexit.register(_shutdown_live_runs)
@@ -124,7 +140,13 @@ atexit.register(_shutdown_live_runs)
 
 @st.fragment(run_every="500ms")
 def _render_live_viewer_fragment(run: UiRun) -> None:
-    _render_live_viewer(_viewer_buffers[run])
+    if run in _deferred_viewer_buffers:
+        _render_deferred_viewer(_deferred_viewer_buffers[run])
+    elif run.deferred_workflow:
+        st.subheader("Live browser view")
+        st.caption("Live view disabled by trusted configuration.")
+    else:
+        _render_live_viewer(_viewer_buffers[run])
 
 
 @st.fragment(run_every="500ms")
@@ -195,7 +217,7 @@ def _render_live_image(images: LiveImageBuffer) -> None:
         st.warning("Live image temporarily unavailable. The final QA result is unchanged.")
 
 
-def _viewer_markup(handle: dict[str, Any]) -> str:
+def _viewer_markup(handle: dict[str, Any], *, allow_expired_existing: bool = False) -> str:
     """Build only a validated local, view-only client for the current owner."""
     owner = handle.get("owner")
     port, path = handle.get("port"), handle.get("path")
@@ -209,7 +231,8 @@ def _viewer_markup(handle: dict[str, Any]) -> str:
         raise ValueError("Invalid live viewer handle")
     remaining = (datetime.fromisoformat(expiry.replace("Z", "+00:00")) -
                  datetime.now(timezone.utc)).total_seconds()
-    if not 0 < remaining <= 60.5:
+    if (not allow_expired_existing and not 0 < remaining <= 60.5) or \
+            (allow_expired_existing and remaining > 60.5):
         raise ValueError("Expired live viewer handle")
     # JSON quoting protects the module script even if this helper is called
     # outside the validated lifecycle channel in a test or future UI seam.
@@ -287,6 +310,30 @@ def _render_live_viewer(viewer: LiveViewerBuffer) -> None:
         elif state == "transitioning": st.caption("Protected browser session is transitioning.")
         elif state == "closed": st.caption("Protected browser view closed.")
         else: st.warning("Live viewer unavailable. The final QA result is unchanged.")
+
+
+def _render_deferred_viewer(viewer: DeferredViewerBuffer) -> None:
+    state, phase, handle = viewer.snapshot()
+    st.subheader("Live browser view")
+    st.caption("Live view launches Chromium in headed mode. Result/profile presentationMode: headless is accepted execution-profile metadata. Viewing is observational only and does not affect QA authority.")
+    labels = {"exploration": "Exploration", "compilation": "Compilation",
+              "replay_1": "Replay 1", "replay_2": "Replay 2"}
+    st.caption(f"Current phase: {labels.get(phase, 'Preparing')}" if state != "closed" else
+               f"Completed phase: {labels.get(phase, 'Preparing')}")
+    if state == "available" and handle is not None:
+        st.caption("View only. Browser input is disabled; automation controls this session.")
+        try:
+            st.html(_viewer_markup(handle, allow_expired_existing=True), unsafe_allow_javascript=True)
+        except ValueError:
+            viewer.mark_unavailable()
+            st.warning("Live browser view unavailable. The final QA result is unchanged.")
+    else:
+        st.html("<script>const p=window.__p4LiveViewer; if(p){p.cancelled=true;if(p.rfb)p.rfb.disconnect();if(p.socket)p.socket.close();p.screen.remove();delete window.__p4LiveViewer}</script>",
+                unsafe_allow_javascript=True)
+        if state in {"not_started", "connecting"}: st.caption("Waiting for the execution browser.")
+        elif state == "transitioning": st.caption("Switching to the next workflow browser session.")
+        elif state == "closed": st.caption("Live browser session closed.")
+        else: st.warning("Live browser view unavailable. The final QA result is unchanged.")
 
 
 def validate_input(target_url: str, task_text: str) -> UiRequest:
