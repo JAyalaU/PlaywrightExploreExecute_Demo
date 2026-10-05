@@ -99,7 +99,7 @@ async function propertyValue(locator: Locator, property: 'visible' | 'enabled' |
 
 /** Execute one accepted closed predicate. A false, evaluable predicate is a QA step failure. */
 export async function executeVerificationAssertionV9(page: Page,
-  assertion: DeferredVerificationAssertion,authority?:{state:()=>Promise<{sessionId:string;pageId:string;stateDigest:string;stateEpoch:number;mutationEpoch:number}>;bounded:()=>void}): Promise<Outcome> {
+  assertion: DeferredVerificationAssertion,authority?:{state:()=>Promise<{sessionId:string;pageId:string;stateDigest:string;stateEpoch:number;mutationEpoch:number}>;bounded:()=>void;currentUrl?:()=>string}): Promise<Outcome> {
   try {
     if(assertion.assertionVersion==='2'){
       if(!authority)throw new QueryFailure('UNAUTHENTICATED_INPUT');const identity=nativeOptionIdentityJournal();
@@ -108,13 +108,14 @@ export async function executeVerificationAssertionV9(page: Page,
       }catch(e){if(e instanceof NativeOptionReadError)throw new QueryFailure(e.reason==='VALUE_NON_UNIQUE'?'OPTION_MAPPING_MISMATCH':e.reason==='UNPROVEN_FRAME'?'FRAME_MISMATCH':e.reason==='NON_UNIQUE'?'NON_UNIQUE_MATCH':e.reason);throw e;}finally{await identity.close();}
     }
     if (assertion.kind === 'url') {
-      const actual = page.url();
+      const readUrl=authority?.currentUrl??(()=>page.url());
+      const actual = readUrl();
       if (actual.length > 2048) throw new QueryFailure('RESULT_LIMIT');
       const expected = assertion.operator === 'equal' ? new URL(assertion.expected).href : undefined;
       const prefix = assertion.operator === 'url_prefix' ? new URL(assertion.expected.slice(0, -1)) : undefined;
       const matched = expected !== undefined ? actual === expected : prefix !== undefined &&
         new URL(actual).origin === prefix.origin && new URL(actual).pathname.startsWith(prefix.pathname);
-      if (page.url() !== actual) throw new QueryFailure('QUERY_UNEVALUABLE');
+      if (readUrl() !== actual) throw new QueryFailure('QUERY_UNEVALUABLE');
       return { ...(matched ? passed() : failed()), facts: { assertion, actual, evaluated: matched } };
     }
     const { locator, frame } = await queryTarget(page, assertion.query);
@@ -144,6 +145,10 @@ export async function executeVerificationAssertionV9(page: Page,
   } catch (error) {
     if (error instanceof QueryFailure) return { status: 'LOCATOR_BINDING_FAILED',
       reason: error.reason, retryable: false };
+    // The PoC URL authority checks page ownership and liveness. Preserve its
+    // typed runner stop instead of folding a closed/unusable page into a
+    // verification query failure.
+    if (authority?.currentUrl) throw error;
     return { status: 'BROWSER_EXECUTION_FAILED',
       reason: page.isClosed() ? 'PAGE_CLOSED' : 'QUERY_EVALUATION_FAILED', retryable: false };
   }

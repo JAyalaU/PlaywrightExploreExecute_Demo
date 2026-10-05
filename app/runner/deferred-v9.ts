@@ -54,12 +54,28 @@ const dispose=async(p:Proof)=>{await Promise.allSettled([...p.all.map(c=>c.handl
 
 /** Owns a fresh private protected context. No discovery, retry, refs or model/MCP dependency. */
 class FreshRunner {
-  #tail:Promise<unknown>=Promise.resolve();#epoch=0;#mutation=0;#stateKey='';
+  #tail:Promise<unknown>=Promise.resolve();#epoch=0;#mutation=0;#navigation=0;#stateKey='';
   readonly sessionId=`runner-session-${randomUUID()}`;readonly pageId=`runner-page-${randomUUID()}`;
-  constructor(readonly session:ProtectedBrowserSession,readonly page:Page,readonly deadline:number){}
+  constructor(readonly session:ProtectedBrowserSession,readonly page:Page,readonly deadline:number){
+    page.on('framenavigated',()=>{this.#navigation++;});
+    page.on('frameattached',()=>{this.#navigation++;});
+    page.on('framedetached',()=>{this.#navigation++;});
+  }
   bounded(closing=false){if(Date.now()>this.deadline)stop('BUDGET_EXHAUSTED');if(!closing&&this.session.isClosed||this.page.isClosed()||this.session.context.pages().length!==1||this.session.context.pages()[0]!==this.page)stop('ENVIRONMENT_FAILURE');}
   async exclusive<T>(callback:()=>Promise<T>):Promise<T>{const prior=this.#tail;let release!:()=>void;this.#tail=new Promise<void>(r=>{release=r;});await prior;try{this.bounded();return await callback();}finally{release();}}
   mutated(){this.#mutation++;}
+  /** URL-only state for admitted PoC URL assertions; no document or control read. */
+  urlState(closing=false):{state:DeferredRunStateV9;url:string}{
+    this.bounded(closing);
+    const navigation=this.#navigation,mutation=this.#mutation,url=this.page.url();
+    if(url.length>2048)stop('INCOMPLETE_EVIDENCE');
+    this.bounded(closing);
+    if(this.#navigation!==navigation||this.#mutation!==mutation||this.page.url()!==url||
+      this.page.mainFrame().url()!==url)stop('STALE_EVIDENCE');
+    const stateDigest=hash({kind:'poc_current_url',pageId:this.pageId,url,navigation,mutation});
+    if(stateDigest!==this.#stateKey){this.#stateKey=stateDigest;this.#epoch++;}
+    return{url,state:{sessionId:this.sessionId,pageId:this.pageId,stateDigest,stateEpoch:this.#epoch,mutationEpoch:mutation}};
+  }
   async state(closing=false):Promise<DeferredRunStateV9>{this.bounded(closing);await engines;const frames=this.page.frames();if(frames.length>8)stop('INCOMPLETE_EVIDENCE');const materials=[];
     for(const f of frames){this.bounded(closing);const content=await f.content(),values=await f.locator('body').locator('runner_v9_state=').textContent({timeout:3000});
       if(content.length>262144||!values||values==='overflow'||values.length>262144)stop('INCOMPLETE_EVIDENCE');materials.push({content,values,url:f.url()});}
@@ -164,8 +180,18 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
     for(const s of r.executionSteps){
       failedStepId=s.id;runtime.bounded();
       const preceding=steps.at(-1);
+      const pocUrl=artifact.trace.source.semanticMode==='poc_v1'&&s.type==='verification_goal'&&
+        'kind'in s.assertion&&s.assertion.kind==='url';
+      let stateRefresh:Step['stateRefresh'];
       if(preceding?.status==='succeeded'&&preceding.effect?.kind==='generic_activation'&&preceding.afterStateStatus==='unavailable')
-        current=await runtime.state();
+        current=pocUrl?runtime.urlState().state:await runtime.state();
+      else if(pocUrl){const next=runtime.urlState().state;
+        if(!same(next,current)){stateRefresh={kind:'url_only',from:current};current=next;}}
+      else if(artifact.trace.source.semanticMode==='poc_v1'&&s.type==='action_goal'&&
+        preceding?.type==='verification_goal'&&preceding.verification&&
+        'kind'in preceding.verification.assertion&&preceding.verification.assertion.kind==='url'){
+        const next=await runtime.state();
+        if(!same(next,current)){stateRefresh={kind:'rich_after_url',from:current};current=next;}}
       else if(!same(await runtime.state(),current))stop('STATE_CONTINUITY_MISMATCH');
       let entry:Step;
       if(s.type==='action_goal')entry=await runtime.execute(s,current);
@@ -175,21 +201,32 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
               return{...base,status:'succeeded' as const,after:await runtime!.state(),afterStateStatus:'observed' as const,invocation,mutationMayHaveOccurred:true};
             }catch(e){let after=current,afterStateStatus:Step['afterStateStatus']='observed';try{after=await runtime!.state();}catch{afterStateStatus='unavailable';}
               return{...base,status:'stopped' as const,after,afterStateStatus,invocation,mutationMayHaveOccurred:invocation!=='not_invoked',reasonCode:e instanceof Stop?e.reason:'ENVIRONMENT_FAILURE' as const};}}
-          const result=await executeVerificationAssertionV9(page,s.assertion,{state:()=>runtime!.state(),bounded:()=>runtime!.bounded()}),after=await runtime!.state();if(!same(current,after))stop('STATE_CONTINUITY_MISMATCH');
+          const result=await executeVerificationAssertionV9(page,s.assertion,{state:()=>runtime!.state(),bounded:()=>runtime!.bounded(),
+            ...(pocUrl?{currentUrl:()=>runtime!.urlState().url}:{})}),after=pocUrl?runtime!.urlState().state:await runtime!.state();if(!same(current,after))stop('STATE_CONTINUITY_MISMATCH');
           return{...base,after,afterStateStatus:'observed' as const,status:result.status==='QA_ASSERTION_PASSED'?'assertion_passed' as const:result.status==='QA_ASSERTION_FAILED'?'assertion_failed' as const:'stopped' as const,
             invocation:'not_invoked' as const,mutationMayHaveOccurred:false,...(result.facts?{verification:result.facts}:{}),...(result.proof?{verificationProof:result.proof}:{}),...(result.status==='QA_ASSERTION_PASSED'||result.status==='QA_ASSERTION_FAILED'?{}:{reasonCode:result.reason==='OPTION_MAPPING_MISMATCH'?'OPTION_MAPPING_MISMATCH' as const:result.reason==='FRAME_MISMATCH'?'FRAME_MISMATCH' as const:result.reason==='NON_UNIQUE_MATCH'?'NON_UNIQUE_MATCH' as const:'VERIFICATION_UNEVALUABLE' as const})};});}
+      if(stateRefresh)entry={...entry,stateRefresh};
       steps.push(entry);current=entry.after;if(entry.status==='stopped')stop(entry.reasonCode!);
-    }finalState=await runtime.state();
+    }
+    const lastExecution=r.executionSteps.at(-1);
+    const lastPocUrl=artifact.trace.source.semanticMode==='poc_v1'&&lastExecution?.type==='verification_goal'&&
+      'kind'in lastExecution.assertion&&lastExecution.assertion.kind==='url';
+    finalState=lastPocUrl?runtime.urlState().state:await runtime.state();
     const last=steps.at(-1);
     if(last?.status==='succeeded'&&last.effect?.kind==='generic_activation'&&last.afterStateStatus==='unavailable')
       current=finalState;
     if(!same(current,finalState))stop('STATE_CONTINUITY_MISMATCH');failedStepId=undefined;
   }catch(e){reason=e instanceof Stop?e.reason:'ENVIRONMENT_FAILURE';}
-  finally{if(session)try{if(runtime&&finalState)await session.closeWithFinalCheck(async()=>{if(!same(finalState,await runtime!.state(true)))stop('STATE_CONTINUITY_MISMATCH');});else await session.close();}
+  finally{if(session)try{if(runtime&&finalState)await session.closeWithFinalCheck(async()=>{const lastExecution=artifact?.resolved.executionSteps.at(-1);
+      const lastPocUrl=artifact?.trace.source.semanticMode==='poc_v1'&&lastExecution?.type==='verification_goal'&&
+        'kind'in lastExecution.assertion&&lastExecution.assertion.kind==='url';
+      const closing=lastPocUrl?runtime!.urlState(true).state:await runtime!.state(true);
+      if(!same(finalState,closing))stop('STATE_CONTINUITY_MISMATCH');});else await session.close();}
     catch(e){if(e instanceof ProtectedFinalCheckError){reason=e.checkError instanceof Stop?e.checkError.reason:'STATE_CONTINUITY_MISMATCH';}else{cleanup='unverified';reason='CLEANUP_UNVERIFIED';}}}
   const r=artifact?.resolved,record=DeferredRunnerRecordV9Schema.parse({runnerVersion:'9',executionRunId,startedAt,finishedAt:new Date().toISOString(),
     ...(r?{provenance:{testSpecId:r.testSpecId,resolvedSpecId:r.resolvedSpecId,resolvedDigest:r.resolvedDigest,compilerAttemptId:r.compilerAttemptId,traceDigest:r.traceDigest,admissionDigest:r.admissionDigest,
-      executionProfileRef:r.executionProfileRef,profileFingerprint:r.profileFingerprint,...(runtime?{sessionId:runtime.sessionId}:{})}}:{}),cleanup,steps,...(startState?{startState}:{}),...(finalState?{finalState}:{}),
+      executionProfileRef:r.executionProfileRef,profileFingerprint:r.profileFingerprint,...(artifact?.trace.source.semanticMode==='poc_v1'?{semanticMode:'poc_v1' as const}:{}),
+      ...(runtime?{sessionId:runtime.sessionId}:{})}}:{}),cleanup,steps,...(startState?{startState}:{}),...(finalState?{finalState}:{}),
     result:reason?{kind:'non_qa_stop',reasonCode:reason,...(failedStepId?{failedStepId}:{})}:{kind:'completed',assertions:steps.filter(s=>s.type==='verification_goal').length,passed:!steps.some(s=>s.status==='assertion_failed')},recordDigest:'0'.repeat(64)});
   const {recordDigest,...data}=record;return new TrustedDeferredRunV9(token,parseDeferredRunnerRecordV9({...data,recordDigest:hash(data)}));
 }

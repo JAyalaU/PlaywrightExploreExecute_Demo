@@ -23,10 +23,11 @@ export const DeferredEffectV9Schema=z.discriminatedUnion('kind',[
       elapsedMs:z.number().int().nonnegative().max(120_000)})})]);
 export const DeferredRunnerRecordV9Schema=z.strictObject({runnerVersion:z.literal('9'),executionRunId:id,startedAt:z.iso.datetime(),finishedAt:z.iso.datetime(),
   provenance:z.strictObject({testSpecId:id,resolvedSpecId:id,resolvedDigest:digest,compilerAttemptId:id,traceDigest:digest,admissionDigest:digest,
-    executionProfileRef:ExecutionProfileRefSchema,profileFingerprint:digest,sessionId:id.optional()}).optional(),cleanup:z.enum(['verified','unverified']),
+    executionProfileRef:ExecutionProfileRefSchema,profileFingerprint:digest,sessionId:id.optional(),semanticMode:z.literal('poc_v1').optional()}).optional(),cleanup:z.enum(['verified','unverified']),
   startState:DeferredRunStateV9Schema.optional(),finalState:DeferredRunStateV9Schema.optional(),
   steps:z.array(z.strictObject({stepId:id,traceRecordId:id,originStepId:id,type:z.enum(['action_goal','navigate','verification_goal']),
     status:z.enum(['succeeded','assertion_passed','assertion_failed','stopped']),before:DeferredRunStateV9Schema,after:DeferredRunStateV9Schema,afterStateStatus:z.enum(['observed','unavailable']),
+    stateRefresh:z.strictObject({kind:z.enum(['url_only','rich_after_url']),from:DeferredRunStateV9Schema}).optional(),
     predicateDigest:digest.optional(),operation:z.enum(['fill','select_option','click']).optional(),argument:z.string().max(1024).optional(),
     invocation:z.enum(['not_invoked','returned','threw']),mutationMayHaveOccurred:z.boolean(),effectDigest:digest.optional(),effect:DeferredEffectV9Schema.optional(),verification:DeferredVerificationFactsV9Schema.optional(),verificationProof:z.strictObject({proofVersion:z.literal('2'),proofId:id,sessionId:id,pageId:id,stateDigest:digest,stateEpoch:z.number().int().nonnegative(),mutationEpoch:z.number().int().nonnegative(),result:NativeOptionProofSchema,proofDigest:digest}).optional(),reasonCode:DeferredRunnerStopV9Schema.optional(),
     invokedAt:z.iso.datetime().optional(),returnedAt:z.iso.datetime().optional()})).max(100),
@@ -38,11 +39,21 @@ export function parseDeferredRunnerRecordV9(input:unknown):DeferredRunnerRecordV
   const r=DeferredRunnerRecordV9Schema.parse(input),{recordDigest,...data}=r;
   if(hash(data)!==recordDigest||Date.parse(r.finishedAt)<Date.parse(r.startedAt)||new Set(r.steps.map(s=>s.stepId)).size!==r.steps.length)throw new Error('INVALID_RUN_V9');
   if(new Set(r.steps.flatMap(s=>s.verificationProof?[s.verificationProof.proofId]:[])).size!==r.steps.filter(s=>s.verificationProof).length)throw new Error('DUPLICATE_NATIVE_PROOF');
-  let current=r.startState, pendingGeneric=false;
+  let current=r.startState, pendingGeneric=false, previous:DeferredRunnerRecordV9['steps'][number]|undefined;
   for(const s of r.steps){
-    const resumed=pendingGeneric&&!!current&&s.before.sessionId===current.sessionId&&
+    const resumed=pendingGeneric&&!!current&&s.before.sessionId===current.sessionId&&s.before.pageId===current.pageId&&
       s.before.stateEpoch>current.stateEpoch&&s.before.mutationEpoch>current.mutationEpoch;
-    if(!current||hash(current)!==hash(s.before)&&!resumed||s.before.sessionId!==r.provenance?.sessionId||s.after.sessionId!==s.before.sessionId||
+    const refresh=s.stateRefresh;
+    const validRefresh=!!refresh&&!!current&&!pendingGeneric&&r.provenance?.semanticMode==='poc_v1'&&
+      hash(refresh.from)===hash(current)&&s.before.sessionId===current.sessionId&&
+      s.before.pageId===current.pageId&&s.before.stateEpoch>current.stateEpoch&&
+      s.before.mutationEpoch>=current.mutationEpoch&&(
+        (refresh.kind==='url_only'&&s.type==='verification_goal'&&
+          (s.status==='stopped'||s.verification?.assertion.assertionVersion!=='2'&&s.verification?.assertion.kind==='url'))||
+        (refresh.kind==='rich_after_url'&&s.type==='action_goal'&&previous?.type==='verification_goal'&&
+          ['assertion_passed','assertion_failed'].includes(previous.status)&&
+          previous.verification?.assertion.assertionVersion!=='2'&&previous.verification?.assertion.kind==='url'));
+    if(refresh&&!validRefresh||!current||hash(current)!==hash(s.before)&&!resumed&&!validRefresh||s.before.sessionId!==r.provenance?.sessionId||s.after.sessionId!==s.before.sessionId||
     s.after.pageId!==s.before.pageId||s.after.stateEpoch<s.before.stateEpoch||s.after.mutationEpoch<s.before.mutationEpoch||
     s.mutationMayHaveOccurred!==(s.invocation!=='not_invoked')||s.type==='action_goal'&&s.status==='succeeded'&&(!s.effectDigest||s.invocation!=='returned'||!s.predicateDigest)||
     s.status==='stopped'&&!s.reasonCode||s.status!=='stopped'&&s.afterStateStatus!=='observed'&&
@@ -58,8 +69,8 @@ export function parseDeferredRunnerRecordV9(input:unknown):DeferredRunnerRecordV
       const {proofDigest,...data}=p,m=p.result.options.filter(o=>o.label===a.optionLabel);
       if(hash(data)!==proofDigest||hash(p.result.labelOwnership)!==p.result.labelOwnershipDigest||hash(p.result.predicate)!==hash(a.controlPredicate)||hash(p.result.frame)!==hash(a.frame)||p.result.optionLabel!==a.optionLabel||p.result.optionValue!==a.compiledOptionValue||p.result.labelOwnershipDigest!==a.compiledLabelOwnershipDigest||m.length!==1||p.result.options.filter(o=>o.value===a.compiledOptionValue).length!==1||p.result.optionCount!==p.result.options.length||m[0]!.value!==a.compiledOptionValue||m[0]!.selected!==p.result.selected||s.verification.actual!==p.result.selected||s.verification.evaluated!==(p.result.selected===a.expectedSelected))throw new Error('INVALID_NATIVE_VERIFICATION_PROOF');
     }else if(s.verificationProof)throw new Error('UNEXPECTED_NATIVE_VERIFICATION_PROOF');
-    current=s.after;pendingGeneric=s.status==='succeeded'&&s.effect?.kind==='generic_activation'&&s.afterStateStatus==='unavailable';}
-  const resumedFinal=pendingGeneric&&!!current&&!!r.finalState&&r.finalState.sessionId===current.sessionId&&
+    current=s.after;pendingGeneric=s.status==='succeeded'&&s.effect?.kind==='generic_activation'&&s.afterStateStatus==='unavailable';previous=s;}
+  const resumedFinal=pendingGeneric&&!!current&&!!r.finalState&&r.finalState.sessionId===current.sessionId&&r.finalState.pageId===current.pageId&&
     r.finalState.stateEpoch>current.stateEpoch&&r.finalState.mutationEpoch>current.mutationEpoch;
   if(r.result.kind==='completed'&&(!r.provenance||r.cleanup!=='verified'||!r.startState||!r.finalState||hash(current)!==hash(r.finalState)&&!resumedFinal||
     r.steps.some(s=>s.status==='stopped')||r.result.assertions!==r.steps.filter(s=>s.type==='verification_goal').length||r.result.passed!==!r.steps.some(s=>s.status==='assertion_failed')))throw new Error('INCOMPLETE_RUN_V9');

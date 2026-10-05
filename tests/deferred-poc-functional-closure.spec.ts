@@ -11,6 +11,8 @@ import { DeferredReplayV9Store, requireTrustedDeferredReplayReadbackV1 } from '.
 import { DeferredWorkflowStopStoreV1 } from '../app/evidence/deferred-workflow-store.js';
 import { parseProtectedTraceCaptureBundleV5 } from '../app/exploration/trace-assembly-v5.js';
 import { successfulTraceDigestV5 } from '../app/domain/agentic-trace-v5.js';
+import { candidateGroundingDigest as hash } from '../app/domain/action-candidate-grounding.js';
+import { parseDeferredRunnerRecordV9 } from '../app/domain/deferred-action-runner.js';
 import { deferredFiveStepSource } from './helpers/deferred-five-step-source.js';
 
 test.describe.configure({ mode: 'serial' });
@@ -25,7 +27,8 @@ const gate = 'PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE';
 const optionMarkup = '<select><option value="">Please select an option</option>' +
   '<option value="1">Option 1</option><option value="2">Option 2</option></select>';
 type Case = 'normal' | 'duplicate_links' | 'wrong_url' | 'duplicate_selects' | 'missing_option' |
-  'replay_disagreement' | 'next_observation_unavailable' | 'compiler_url_snapshot_unavailable' | 'direct_action';
+  'replay_disagreement' | 'next_observation_unavailable' | 'compiler_url_snapshot_unavailable' |
+  'runner_url_snapshot_unavailable' | 'runner_no_page' | 'runner_closed_page' | 'direct_action';
 
 async function fixture(mode: Case) {
   const artifactRoot = await mkdtemp(path.join(tmpdir(), 'deferred-poc-closure-'));
@@ -90,10 +93,17 @@ async function fixture(mode: Case) {
     const browser = await originalOpen.apply(this, args);
     const ordinal = openedContexts.push(browser.context);
     if (mode === 'next_observation_unavailable' && ordinal === 1 ||
-        mode === 'compiler_url_snapshot_unavailable' && ordinal === 2)
+        mode === 'compiler_url_snapshot_unavailable' && ordinal === 2 ||
+        mode === 'runner_url_snapshot_unavailable' && ordinal >= 3)
       browser.context.on('page', (page) => page.on('framenavigated', (frame) => {
         if (frame === page.mainFrame() && frame.url() === dropdownUrl)
           frame.content = async () => { throw new Error('Fixture: next protected observation unavailable'); };
+      }));
+    if ((mode === 'runner_no_page' || mode === 'runner_closed_page') && ordinal >= 3)
+      browser.context.on('page', (page) => page.on('framenavigated', (frame) => {
+        if (frame !== page.mainFrame() || frame.url() !== dropdownUrl) return;
+        if (mode === 'runner_no_page') browser.context.pages = () => [];
+        else page.isClosed = () => true;
       }));
     await browser.context.route('**/*', async (route) => {
       const url = route.request().url();
@@ -228,6 +238,16 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
           assertion: { kind: 'url', expected: dropdownUrl } } });
       expect(run.steps.find((step) => step.originStepId === 's2'))
         .toMatchObject({ status: 'succeeded', afterStateStatus: 'unavailable', effect: { kind: 'generic_activation' } });
+      const optionAction = run.steps.find((step) => step.originStepId === 's4')!;
+      expect(optionAction.stateRefresh?.kind).toBe('rich_after_url');
+      expect(optionAction.stateRefresh?.from.pageId).toBe(optionAction.before.pageId);
+      expect(optionAction.before.stateEpoch).toBeGreaterThan(optionAction.stateRefresh!.from.stateEpoch);
+      const drifted = structuredClone(run);
+      const driftedAction = drifted.steps.find((step) => step.originStepId === 's4')!;
+      driftedAction.before.pageId = 'different-page';
+      const { recordDigest: _digest, ...data } = drifted;
+      drifted.recordDigest = hash(data);
+      expect(() => parseDeferredRunnerRecordV9(drifted)).toThrow('INVALID_RUN_STEP_V9');
     }
   } finally { await f.close(); }
 });
@@ -316,6 +336,54 @@ test('fresh compiler URL verification succeeds without a document snapshot', asy
         result:{kind:'url',value:dropdownUrl,complete:true}})})]));
   } finally { await f.close(); }
 });
+
+test('runner URL assertion succeeds without a document snapshot; the next DOM action stops', async () => {
+  const f = await fixture('runner_url_snapshot_unavailable');
+  try {
+    const response = await f.run();
+    if (response.kind === 'bridge_error') throw new Error('Bridge error');
+    const result = response.context.result;
+    expect(result.terminal.status, JSON.stringify(response)).toBe('ENVIRONMENT_FAILED');
+    expect(result.cleanup).toBe('verified');
+    const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+      .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+    const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
+      .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+    const pair = await new DeferredReplayV9Store(f.artifactRoot)
+      .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiler);
+    const replay = requireTrustedDeferredReplayReadbackV1(pair).record;
+    expect(replay.runs).toHaveLength(1);
+    for (const run of replay.runs) {
+      expect(run.steps.find((step) => step.originStepId === 's3'))
+        .toMatchObject({status:'assertion_passed',verification:{actual:dropdownUrl,evaluated:true}});
+      expect(run.result).toMatchObject({kind:'non_qa_stop',failedStepId:expect.any(String)});
+    }
+  } finally { await f.close(); }
+});
+
+for (const mode of ['runner_no_page', 'runner_closed_page'] as const) {
+  test(`${mode} remains a non-QA replay environment stop`, async () => {
+    const f = await fixture(mode);
+    try {
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error('Bridge error');
+      const result = response.context.result;
+      expect(result.terminal.status, JSON.stringify(response)).toBe('ENVIRONMENT_FAILED');
+      expect(result.cleanup).toBe('verified');
+      expect(result.executionRunIds).toHaveLength(1);
+      const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+        .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+      const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
+        .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+      const pair = await new DeferredReplayV9Store(f.artifactRoot)
+        .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiler);
+      const replay = requireTrustedDeferredReplayReadbackV1(pair).record;
+      expect(replay.runs).toHaveLength(1);
+      expect(replay.runs[0]!.result).toMatchObject({kind:'non_qa_stop',reasonCode:'ENVIRONMENT_FAILURE',failedStepId:expect.any(String)});
+      expect(replay.runs[0]!.steps.find((step) => step.originStepId === 's3')).toBeUndefined();
+    } finally { await f.close(); }
+  });
+}
 
 test('a delivered navigating click can resume directly at the next action', async () => {
   const f = await fixture('direct_action');
