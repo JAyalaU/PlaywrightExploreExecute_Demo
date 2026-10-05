@@ -38,18 +38,64 @@ function reasonFor(error:ActionCandidateGroundingError):DeferredCompilerReasonV4
   if(error.reason==='STALE_STATE')return 'STALE_EVIDENCE';
   if(['PENDING_OBLIGATIONS','UNSUPPORTED_MAPPING','UNSUPPORTED_OPERATION','UNSUPPORTED_CONTROL'].includes(error.reason))return 'UNSUPPORTED_REPRESENTATION';
   if(error.reason==='NO_CANDIDATES')return 'TARGET_MISMATCH';
-  return 'SOURCE_CORRESPONDENCE';
+  if(['OBLIGATION_MAPPING_MISMATCH','INVALID_REQUEST'].includes(error.reason))return 'SOURCE_CORRESPONDENCE';
+  if(['UNTRUSTED_EVIDENCE','SELECTED_REF_NOT_MEMBER'].includes(error.reason))return 'STALE_EVIDENCE';
+  return 'ENVIRONMENT_FAILURE';
 }
 function requestFor(a:DeterministicVerificationAssertionV1){return a.kind==='url'?{kind:'current_url' as const}:a.kind==='semantic_count'?{kind:'semantic_query' as const,query:a.query}:{kind:'target_property' as const,query:a.query,property:a.property};}
+type ObservationDiagnostic = NonNullable<CompilerAttemptV4['verificationObservationDiagnostics']>[number];
+type BrowserSnapshot = Pick<ObservationDiagnostic,'selectedPageBefore'|'pageCountBefore'|'currentUrlBefore'>;
+function safeDiagnosticUrl(value:string):string|undefined {
+  try { const url=new URL(value);if(!['http:','https:'].includes(url.protocol))return undefined;
+    return `${url.origin}${url.pathname}`.slice(0,512);
+  }catch{return undefined;}
+}
+function browserSnapshot(session:McpExplorationSession):BrowserSnapshot {
+  try {const pages=session.browserSession.context.pages(),page=pages[0];
+    return{pageCountBefore:Math.min(pages.length,1000),selectedPageBefore:!page?'absent':page.isClosed()?'closed':'open',
+      ...(!page||page.isClosed()?{}:{currentUrlBefore:safeDiagnosticUrl(page.url())})};
+  }catch{return{selectedPageBefore:'unknown'};}
+}
+function diagnosticExceptionName(error:unknown):ObservationDiagnostic['exceptionName'] {
+  if(error instanceof Error&&error.constructor.name==='ObservationFailure')return 'ObservationFailure';
+  const name=error instanceof Error?error.name:'Unknown';
+  return ['Error','TimeoutError','ActionCandidateGroundingError','ObservationFailure','TargetClosedError'].includes(name)
+    ?name as ObservationDiagnostic['exceptionName']:'Unknown';
+}
+function diagnosticReason(error:unknown,snapshot:BrowserSnapshot,session:McpExplorationSession):ObservationDiagnostic['internalReason'] {
+  if(session.browserSession.isClosed)return 'CONTEXT_CLOSED';
+  if(error instanceof Error&&/context.*closed/i.test(error.message))return 'CONTEXT_CLOSED';
+  if(snapshot.selectedPageBefore==='closed'||snapshot.selectedPageBefore==='absent')return 'PAGE_CLOSED';
+  if(error instanceof Error&&error.constructor.name==='ObservationFailure'){
+    const candidate=(error as Error&{reason?:unknown}).reason;
+    if(typeof candidate==='string'&&['INVALID_SCOPE','STALE_STATE','BROWSER_FAILURE','QUERY_UNEVALUABLE',
+      'RESULT_LIMIT','NO_MATCH','NON_UNIQUE','UNSUPPORTED_PROPERTY'].includes(candidate))
+      return candidate as ObservationDiagnostic['internalReason'];
+  }
+  if(error instanceof ActionCandidateGroundingError){
+    if(error.browserFailureCause)return error.browserFailureCause;
+    if(['STALE_STATE','RESULT_LIMIT','QUERY_UNEVALUABLE'].includes(error.reason))return error.reason as ObservationDiagnostic['internalReason'];
+    return 'BROWSER_FAILURE';
+  }
+  if(error instanceof Error){
+    if(error.name==='TimeoutError')return 'OBSERVATION_TIMEOUT';
+    // Playwright messages are inspected only in memory; unrestricted messages are never persisted.
+    if(/frame was detached|detached frame/i.test(error.message))return 'FRAME_DETACHED';
+    if(/navigation.*(in progress|interrupted)|navigating/i.test(error.message))return 'NAVIGATION_IN_PROGRESS';
+    if(/context.*closed/i.test(error.message))return 'CONTEXT_CLOSED';
+    if(/page.*closed/i.test(error.message))return 'PAGE_CLOSED';
+  }
+  return 'OBSERVATION_UNAVAILABLE';
+}
 /** No model calls, legacy compilers, locator copying, or authored-language interpretation. */
 export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextFactory,readback:TrustedSuccessfulTraceReadbackV5):Promise<{
   kind:'compiled'|'compilation_stop'|'compilation_unsupported';compiler:CompilerAttemptV4;resolved?:ResolvedTestSpecV9;artifact:TrustedDeferredCompilationV4}> {
   const {trace}=requireTrustedSuccessfulTraceReadbackV5(readback),source=trace.source;
   const compilerAttemptId=id('compiler'),resolvedSpecId=id('resolved'),startedAt=new Date(Math.max(Date.now(),Date.parse(trace.finishedAt))).toISOString(),deadline=Date.now()+120_000;
   const checks:CompilerAttemptV4['checks']=[],freshActions:CompilerAttemptV4['freshActions']=[],freshVerifications:CompilerAttemptV4['freshVerifications']=[],freshNavigations:CompilerAttemptV4['freshNavigations']=[],steps:ResolvedTestSpecV9['executionSteps']=[];
-  const executionStops:CompilerAttemptV4['executionStops']=[];
+  const executionStops:CompilerAttemptV4['executionStops']=[],verificationObservationDiagnostics:NonNullable<CompilerAttemptV4['verificationObservationDiagnostics']>=[];
   let freshStartState:TraceStateV5|undefined,freshFinalState:TraceStateV5|undefined;
-  let session:McpExplorationSession|undefined,runtime:ActionCandidateGroundingSessionV1|undefined,reason:DeferredCompilerReasonV4|undefined,active=trace.successfulPath[0]!.recordId,cleanup:'verified'|'unverified'='verified';
+  let session:McpExplorationSession|undefined,runtime:ActionCandidateGroundingSessionV1|undefined,reason:DeferredCompilerReasonV4|undefined,active=trace.successfulPath[0]!.recordId,cleanup:'verified'|'unverified'='verified',observationThrew=false;
   const mark=(kind:CompilerAttemptV4['checks'][number]['kind'],passed:boolean,why:DeferredCompilerReasonV4,evidence?:unknown)=>{
     checks.push({traceRecordId:active,kind,passed,...(evidence?{evidenceDigest:hash(evidence)}:{})});if(!passed)throw new Stop(why);
   };
@@ -80,7 +126,19 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
       }
       if(record.type==='verification_goal'){
         if('verificationVersion'in record){
-          const observed=await nativeObserver.observe(record.goalStepId);
+          const start=new Date(),tick=performance.now(),before=browserSnapshot(session),diagnosticBase={diagnosticVersion:'1' as const,
+            traceRecordId:record.recordId,compilerStepId:base.id,originStepId:record.originStepId,stage:'verification_observation' as const,
+            assertionKind:'native_owned_option_selected' as const,observationKind:'native_owned_option_state' as const};
+          let observed:Awaited<ReturnType<typeof nativeObserver.observe>>;
+          try{observed=await nativeObserver.observe(record.goalStepId);}
+          catch(error){observationThrew=true;const after=browserSnapshot(session);verificationObservationDiagnostics.push({...diagnosticBase,startedAt:start.toISOString(),finishedAt:new Date().toISOString(),
+            elapsedMs:Math.min(86_400_000,Math.max(0,Math.round(performance.now()-tick))),pageCountBefore:before.pageCountBefore,pageCountAfter:after.pageCountBefore,
+            selectedPageBefore:before.selectedPageBefore,selectedPageAfter:after.selectedPageBefore,currentUrlBefore:before.currentUrlBefore,currentUrlAfter:after.currentUrlBefore,
+            outcome:'threw',exceptionName:diagnosticExceptionName(error),internalReason:diagnosticReason(error,after,session)});throw error;}
+          const after=browserSnapshot(session);verificationObservationDiagnostics.push({...diagnosticBase,startedAt:start.toISOString(),finishedAt:new Date().toISOString(),
+            elapsedMs:Math.min(86_400_000,Math.max(0,Math.round(performance.now()-tick))),pageCountBefore:before.pageCountBefore,pageCountAfter:after.pageCountBefore,
+            selectedPageBefore:before.selectedPageBefore,selectedPageAfter:after.selectedPageBefore,currentUrlBefore:before.currentUrlBefore,currentUrlAfter:after.currentUrlBefore,
+            outcome:observed.status==='complete'?'complete':'observation_error',...(observed.status==='error'?{internalReason:observed.reason}:{})});
           mark('verification',observed.status==='complete'&&!!await nativeObserver.currentEvidence(observed),'INCOMPLETE_EVIDENCE');
           if(observed.status!=='complete')throw new Stop('INCOMPLETE_EVIDENCE');
           const original=record.observations[0];mark('verification',original?.status==='complete'&&same(observed.result.frame,original.result.frame),'FRAME_MISMATCH');
@@ -91,7 +149,19 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
           steps.push({...base,type:'verification_goal',goalStepId:record.goalStepId,assertion});mark('order',true,'SOURCE_CORRESPONDENCE');continue;
         }
         const assertion=assertionFromStrategyV1(record);mark('verification',!!assertion,'UNSUPPORTED_VERIFICATION');
-        const observed=await observer.observe(requestFor(assertion!));
+        const request=requestFor(assertion!),start=new Date(),tick=performance.now(),before=browserSnapshot(session),diagnosticBase={diagnosticVersion:'1' as const,
+          traceRecordId:record.recordId,compilerStepId:base.id,originStepId:record.originStepId,stage:'verification_observation' as const,
+          assertionKind:assertion!.kind,observationKind:request.kind};
+        let observed:TrustedObservationResultV1;
+        try{observed=await observer.observe(request);}
+        catch(error){observationThrew=true;const after=browserSnapshot(session);verificationObservationDiagnostics.push({...diagnosticBase,startedAt:start.toISOString(),finishedAt:new Date().toISOString(),
+          elapsedMs:Math.min(86_400_000,Math.max(0,Math.round(performance.now()-tick))),pageCountBefore:before.pageCountBefore,pageCountAfter:after.pageCountBefore,
+          selectedPageBefore:before.selectedPageBefore,selectedPageAfter:after.selectedPageBefore,currentUrlBefore:before.currentUrlBefore,currentUrlAfter:after.currentUrlBefore,
+          outcome:'threw',exceptionName:diagnosticExceptionName(error),internalReason:diagnosticReason(error,after,session)});throw error;}
+        const after=browserSnapshot(session);verificationObservationDiagnostics.push({...diagnosticBase,startedAt:start.toISOString(),finishedAt:new Date().toISOString(),
+          elapsedMs:Math.min(86_400_000,Math.max(0,Math.round(performance.now()-tick))),pageCountBefore:before.pageCountBefore,pageCountAfter:after.pageCountBefore,
+          selectedPageBefore:before.selectedPageBefore,selectedPageAfter:after.selectedPageBefore,currentUrlBefore:before.currentUrlBefore,currentUrlAfter:after.currentUrlBefore,
+          outcome:observed.status==='complete'?'complete':'observation_error',...(observed.status==='error'?{internalReason:observed.reason}:{})});
         mark('verification',observed.status==='complete'&&!!await observer.currentEvidence(observed),'INCOMPLETE_EVIDENCE');
         mark('verification',evaluation(assertion!,observed)===record.evaluated,'POST_EFFECT_UNPROVEN',observed);
         freshVerifications.push({traceRecordId:record.recordId,observation:observed});
@@ -136,15 +206,25 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
       steps.push({...base,type:'action_goal',operation:pre.operation,guard,...(pre.argument?{authoredArgument:pre.argument.authoredText,executableArgument:pre.argument.executableValue}:{})});
       mark('order',true,'SOURCE_CORRESPONDENCE');
     }
-    freshFinalState=await point();
-  }catch(error){reason=error instanceof Stop?error.reason:error instanceof ActionCandidateGroundingError?reasonFor(error):'ENVIRONMENT_FAILURE';
+    const finalRecord=trace.successfulPath.at(-1);
+    const finalUrl=source.semanticMode==='poc_v1'&&finalRecord?.type==='verification_goal'&&
+      !('verificationVersion'in finalRecord)&&finalRecord.observations.at(-1)?.request.kind==='current_url';
+    if(finalUrl){
+      const state=ActionCandidateGroundingSessionV1.prototype.protectedCurrentUrlState.call(runtime);
+      freshFinalState={sessionId:runtime.sessionId,pageId:state.pageId,stateDigest:state.stateDigest,
+        stateEpoch:state.stateEpoch,mutationEpoch:state.mutationEpoch};
+    }else freshFinalState=await point();
+  }catch(error){reason=error instanceof Stop?error.reason:observationThrew?
+      error instanceof ActionCandidateGroundingError&&error.reason==='STALE_STATE'?'STALE_EVIDENCE':
+      error instanceof ActionCandidateGroundingError&&error.reason==='RESULT_LIMIT'?'INCOMPLETE_EVIDENCE':'ENVIRONMENT_FAILURE':
+      error instanceof ActionCandidateGroundingError?reasonFor(error):'ENVIRONMENT_FAILURE';
     checks.push({traceRecordId:active,kind:'predicate',passed:false});
   }finally{if(session)try{await session.close();}catch{cleanup='unverified';reason='CLEANUP_UNVERIFIED';}}
   checks.push({traceRecordId:active,kind:'cleanup',passed:cleanup==='verified'});
   const owner={testSpecId:trace.testSpecId,explorationAttemptId:trace.explorationAttemptId,successfulTraceId:trace.successfulTraceId,traceDigest:trace.traceDigest,
     executionProfileRef:trace.executionProfileRef,profileFingerprint:trace.profileFingerprint,compilerAttemptId};
   const compilerData=CompilerAttemptV4Schema.parse({compilerVersion:'4',...owner,startedAt,finishedAt:new Date(Math.max(Date.now(),Date.parse(startedAt))).toISOString(),
-    ...(runtime?{freshSessionId:runtime.sessionId}:{}),...(freshStartState?{freshStartState}:{}),...(freshFinalState?{freshFinalState}:{}),cleanup,checks,freshActions,executionStops,freshVerifications,freshNavigations,
+    ...(runtime?{freshSessionId:runtime.sessionId}:{}),...(freshStartState?{freshStartState}:{}),...(freshFinalState?{freshFinalState}:{}),cleanup,checks,freshActions,executionStops,freshVerifications,freshNavigations,verificationObservationDiagnostics,
     result:reason?{status:'rejected',reasonCode:reason,failedTraceRecordId:active}:{status:'accepted',resolvedSpecId},attemptDigest:'0'.repeat(64)});
   const {attemptDigest:_ad,...orderedCompiler}=compilerData;
   const finalIntegrityStop=()=>{

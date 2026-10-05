@@ -4,6 +4,7 @@ import { expect, test } from '@playwright/test';
 import { ProtectedContextFactory, ProfileCatalog } from '../app/profile/index.js';
 import { McpExplorationSession } from '../app/exploration/mcp.js';
 import { ActionCandidateGroundingSessionV1 } from '../app/exploration/action-candidate-grounding.js';
+import { TrustedObservationSessionV1 } from '../app/exploration/trusted-observation.js';
 import { normalizePocSemanticExtraction } from '../app/interpretation/deferred-action-poc-normalize.js';
 import { admitPocSemanticFidelityV2 } from '../app/domain/action-semantic-admission.js';
 import { executeActionGoalGroundingV1 } from '../app/interpretation/action-grounding-execution-controller.js';
@@ -75,6 +76,41 @@ test('PoC unique link click navigates and retains a generic delivery witness aft
     expect(f.runtime.protectedActionGroundingRetirement(result.witness.witnessId)).toBeUndefined();
   } finally { await f.close(); }
 });
+
+test('PoC current URL observation and evidence check do not read frame content or ARIA', async () => {
+  const f = await fixture('<a href="/next">Dropdown</a>', link('go'), 'Click the Dropdown link.');
+  const page = f.session.browserSession.context.pages()[0]!, frame = page.mainFrame();
+  const originalContent = frame.content;
+  const body = frame.locator('body');
+  const locatorPrototype = Object.getPrototypeOf(body) as typeof body;
+  const originalAria = locatorPrototype.ariaSnapshot;
+  try {
+    frame.content = async () => { throw new Error('Frame content unavailable'); };
+    locatorPrototype.ariaSnapshot = async () => { throw new Error('ARIA unavailable'); };
+    const observer = new TrustedObservationSessionV1(f.session, f.runtime);
+    const fact = await observer.observe({ kind: 'current_url' });
+    expect(fact).toMatchObject({ status: 'complete', request: { kind: 'current_url' },
+      result: { kind: 'url', value: f.url, complete: true }, frame: { kind: 'main' } });
+    expect(await observer.currentEvidence(fact)).toEqual(fact);
+    await f.session.navigate(`${f.url}next`);
+    expect(await observer.currentEvidence(fact)).toBeUndefined();
+  } finally { frame.content = originalContent; locatorPrototype.ariaSnapshot = originalAria; await f.close(); }
+});
+
+for (const mode of ['no_page', 'closed_page', 'multiple_pages'] as const) {
+  test(`PoC current URL observation rejects ${mode} without QA evidence`, async () => {
+    const f = await fixture('<a href="/next">Dropdown</a>', link('go'), 'Click the Dropdown link.');
+    const page = f.session.browserSession.context.pages()[0]!;
+    const originalIsClosed = page.isClosed;
+    try {
+      if (mode === 'no_page') await page.close();
+      else if (mode === 'closed_page') page.isClosed = () => true;
+      else await f.session.browserSession.context.newPage();
+      const observer = new TrustedObservationSessionV1(f.session, f.runtime);
+      await expect(observer.observe({ kind: 'current_url' })).rejects.toMatchObject({ reason: 'BROWSER_FAILURE' });
+    } finally { page.isClosed = originalIsClosed; await f.close(); }
+  });
+}
 
 test('PoC two matching links stop as non-unique before click', async () => {
   const f = await fixture('<a href="/next">Dropdown</a><a href="/other">Dropdown</a>', link());

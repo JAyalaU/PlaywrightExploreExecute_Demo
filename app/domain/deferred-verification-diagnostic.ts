@@ -2,6 +2,24 @@ import { z } from 'zod';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);
 const bounded = z.string().max(512);
+/** Private attempt facts only. They cannot serve as verification evidence. */
+export const DeferredVerificationObservationAttemptV1Schema = z.strictObject({
+  attemptVersion: z.literal('1'), stepId: id,
+  strategy: z.enum(['poc_resulting_url','ordinary_model','native_owned_option']),
+  observationKind: z.enum(['current_url','semantic_query','target_property','semantic_snapshot','native_owned_option_state']),
+  startedAt: z.iso.datetime(), finishedAt: z.iso.datetime(), elapsedMs: z.number().int().min(0).max(86_400_000),
+  pageCountBefore: z.number().int().min(0).max(1000).optional(), pageCountAfter: z.number().int().min(0).max(1000).optional(),
+  selectedPageBefore: z.enum(['open','closed','absent','unknown']), selectedPageAfter: z.enum(['open','closed','absent','unknown']),
+  currentUrlBefore: bounded.optional(), currentUrlAfter: bounded.optional(),
+  pageReplaced: z.boolean().optional(), navigationObserved: z.boolean().optional(),
+  outcome: z.enum(['complete','observation_error','threw']),
+  exceptionName: z.enum(['Error','TimeoutError','ActionCandidateGroundingError','ObservationFailure','NativeOptionReadError','TargetClosedError','Unknown']).optional(),
+  internalReason: z.enum(['OBSERVATION_TIMEOUT','PAGE_CLOSED','CONTEXT_CLOSED','FRAME_DETACHED','NAVIGATION_IN_PROGRESS',
+    'BROWSER_FAILURE','OBSERVATION_UNAVAILABLE','STALE_STATE','RESULT_LIMIT','QUERY_UNEVALUABLE','INVALID_SCOPE',
+    'NO_MATCH','NON_UNIQUE','UNSUPPORTED_PROPERTY','OPTION_ABSENT','OPTION_NON_UNIQUE','VALUE_NON_UNIQUE',
+    'UNSUPPORTED_CONTROL','UNPROVEN_FRAME']).optional(),
+});
+export type DeferredVerificationObservationAttemptV1 = z.infer<typeof DeferredVerificationObservationAttemptV1Schema>;
 /** Restricted accounting only. This record is never evidence for trace, replay, or QA. */
 export const DeferredVerificationDiagnosticV1Schema = z.strictObject({
   diagnosticVersion: z.literal('1'), stepId: id,
@@ -22,6 +40,7 @@ export const DeferredVerificationDiagnosticV1Schema = z.strictObject({
   decisionTurn: z.number().int().min(1).max(4).optional(),
   decision: z.enum(['true', 'false', 'unresolved', 'unsupported']), reason: bounded.optional(),
   elapsedMs: z.number().int().min(0).max(86_400_000),
+  observationAttempts: z.array(DeferredVerificationObservationAttemptV1Schema).max(8).optional(),
 });
 export type DeferredVerificationDiagnosticV1 = z.infer<typeof DeferredVerificationDiagnosticV1Schema>;
 

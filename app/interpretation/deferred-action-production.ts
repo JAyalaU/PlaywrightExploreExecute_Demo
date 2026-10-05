@@ -27,7 +27,8 @@ import { projectDeferredReportV2 } from '../subprocess/deferred-report-projectio
 import { ProtectedContextFactory, profilePresentationMode } from '../profile/index.js';
 import {NativeOptionObservationSessionV2} from '../exploration/native-option-observation.js';
 import {NativeOptionVerificationControllerV2,type NativeOptionVerificationModelV6} from './native-option-verification-controller.js';
-import { DeferredVerificationDiagnosticV1Schema, diagnosticText, diagnosticOptionValue } from '../domain/deferred-verification-diagnostic.js';
+import { DeferredVerificationDiagnosticV1Schema, diagnosticText, diagnosticOptionValue,
+  type DeferredVerificationObservationAttemptV1 } from '../domain/deferred-verification-diagnostic.js';
 import type { TrustedObservationResultV1 } from '../domain/observation-contracts.js';
 import type { NativeOptionObservationV2 } from '../domain/native-option-verification.js';
 
@@ -202,6 +203,17 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
       } else {
         const native = 'verificationVersion' in goal;
         const started = performance.now();
+        const ordinaryGoal = !native ? goal as Exclude<typeof goal, { verificationVersion: '2' }> : undefined;
+        const urlLiteral = ordinaryGoal?.sourceText.match(/https?:\/\/[^\s<>"']+/)?.[0]?.replace(/[.,;!?]+$/, '');
+        const safeUrl = diagnosticText(urlLiteral);
+        const resultingUrl = !!safeUrl && /\b(?:url|takes?\s+(?:you\s+)?to)\b/i.test(ordinaryGoal!.sourceText);
+        const attemptStrategy = native ? 'native_owned_option' as const : resultingUrl ? 'poc_resulting_url' as const : 'ordinary_model' as const;
+        const observationAttempts:DeferredVerificationObservationAttemptV1[]=[];
+        const unsubscribeAttempt = native ? nativeObservations?.onPrivateObservationAttempt((probe)=>{
+          if(observationAttempts.length<8)observationAttempts.push({attemptVersion:'1',stepId:goal.id,strategy:attemptStrategy,...probe});
+        }) : observations.onPrivateObservationAttempt((probe)=>{
+          if(observationAttempts.length<8)observationAttempts.push({attemptVersion:'1',stepId:goal.id,strategy:attemptStrategy,...probe});
+        });
         const captured: Array<TrustedObservationResultV1 | NativeOptionObservationV2> = [];
         const unsubscribe = native
           ? nativeObservations?.onProtectedRecord((record) => { if (captured.length < 8 && record.goalStepId === goal.id) captured.push(record); })
@@ -211,14 +223,10 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
         try { outcome = native ? nativeVerification?await nativeVerification.evaluate(goal,ordinal,options.signal):{conclusion:'unsupported' as const,strategy:undefined,reason:'NATIVE_VERIFIER_UNAVAILABLE'}
           : await verification.evaluate(goal, ordinal, options.signal); }
         catch (error) { evaluationError = error; outcome = { conclusion: 'unresolved' as const, strategy: undefined, reason: 'EVALUATION_EXCEPTION' }; }
-        finally { unsubscribe?.(); }
+        finally { unsubscribe?.(); unsubscribeAttempt?.(); }
         const last = captured.at(-1);
         const nativeRead = native ? nativeObservations?.protectedDiagnostic(goal.id) : undefined;
         const nativeGoal = native ? goal as Extract<typeof goal, { verificationVersion: '2' }> : undefined;
-        const ordinaryGoal = !native ? goal as Exclude<typeof goal, { verificationVersion: '2' }> : undefined;
-        const urlLiteral = ordinaryGoal?.sourceText.match(/https?:\/\/[^\s<>"']+/)?.[0]?.replace(/[.,;!?]+$/, '');
-        const safeUrl = diagnosticText(urlLiteral);
-        const resultingUrl = !!safeUrl && /\b(?:url|takes?\s+(?:you\s+)?to)\b/i.test(ordinaryGoal!.sourceText);
         const observationKind = last?.status === 'complete' ? last.result.kind : last?.status === 'error' ? 'error' : undefined;
         const observed = last?.status === 'complete' ? last.result.kind === 'native_owned_option_state' ? last.result.selected :
           last.result.kind === 'url' ? diagnosticText(last.result.value) : last.result.kind === 'matches' ? last.result.count :
@@ -259,6 +267,7 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
             { comparisonExpected: comparison.expected } : resultingUrl ? { comparisonExpected: safeUrl } : {} : {}),
           decision, ...(reason ? { reason: diagnosticText(reason) } : {}),
           elapsedMs: Math.max(0, Math.min(86_400_000, Math.round(performance.now() - started))),
+          observationAttempts,
         });
         if (diagnostic.success && accounting.verificationDiagnostics!.length < 100)
           accounting.verificationDiagnostics!.push(diagnostic.data);

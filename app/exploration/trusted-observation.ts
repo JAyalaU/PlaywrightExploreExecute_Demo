@@ -6,6 +6,7 @@ import { TrustedObservationRequestV1Schema, TrustedObservationResultV1Schema,
 import { ExploratoryTargetResolutionError, type CurrentStateExploration } from './current-state.js';
 import type { McpExplorationSession } from './mcp.js';
 import { ActionCandidateGroundingSessionV1 } from './action-candidate-grounding.js';
+import { probeVerificationObservation, type PrivateObservationProbe } from './verification-observation-diagnostics.js';
 
 const MAX_FRAMES = 8;
 const MAX_IFRAMES_PER_LEVEL = 80;
@@ -40,6 +41,7 @@ export class TrustedObservationSessionV1 {
   readonly #pageIds = new WeakMap<Page, string>();
   readonly #records = new Map<string, TrustedObservationResultV1>();
   readonly #captureListeners = new Set<(record: TrustedObservationResultV1) => void>();
+  readonly #privateAttemptListeners = new Set<(probe: PrivateObservationProbe) => void>();
   #stateKey: string | undefined;
   #stateEpoch = 0;
   #navigationEpoch = 0;
@@ -215,6 +217,12 @@ export class TrustedObservationSessionV1 {
     return () => { this.#captureListeners.delete(listener); };
   }
 
+  /** Opt-in private telemetry; never an observation witness. */
+  onPrivateObservationAttempt(listener:(probe:PrivateObservationProbe)=>void):()=>void {
+    this.#privateAttemptListeners.add(listener);
+    return()=>{this.#privateAttemptListeners.delete(listener);};
+  }
+
   /** Historical readback is limited to records created by this runtime instance. */
   protectedRecord(observationId: string): TrustedObservationResultV1 | undefined {
     const record = this.#records.get(observationId);
@@ -228,12 +236,35 @@ export class TrustedObservationSessionV1 {
   }
 
   async observe(requestInput: unknown): Promise<TrustedObservationResultV1> {
+    if(!this.#privateAttemptListeners.size)return this.#observe(requestInput);
+    const request=TrustedObservationRequestV1Schema.parse(requestInput);
+    return probeVerificationObservation(this.#session,request.kind,()=>this.#observe(request),
+      probe=>{for(const listener of this.#privateAttemptListeners)listener(probe);},()=>this.#navigationEpoch);
+  }
+
+  async #observe(requestInput: unknown): Promise<TrustedObservationResultV1> {
     // Reject arbitrary model fields before touching the browser.
     const request = TrustedObservationRequestV1Schema.parse(requestInput);
     if (this.#busy) throw new ObservationFailure('STALE_STATE');
     if (this.#records.size >= MAX_OBSERVATIONS) throw new ObservationFailure('RESULT_LIMIT');
     this.#busy = true;
     try {
+      if (request.kind === 'current_url' && this.#current instanceof ActionCandidateGroundingSessionV1 &&
+          ActionCandidateGroundingSessionV1.prototype.protectedObservationOwner.call(this.#current, this.#session)
+            .admission.spec.semanticMode === 'poc_v1') {
+        const read = () => ActionCandidateGroundingSessionV1.prototype.protectedCurrentUrlState.call(this.#current);
+        const before = read(), after = read();
+        const state: State = { page: after.page, pageId: after.pageId, stateDigest: after.stateDigest,
+          stateEpoch: after.stateEpoch, mutationEpoch: after.mutationEpoch,
+          frameDigests: new Map([[after.page.mainFrame(), hash({ kind: 'poc_current_url',
+            pageId: after.pageId, url: after.url, stateDigest: after.stateDigest })]]) };
+        if (before.stateDigest !== after.stateDigest || before.stateEpoch !== after.stateEpoch ||
+            before.mutationEpoch !== after.mutationEpoch)
+          return this.#record(state, request, { kind: 'unresolved' }, { status: 'error', reason: 'STALE_STATE' });
+        return this.#record(state, request, { kind: 'main',
+          snapshotDigest: state.frameDigests.get(after.page.mainFrame())! },
+          { status: 'complete', result: { kind: 'url', value: after.url, complete: true } });
+      }
       let before: State;
       try { before = await this.#state(); }
       catch (error) {
@@ -303,6 +334,15 @@ export class TrustedObservationSessionV1 {
     const original = this.#records.get(parsed.data.observationId);
     if (!original || !same(original, parsed.data)) return undefined;
     try {
+      if (parsed.data.request.kind === 'current_url' && this.#current instanceof ActionCandidateGroundingSessionV1 &&
+          ActionCandidateGroundingSessionV1.prototype.protectedObservationOwner.call(this.#current, this.#session)
+            .admission.spec.semanticMode === 'poc_v1') {
+        const current = ActionCandidateGroundingSessionV1.prototype.protectedCurrentUrlState.call(this.#current);
+        return parsed.data.result.kind === 'url' && parsed.data.result.value === current.url &&
+          parsed.data.stateDigest === current.stateDigest && parsed.data.stateEpoch === current.stateEpoch &&
+          parsed.data.mutationEpoch === current.mutationEpoch && parsed.data.pageId === current.pageId
+          ? structuredClone(original) : undefined;
+      }
       const current = await this.#state();
       if (parsed.data.stateDigest !== current.stateDigest || parsed.data.stateEpoch !== current.stateEpoch ||
           parsed.data.mutationEpoch !== current.mutationEpoch || parsed.data.pageId !== current.pageId)

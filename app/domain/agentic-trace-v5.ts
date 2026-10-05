@@ -25,6 +25,8 @@ const base = { recordId: id, sequence: z.number().int().positive(), source: z.li
   originStepId: id, preStateDigest: digest, postStateDigest: digest };
 export const SuccessfulActionGroundingRecordV5Schema = z.strictObject({ ...base,
   type: z.literal('action_goal'), witness: ActionGroundingWitnessV1Schema, retirement: ActionGroundingRetirementV1Schema.optional(),
+  /** A PoC URL fact is followed by a separately grounded full browser state. */
+  stateRefresh: z.strictObject({ fromObservationId: id, after: TraceStateV5Schema }).optional(),
   // A navigating PoC click is delivered before the next step observes its new document.
   continuation: z.union([
     z.strictObject({ observationId: id, after: TraceStateV5Schema }),
@@ -103,6 +105,21 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
         generic = post.effect.kind === 'generic_activation',
         retirement = record.retirement ? parseActionGroundingRetirementV1(record.retirement) : undefined;
       const continuation = record.continuation;
+      const preceding = trace.successfulPath[index - 1];
+      const urlFact = preceding?.type === 'verification_goal' && !('verificationVersion' in preceding)
+        ? preceding.observations.at(-1) : undefined;
+      const refresh = record.stateRefresh;
+      const refreshedBefore = { sessionId: post.before.sessionId, pageId: post.before.pageId,
+        stateDigest: post.before.stateDigest, stateEpoch: post.before.stateEpoch,
+        mutationEpoch: post.before.mutationEpoch };
+      requireFact(refresh ? source.semanticMode === 'poc_v1' && urlFact?.status === 'complete' &&
+        urlFact.request.kind === 'current_url' && urlFact.result.kind === 'url' &&
+        refresh.fromObservationId === urlFact.observationId && same(refresh.after, refreshedBefore) &&
+        refresh.after.sessionId === current.sessionId && refresh.after.pageId === current.pageId &&
+        refresh.after.stateEpoch > current.stateEpoch &&
+        refresh.after.mutationEpoch >= current.mutationEpoch &&
+        Date.parse(witness.preparation.observedAt) >= Date.parse(urlFact.observedAt) :
+        same(current, refreshedBefore), 'V5 URL-to-action refresh mismatch');
       const following = trace.successfulPath[index + 1];
       const actionAfter = generic ? continuation?.after : retirement?.after;
       requireFact(parent.status === 'complete' && parent.testSpecId === trace.testSpecId &&
@@ -110,7 +127,8 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
         parent.profileFingerprint === trace.profileFingerprint && same(parent.executionProfileRef, trace.executionProfileRef) &&
         same(parent.request.handoff, trace.obligationHandoff) && same(pre.sourceGoal, step) &&
         pre.sourceInstruction === source.sourceInstruction && pre.admissionDigest === sourceHash(admission) &&
-        same(witness.preparation.sourceGoal, step) && record.preStateDigest === post.before.stateDigest &&
+        same(witness.preparation.sourceGoal, step) &&
+        (refresh ? record.preStateDigest === current.stateDigest : record.preStateDigest === post.before.stateDigest) &&
         (generic ? !retirement && !!continuation && !!actionAfter && continuation.after.sessionId === trace.sessionId &&
           continuation.after.stateEpoch > post.before.stateEpoch && continuation.after.mutationEpoch > post.before.mutationEpoch &&
           (following?.type === 'verification_goal' && 'observationId' in continuation &&
@@ -129,8 +147,7 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
           same(retirement.before, post.after) && Date.parse(retirement.observedAt) >= Date.parse(execution.finishedAt) &&
           Date.parse(retirement.observedAt) <= Date.parse(trace.finishedAt)) &&
         record.postStateDigest === actionAfter?.stateDigest &&
-        same(current, { sessionId: post.before.sessionId, pageId: post.before.pageId, stateDigest: post.before.stateDigest,
-          stateEpoch: post.before.stateEpoch, mutationEpoch: post.before.mutationEpoch }) &&
+        (refresh ? record.preStateDigest === current.stateDigest : same(current, refreshedBefore)) &&
         Date.parse(witness.preparation.observedAt) >= Date.parse(trace.startedAt) &&
         Date.parse(execution.finishedAt) <= Date.parse(trace.finishedAt) &&
         !executions.has(execution.executionId) && !witnessIds.has(witness.witnessId) && !strategies.has(pre.strategyId),

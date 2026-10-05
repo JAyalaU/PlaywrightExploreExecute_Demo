@@ -46,6 +46,22 @@ export const ResolvedTestSpecV9Schema = z.strictObject({ schemaVersion: z.litera
   runtimeVersions: z.strictObject({ playwright: z.string().min(1).max(128), mcp: z.string().min(1).max(128),
     compiler: z.literal('4'), guard: z.literal('1') }), executionSteps: z.array(DeferredExecutionStepV9Schema).min(1).max(100), resolvedDigest: digest });
 export type ResolvedTestSpecV9 = z.infer<typeof ResolvedTestSpecV9Schema>;
+/** Authenticated private telemetry only. It is never a verification witness or QA input. */
+export const CompilerVerificationObservationDiagnosticV1Schema = z.strictObject({
+  diagnosticVersion: z.literal('1'), traceRecordId: id, compilerStepId: id, originStepId: id,
+  stage: z.literal('verification_observation'), assertionKind: z.enum(['url','semantic_count','unique_boolean_property','unique_string_property','native_owned_option_selected']),
+  observationKind: z.enum(['current_url','semantic_query','target_property','native_owned_option_state']),
+  startedAt: z.iso.datetime(), finishedAt: z.iso.datetime(), elapsedMs: z.number().int().nonnegative().max(86_400_000),
+  pageCountBefore: z.number().int().nonnegative().max(1000).optional(), pageCountAfter: z.number().int().nonnegative().max(1000).optional(),
+  selectedPageBefore: z.enum(['open','closed','absent','unknown']), selectedPageAfter: z.enum(['open','closed','absent','unknown']),
+  currentUrlBefore: z.string().max(512).optional(), currentUrlAfter: z.string().max(512).optional(),
+  outcome: z.enum(['complete','observation_error','threw']),
+  exceptionName: z.enum(['Error','TimeoutError','ActionCandidateGroundingError','ObservationFailure','TargetClosedError','Unknown']).optional(),
+  internalReason: z.enum(['OBSERVATION_TIMEOUT','PAGE_CLOSED','CONTEXT_CLOSED','FRAME_DETACHED','NAVIGATION_IN_PROGRESS',
+    'BROWSER_FAILURE','OBSERVATION_UNAVAILABLE','STALE_STATE','RESULT_LIMIT','QUERY_UNEVALUABLE','INVALID_SCOPE',
+    'NO_MATCH','NON_UNIQUE','UNSUPPORTED_PROPERTY','OPTION_ABSENT','OPTION_NON_UNIQUE','VALUE_NON_UNIQUE',
+    'UNSUPPORTED_CONTROL','UNPROVEN_FRAME']).optional(),
+});
 export const CompilerAttemptV4Schema = z.strictObject({ compilerVersion: z.literal('4'), ...owner,
   startedAt: z.iso.datetime(), finishedAt: z.iso.datetime(), freshSessionId: id.optional(), cleanup: z.enum(['verified','unverified']),
   checks: z.array(z.strictObject({ traceRecordId: id, kind: z.enum(['profile','source','predicate','frame','execution','verification','order','cleanup']),
@@ -56,6 +72,7 @@ export const CompilerAttemptV4Schema = z.strictObject({ compilerVersion: z.liter
   freshActions: z.array(z.strictObject({ traceRecordId: id, witness: ActionGroundingWitnessV1Schema, retirement: ActionGroundingRetirementV1Schema.optional() })).max(100),
   executionStops: z.array(z.strictObject({traceRecordId:id,execution:ActionExecutionAttemptV1Schema})).max(100),
   freshVerifications: z.array(z.strictObject({ traceRecordId: id, observation: z.union([TrustedObservationResultV1Schema,NativeOptionObservationV2Schema]) })).max(100),
+  verificationObservationDiagnostics: z.array(CompilerVerificationObservationDiagnosticV1Schema).max(100).optional(),
   freshNavigations: z.array(z.strictObject({ traceRecordId:id,url:ApprovedAbsoluteUrlSchema,before:TraceStateV5Schema,after:TraceStateV5Schema,observedAt:z.iso.datetime() })).max(100),
   result: z.discriminatedUnion('status',[z.strictObject({ status: z.literal('accepted'), resolvedSpecId: id }),
     z.strictObject({ status: z.literal('rejected'), reasonCode: DeferredCompilerReasonV4Schema, failedTraceRecordId: id.optional() })]), attemptDigest: digest });
@@ -82,7 +99,9 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
     Date.parse(a.startedAt)<Date.parse(trace.finishedAt) || a.checks.some(c=>!trace.successfulPath.some(r=>r.recordId===c.traceRecordId)) ||
     a.freshSessionId===trace.sessionId || new Set(a.freshActions.map(x=>x.traceRecordId)).size!==a.freshActions.length ||
     new Set(a.freshVerifications.map(x=>x.traceRecordId)).size!==a.freshVerifications.length ||
-    new Set(a.freshNavigations.map(x=>x.traceRecordId)).size!==a.freshNavigations.length) throw new Error('INVALID_COMPILER_V4');
+    new Set(a.freshNavigations.map(x=>x.traceRecordId)).size!==a.freshNavigations.length ||
+    a.verificationObservationDiagnostics?.some(d=>!trace.successfulPath.some(r=>r.recordId===d.traceRecordId&&r.type==='verification_goal'&&r.originStepId===d.originStepId) ||
+      Date.parse(d.startedAt)<Date.parse(a.startedAt)||Date.parse(d.finishedAt)>Date.parse(a.finishedAt)||Date.parse(d.finishedAt)<Date.parse(d.startedAt))) throw new Error('INVALID_COMPILER_V4');
   for (const fresh of a.freshActions) {
     const w=parseActionGroundingWitnessV1(fresh.witness,
       {source:trace.source,semanticAdmission:trace.semanticAdmission}), original=trace.successfulPath.find(r=>r.recordId===fresh.traceRecordId);
@@ -143,7 +162,7 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
     const point=(v:{sessionId:string;pageId:string;stateDigest:string;stateEpoch:number;mutationEpoch:number})=>({sessionId:v.sessionId,pageId:v.pageId,stateDigest:v.stateDigest,stateEpoch:v.stateEpoch,mutationEpoch:v.mutationEpoch});
     if(current.sessionId!==a.freshSessionId)throw new Error('INVALID_FRESH_START');
     let pendingGeneric: CompilerAttemptV4['freshActions'][number]['witness'] | undefined;
-    for(const record of trace.successfulPath){
+    for(const [index,record] of trace.successfulPath.entries()){
       if(record.type==='action_goal'){const f=a.freshActions.find(x=>x.traceRecordId===record.recordId)!;
         if (pendingGeneric) {
           const before = point(f.witness.postEffect.before);
@@ -153,7 +172,22 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
             throw new Error('INVALID_FRESH_GENERIC_CONTINUATION');
           current = before; pendingGeneric = undefined;
         }
-        if(!same(current,point(f.witness.postEffect.before)))throw new Error('INVALID_FRESH_ACTION_ORDER');
+        const before=point(f.witness.postEffect.before);
+        if(record.stateRefresh){
+          const preceding=trace.successfulPath[index-1];
+          const freshPrior=preceding?.type==='verification_goal'?
+            a.freshVerifications.find(v=>v.traceRecordId===preceding.recordId)?.observation:undefined;
+          if(trace.source.semanticMode!=='poc_v1'||preceding?.type!=='verification_goal'||
+            'verificationVersion' in preceding||preceding.observations.at(-1)?.request.kind!=='current_url'||
+            freshPrior?.status!=='complete'||!('request'in freshPrior)||freshPrior.request.kind!=='current_url'||
+            !same(current,point(freshPrior))||before.sessionId!==current.sessionId||
+            before.pageId!==current.pageId||
+            before.stateEpoch<=current.stateEpoch||before.mutationEpoch<current.mutationEpoch||
+            Date.parse(f.witness.preparation.observedAt)<Date.parse(freshPrior.observedAt))
+            throw new Error('INVALID_FRESH_URL_REFRESH');
+          current=before;
+        }
+        if(!same(current,before))throw new Error('INVALID_FRESH_ACTION_ORDER');
         if (f.witness.postEffect.effect.kind === 'generic_activation') pendingGeneric = f.witness;
         else { if (!f.retirement) throw new Error('MISSING_FRESH_RETIREMENT'); current=point(f.retirement.after); }
       }else if(record.type==='navigate'){const f=a.freshNavigations.find(x=>x.traceRecordId===record.recordId)!;

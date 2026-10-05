@@ -222,6 +222,8 @@ for(const [name,html,goal,decision,reason,owners,optionsCount] of [
    decisionTurn:1,
    ...(decision==='true'||decision==='false'?{comparisonKind:'native_owned_option_selected',comparisonExpected:true}:{}),
    ...(reason?{reason}:{}),...(optionsCount===undefined?{}:{optionCandidateCount:optionsCount})});
+  expect(diagnostics?.[0]?.observationAttempts).toEqual([expect.objectContaining({stepId:'verify',strategy:'native_owned_option',
+   observationKind:'native_owned_option_state',outcome:decision==='true'||decision==='false'?'complete':'observation_error'})]);
   if(name==='constraint mismatch')expect(diagnostics?.[0]?.unresolvedConstraint).toBe('label:Country');
   if(decision==='true'||decision==='false')expect(diagnostics?.[0]).toMatchObject({observationKind:'native_owned_option_state',
    observed:decision==='true',optionSelected:decision==='true',optionValue:'runtime-one'});

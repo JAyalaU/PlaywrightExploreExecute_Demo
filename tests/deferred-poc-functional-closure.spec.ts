@@ -8,6 +8,9 @@ import { runAgenticSubprocessAdapterV2 } from '../app/subprocess/agentic-entry.j
 import { SuccessfulTraceV5Store } from '../app/evidence/trace-store-v5.js';
 import { DeferredCompilerV4Store } from '../app/evidence/deferred-compiler-store-v4.js';
 import { DeferredReplayV9Store, requireTrustedDeferredReplayReadbackV1 } from '../app/evidence/deferred-replay-store-v9.js';
+import { DeferredWorkflowStopStoreV1 } from '../app/evidence/deferred-workflow-store.js';
+import { parseProtectedTraceCaptureBundleV5 } from '../app/exploration/trace-assembly-v5.js';
+import { successfulTraceDigestV5 } from '../app/domain/agentic-trace-v5.js';
 import { deferredFiveStepSource } from './helpers/deferred-five-step-source.js';
 
 test.describe.configure({ mode: 'serial' });
@@ -22,7 +25,7 @@ const gate = 'PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE';
 const optionMarkup = '<select><option value="">Please select an option</option>' +
   '<option value="1">Option 1</option><option value="2">Option 2</option></select>';
 type Case = 'normal' | 'duplicate_links' | 'wrong_url' | 'duplicate_selects' | 'missing_option' |
-  'replay_disagreement' | 'next_observation_unavailable' | 'direct_action';
+  'replay_disagreement' | 'next_observation_unavailable' | 'compiler_url_snapshot_unavailable' | 'direct_action';
 
 async function fixture(mode: Case) {
   const artifactRoot = await mkdtemp(path.join(tmpdir(), 'deferred-poc-closure-'));
@@ -86,7 +89,8 @@ async function fixture(mode: Case) {
   ProtectedContextFactory.prototype.open = async function (...args) {
     const browser = await originalOpen.apply(this, args);
     const ordinal = openedContexts.push(browser.context);
-    if (mode === 'next_observation_unavailable' && ordinal === 1)
+    if (mode === 'next_observation_unavailable' && ordinal === 1 ||
+        mode === 'compiler_url_snapshot_unavailable' && ordinal === 2)
       browser.context.on('page', (page) => page.on('framenavigated', (frame) => {
         if (frame === page.mainFrame() && frame.url() === dropdownUrl)
           frame.content = async () => { throw new Error('Fixture: next protected observation unavailable'); };
@@ -130,6 +134,7 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     const response = await f.run();
     if (response.kind === 'bridge_error') throw new Error('Bridge error');
     expect(response.context.result.terminal.status, JSON.stringify(response)).toBe('QA_ASSERTION_PASSED');
+    expect(JSON.stringify(response)).not.toContain('observationAttempts');
     expect(response.context.result.cleanup).toBe('verified');
     expect(response.context.result.executionRunIds).toHaveLength(2);
     expect(f.denied).toEqual([]);
@@ -176,6 +181,18 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     expect(link.continuation?.after.stateDigest).toBe(urlRecord.preStateDigest);
     expect(link.continuation?.after.stateDigest).not.toBe(link.witness.postEffect.before.stateDigest);
     const selection = artifact.successfulPath.find((step) => step.type === 'action_goal' && step.originStepId === 's4');
+    if (selection?.type !== 'action_goal') throw new Error('Missing selection action');
+    expect(selection.stateRefresh).toMatchObject({fromObservationId:urlRecord.observationIds[0],
+      after:expect.objectContaining({pageId:urlRecord.observations[0]!.pageId,
+        stateEpoch:expect.any(Number)})});
+    const changed = structuredClone(artifact);
+    const changedSelection = changed.successfulPath[3];
+    if (changedSelection?.type !== 'action_goal' || !changedSelection.stateRefresh)
+      throw new Error('Missing URL state refresh');
+    changedSelection.stateRefresh.after.pageId = 'unrelated-page';
+    const {traceDigest:_changedDigest,...changedData}=changed;
+    changed.traceDigest=successfulTraceDigestV5(changedData);
+    expect(()=>parseProtectedTraceCaptureBundleV5(trace.protectedArtifact().capture,changed)).toThrow();
     expect(selection?.type === 'action_goal' ? selection.witness.postEffect.effect : undefined)
       .toMatchObject({ kind: 'native_choice', value: '1' });
     const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
@@ -187,6 +204,14 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     expect(compiler.protectedArtifact().resolved?.schemaVersion).toBe('9');
     expect(compiler.protectedArtifact().resolved?.executionSteps.find((step) => step.originStepId === 's3'))
       .toMatchObject({ type: 'verification_goal', assertion: { kind: 'url', operator: 'equal', expected: dropdownUrl } });
+    const privateDiagnostics=await new DeferredWorkflowStopStoreV1(f.artifactRoot)
+      .readVerificationDiagnostics(result.testSpecId,result.explorationAttemptId!,result.profileFingerprint);
+    expect(privateDiagnostics.find((item)=>item.stepId==='s3')?.observationAttempts).toEqual([
+      expect.objectContaining({stepId:'s3',strategy:'poc_resulting_url',observationKind:'current_url',
+        outcome:'complete',selectedPageBefore:'open',selectedPageAfter:'open',
+        currentUrlBefore:dropdownUrl,currentUrlAfter:dropdownUrl,elapsedMs:expect.any(Number)})]);
+    expect(privateDiagnostics.find((item)=>item.stepId==='s5')?.observationAttempts).toEqual([
+      expect.objectContaining({stepId:'s5',strategy:'native_owned_option',observationKind:'native_owned_option_state',outcome:'complete'})]);
     const pair = await new DeferredReplayV9Store(f.artifactRoot)
       .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiler);
     const replay = requireTrustedDeferredReplayReadbackV1(pair).record;
@@ -250,17 +275,45 @@ test('wrong resulting URL becomes an agreeing QA assertion failure', async () =>
   } finally { await f.close(); }
 });
 
-test('returned click is retained when the following URL observation cannot access the new document', async () => {
+test('URL verification succeeds without a document snapshot; later grounding still stops if the document is unavailable', async () => {
   const f = await fixture('next_observation_unavailable');
   try {
     const response = await f.run();
     if (response.kind === 'bridge_error') throw new Error('Bridge error');
     const result = response.context.result;
-    expect(result.terminal.stage).toBe('exploration');
-    expect(result.terminal.status).toBe('EXPLORATION_UNRESOLVED');
+    expect(result.terminal.stage).toBe('environment');
+    expect(result.terminal.status).toBe('ENVIRONMENT_FAILED');
     expect(result.deferredStage?.stage).toBe('grounding');
     expect(result.executionRunIds).toEqual([]);
     expect(result.cleanup).toBe('verified');
+    const privateAccounting=await new DeferredWorkflowStopStoreV1(f.artifactRoot).readPrivateAccounting(result.testSpecId);
+    expect(privateAccounting.verificationDiagnostics?.find((item)=>item.stepId==='s3')?.observationAttempts).toEqual([
+      expect.objectContaining({stepId:'s3',strategy:'poc_resulting_url',observationKind:'current_url',
+        outcome:'complete',currentUrlBefore:dropdownUrl,currentUrlAfter:dropdownUrl})]);
+    expect(privateAccounting.verificationDiagnostics?.find((item)=>item.stepId==='s3'))
+      .toMatchObject({decision:'true',observed:dropdownUrl,comparisonAttempted:true});
+    expect(JSON.stringify(response)).not.toContain('observationAttempts');
+  } finally { await f.close(); }
+});
+
+test('fresh compiler URL verification succeeds without a document snapshot', async () => {
+  const f = await fixture('compiler_url_snapshot_unavailable');
+  try {
+    const response = await f.run();
+    if (response.kind === 'bridge_error') throw new Error('Bridge error');
+    const result = response.context.result;
+    expect(result.terminal.status).toBe('ENVIRONMENT_FAILED');
+    expect(result.deferredStage?.stage).toBe('compilation');
+    expect(result.executionRunIds).toEqual([]);
+    expect(result.cleanup).toBe('verified');
+    const accounting = await new DeferredWorkflowStopStoreV1(f.artifactRoot)
+      .readPrivateAccounting(result.testSpecId);
+    expect(accounting.compilerAttempt?.verificationObservationDiagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({originStepId:'s3',assertionKind:'url',observationKind:'current_url',
+        outcome:'complete',currentUrlBefore:dropdownUrl,currentUrlAfter:dropdownUrl})]));
+    expect(accounting.compilerAttempt?.freshVerifications).toEqual(expect.arrayContaining([
+      expect.objectContaining({observation:expect.objectContaining({status:'complete',
+        result:{kind:'url',value:dropdownUrl,complete:true}})})]));
   } finally { await f.close(); }
 });
 

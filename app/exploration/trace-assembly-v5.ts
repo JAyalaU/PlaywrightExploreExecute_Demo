@@ -36,7 +36,8 @@ export function requireAssembledSuccessfulTraceV5(input: AssembledSuccessfulTrac
 }
 
 type State = Awaited<ReturnType<ActionCandidateGroundingSessionV1['protectedTraceState']>>;
-function statePoint(state: State, sessionId: string): TraceStateV5 {
+function statePoint(state: Pick<State, 'pageId' | 'stateDigest' | 'stateEpoch' | 'mutationEpoch'>,
+  sessionId: string): TraceStateV5 {
   return TraceStateV5Schema.parse({ sessionId, pageId: state.pageId, stateDigest: state.stateDigest,
     stateEpoch: state.stateEpoch, mutationEpoch: state.mutationEpoch });
 }
@@ -160,11 +161,22 @@ export class SuccessfulTraceAssemblerV5 {
       (generic ? !retirement : !!retirement),
       'V5 private finalcheck/execution/post/mapping readback mismatch');
     const { frameId: _beforeFrame, ...before } = witness.postEffect.before;
-    requireFact(same(this.#current, before), 'V5 action state chain mismatch');
+    const preceding = this.#path.at(-1);
+    const urlFact = preceding?.type === 'verification_goal' && !('verificationVersion' in preceding)
+      ? preceding.observations.at(-1) : undefined;
+    const refreshed = !same(this.#current, before);
+    requireFact(!refreshed || this.#admission.spec.semanticMode === 'poc_v1' &&
+      urlFact?.status === 'complete' && urlFact.request.kind === 'current_url' &&
+      urlFact.result.kind === 'url' && before.sessionId === this.#current.sessionId &&
+      before.pageId === this.#current.pageId &&
+      before.stateEpoch > this.#current.stateEpoch && before.mutationEpoch >= this.#current.mutationEpoch &&
+      Date.parse(witness.preparation.observedAt) >= Date.parse(urlFact.observedAt),
+      'V5 action state chain mismatch');
     const after = generic ? before : (() => { const { frameId: _afterFrame, ...state } = retirement!.after; return state; })();
     const record: SuccessfulPathRecordV5 = { type: 'action_goal', source: 'authored', recordId: `record-${randomUUID()}`,
       sequence: this.#path.length + 1, originStepId: witness.preparation.goalId,
-      preStateDigest: before.stateDigest, postStateDigest: after.stateDigest, witness,
+      preStateDigest: this.#current.stateDigest, postStateDigest: after.stateDigest, witness,
+      ...(refreshed && urlFact ? { stateRefresh: { fromObservationId: urlFact.observationId, after: before } } : {}),
       ...(retirement ? { retirement } : {}) };
     this.#actions.push({ recordId: record.recordId, witness, finalCheck: witness.finalCheck,
       execution: witness.execution, postEffect: witness.postEffect, ...(retirement ? { retirement } : {}), mappingDigest: mapping!.mappingDigest });
@@ -224,7 +236,13 @@ export class SuccessfulTraceAssemblerV5 {
     this.#path.push(record); this.#strategies.push(strategy!); this.#fresh.push({ goalStepId: goalId, observationId: latest.observationId });
   }
   async finalize(): Promise<AssembledSuccessfulTraceV5> {
-    this.#active(); const current = await ActionCandidateGroundingSessionV1.prototype.protectedTraceState.call(this.#runtime);
+    this.#active();
+    const last = this.#path.at(-1);
+    const lastUrl = last?.type === 'verification_goal' && !('verificationVersion' in last) &&
+      last.observations.at(-1)?.request.kind === 'current_url' && this.#admission.spec.semanticMode === 'poc_v1';
+    const current = lastUrl
+      ? ActionCandidateGroundingSessionV1.prototype.protectedCurrentUrlState.call(this.#runtime)
+      : await ActionCandidateGroundingSessionV1.prototype.protectedTraceState.call(this.#runtime);
     requireFact(this.#pendingGenericAction === undefined && this.#path.length === this.#admission.spec.steps.length && same(statePoint(current, this.#owner.sessionId), this.#current) &&
       same(ActionCandidateGroundingSessionV1.prototype.protectedSuccessfulGroundingWitnesses.call(this.#runtime), this.#actions.map((a) => a.witness)),
       'V5 omitted/abandoned successful path or final state drift');

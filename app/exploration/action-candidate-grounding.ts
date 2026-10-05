@@ -67,7 +67,10 @@ export class ActionCandidateGroundingError extends Error {
     'UNSUPPORTED_MAPPING' | 'UNTRUSTED_EVIDENCE' | 'SELECTED_REF_NOT_MEMBER' |
     'NO_CANDIDATES' | 'NON_UNIQUE' | 'PENDING_OBLIGATIONS' | 'NOT_ACTIONABLE' |
     'UNSUPPORTED_OPERATION' | 'BUSY' | 'UNSUPPORTED_CONTROL' | 'OPTION_ABSENT' |
-    'OPTION_NON_UNIQUE' | 'VALUE_NON_UNIQUE' | 'OPTION_DISABLED') { super(reason); this.name = 'ActionCandidateGroundingError'; }
+    'OPTION_NON_UNIQUE' | 'VALUE_NON_UNIQUE' | 'OPTION_DISABLED',
+    readonly browserFailureCause?: 'OBSERVATION_TIMEOUT'|'PAGE_CLOSED'|'CONTEXT_CLOSED'|'FRAME_DETACHED'|'NAVIGATION_IN_PROGRESS'|'BROWSER_FAILURE') {
+    super(reason); this.name = 'ActionCandidateGroundingError';
+  }
 }
 function stop(reason: ActionCandidateGroundingError['reason']): never { throw new ActionCandidateGroundingError(reason); }
 
@@ -204,6 +207,27 @@ export class ActionCandidateGroundingSessionV1 {
   async protectedTraceState(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
     return this.#state(aroundObservation);
   }
+  /** PoC URL assertions need a runtime-owned page fact, not frame content or ARIA. */
+  protectedCurrentUrlState() {
+    this.#owner();
+    if (this.#admission.spec.semanticMode !== 'poc_v1') stop('UNSUPPORTED_OPERATION');
+    const navigation = this.#navigationEpoch, mutation = this.#mutationEpoch;
+    const revision = this.#session.groundingRevision;
+    const pages = this.#session.browserSession.context.pages();
+    if (pages.length !== 1 || pages[0]!.isClosed()) stop('BROWSER_FAILURE');
+    const page = pages[0]!, url = page.url();
+    if (url.length > 2048) stop('RESULT_LIMIT');
+    this.#owner();
+    if (this.#navigationEpoch !== navigation || this.#mutationEpoch !== mutation ||
+      this.#session.groundingRevision !== revision || page.isClosed() ||
+      this.#session.browserSession.context.pages().length !== 1 ||
+      this.#session.browserSession.context.pages()[0] !== page || page.url() !== url)
+      stop('STALE_STATE');
+    const pageId = this.#id(page, 'page');
+    const stateDigest = hash({ kind: 'poc_current_url', pageId, url, navigation, mutation, revision });
+    if (stateDigest !== this.#stateKey) { this.#stateKey = stateDigest; this.#stateEpoch++; }
+    return { page, pageId, url, stateDigest, stateEpoch: this.#stateEpoch, mutationEpoch: mutation };
+  }
   protectedSuccessfulGroundingWitnesses(): readonly ActionGroundingWitnessV1[] {
     this.#owner(); return structuredClone([...this.#groundingWitnesses.values()]);
   }
@@ -262,7 +286,17 @@ export class ActionCandidateGroundingSessionV1 {
 
   async #state(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
     try { return await this.#captureState(aroundObservation); }
-    catch (error) { if (error instanceof ActionCandidateGroundingError) throw error; stop('BROWSER_FAILURE'); }
+    catch (error) {
+      if (error instanceof ActionCandidateGroundingError) throw error;
+      const message=error instanceof Error?error.message:'';
+      const cause=this.#session.browserSession.isClosed?'CONTEXT_CLOSED':
+        /context.*closed/i.test(message)?'CONTEXT_CLOSED':
+        /page.*closed/i.test(message)?'PAGE_CLOSED':
+        error instanceof Error&&error.name==='TimeoutError'?'OBSERVATION_TIMEOUT':
+        /frame was detached|detached frame/i.test(message)?'FRAME_DETACHED':
+        /navigation.*(in progress|interrupted)|navigating/i.test(message)?'NAVIGATION_IN_PROGRESS':'BROWSER_FAILURE';
+      throw new ActionCandidateGroundingError('BROWSER_FAILURE',cause);
+    }
   }
   async #captureState(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
     this.#owner();

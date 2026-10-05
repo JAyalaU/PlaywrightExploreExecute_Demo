@@ -280,6 +280,76 @@ async function verifiedInput(run:Run){
   return new SuccessfulTraceV5Store(run.root).writeSuccessfulExplorationV5(await builder.finalize());
 }
 
+async function verifiedUrlInput(run:Run){
+  const observations=new TrustedObservationSessionV1(run.session,run.runtime);
+  const controller=new GoalDirectedVerificationControllerV1(observations,run.runtime,{complete:async({context})=>JSON.stringify(
+    context.observations.length?{decisionVersion:'4',kind:'conclude',conclusion:'satisfied',comparison:{kind:'string',property:'url',operator:'equal',
+      observationId:context.observations.at(-1)!.observationId,expected:run.url}}:
+      {decisionVersion:'4',kind:'observe',request:{kind:'current_url'}})});
+  const builder=await SuccessfulTraceAssemblerV5.create({...run,observations,verification:controller});
+  const outcome=await success(run,builder);controller.noteSuccessfulGroundingWitness(outcome.witness);
+  expect((await controller.evaluate(run.admission.spec.steps[1],1)).conclusion).toBe('satisfied');
+  await builder.appendVerificationGoal('verify');
+  return new SuccessfulTraceV5Store(run.root).writeSuccessfulExplorationV5(await builder.finalize());
+}
+
+test('real source correspondence predicate remains SOURCE_CORRESPONDENCE',async()=>{
+  const run=await harness('<input>',[fill()]),original=ActionCandidateGroundingSessionV1.forFreshCompiler;
+  try{const readback=await input(run);
+    ActionCandidateGroundingSessionV1.forFreshCompiler=function(...args){
+      const handoff=original.apply(this,args),mapping=handoff.mappings.get('s1')!;
+      handoff.mappings.set('s1',{...mapping,correspondence:[]});
+      return handoff;
+    };
+    const result=await compile(run,readback);
+    expect(result.compiler.result).toMatchObject({status:'rejected',reasonCode:'SOURCE_CORRESPONDENCE'});
+    expect(result.compiler.checks).toContainEqual(expect.objectContaining({kind:'source',passed:false}));
+    expect(result.compiler.verificationObservationDiagnostics).toEqual([]);
+  }finally{ActionCandidateGroundingSessionV1.forFreshCompiler=original;await run.close();}
+});
+
+test('fresh URL observation records bounded authenticated compiler stage on success',async()=>{
+  const run=await harness('<input>',url=>[fill(),{id:'verify',type:'verification_goal',sourceText:`Confirm the URL is ${url}`,
+    instruction:`Confirm the URL is ${url}`,sourceInstructionSpan:{start:0,end:1}}]);
+  try{const readback=await verifiedUrlInput(run),result=await compile(run,readback);
+    expect(result.kind,JSON.stringify(result.compiler.result)).toBe('compiled');
+    expect(result.compiler.verificationObservationDiagnostics).toHaveLength(1);
+    expect(result.compiler.verificationObservationDiagnostics![0]).toMatchObject({stage:'verification_observation',originStepId:'verify',
+      assertionKind:'url',observationKind:'current_url',outcome:'complete',selectedPageBefore:'open',selectedPageAfter:'open',
+      currentUrlBefore:run.url,currentUrlAfter:run.url});
+    const store=new DeferredCompilerV4Store(run.root);await store.writeCompilationV4(result.artifact,readback);
+    const persisted=await store.readCompilerAttemptV4(result.compiler.testSpecId,result.compiler.compilerAttemptId,readback);
+    expect(persisted.verificationObservationDiagnostics).toEqual(result.compiler.verificationObservationDiagnostics);
+  }finally{await run.close();}
+});
+
+for(const failure of [
+  {name:'timeout',error:()=>Object.assign(new Error('Secret timeout detail'),{name:'TimeoutError'}),reason:'OBSERVATION_TIMEOUT'},
+  {name:'closed page',error:()=>new Error('Target page has been closed'),reason:'PAGE_CLOSED'},
+  {name:'closed context',error:()=>new Error('Browser context has been closed'),reason:'CONTEXT_CLOSED'},
+  {name:'browser failure',error:()=>new ActionCandidateGroundingError('BROWSER_FAILURE'),reason:'BROWSER_FAILURE'},
+  {name:'wrapped Playwright timeout',error:()=>new ActionCandidateGroundingError('BROWSER_FAILURE','OBSERVATION_TIMEOUT'),reason:'OBSERVATION_TIMEOUT'},
+  {name:'typed observation failure',error:()=>new (class ObservationFailure extends Error {readonly reason='STALE_STATE';})(),reason:'STALE_STATE'},
+] as const)test(`fresh current-URL ${failure.name} is private observation failure, never source correspondence`,async()=>{
+  const run=await harness('<input>',url=>[fill(),{id:'verify',type:'verification_goal',sourceText:`Confirm the URL is ${url}`,
+    instruction:`Confirm the URL is ${url}`,sourceInstructionSpan:{start:0,end:1}}]);
+  const original=TrustedObservationSessionV1.prototype.observe;
+  try{const readback=await verifiedUrlInput(run);
+    TrustedObservationSessionV1.prototype.observe=async function(request){if((request as {kind?:string}).kind==='current_url')throw failure.error();
+      return original.call(this,request);};
+    const result=await compile(run,readback);
+    expect(result.kind).toBe('compilation_stop');expect(result.resolved).toBeUndefined();
+    expect(result.compiler.result).toMatchObject({status:'rejected',reasonCode:'ENVIRONMENT_FAILURE'});
+    expect(result.compiler.verificationObservationDiagnostics).toHaveLength(1);
+    expect(result.compiler.verificationObservationDiagnostics![0]).toMatchObject({stage:'verification_observation',originStepId:'verify',
+      assertionKind:'url',observationKind:'current_url',outcome:'threw',internalReason:failure.reason});
+    expect(JSON.stringify(result.compiler)).not.toContain('Secret timeout detail');
+    const store=new DeferredCompilerV4Store(run.root);await store.writeCompilationV4(result.artifact,readback);
+    const persisted=await store.readCompilerAttemptV4(result.compiler.testSpecId,result.compiler.compilerAttemptId,readback);
+    expect(persisted.verificationObservationDiagnostics).toEqual(result.compiler.verificationObservationDiagnostics);
+  }finally{TrustedObservationSessionV1.prototype.observe=original;await run.close();}
+});
+
 test('ordered native fill and VerificationGoal project fresh trusted strategy into v9',async()=>{
   const run=await harness('<input>',[fill(),verification()]);
   try{const readback=await verifiedInput(run),result=await compile(run,readback);expect(result.kind,JSON.stringify(result.compiler.result)).toBe('compiled');
