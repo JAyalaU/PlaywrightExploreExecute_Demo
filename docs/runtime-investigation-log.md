@@ -1,5 +1,9 @@
 # Runtime investigation log
 
+## 2026-10-05 — Browser backend A/B experiment completed after Docker recovery
+
+- See [browser-backend-ab-experiment.md](browser-backend-ab-experiment.md). After the earlier Docker preflight block, all six read-only D/W/W/D/D/W sessions completed with HTTP 200, 46 root links and one exact `Dropdown` link; classification `BACKENDS_BEHAVE_EQUIVALENTLY` for root content. The trusted Docker profile is headed while the derived Windows profile is headless.
+
 ## 2026-10-05 — Docker versus Windows differential audit
 
 - Source-only baseline-to-working-tree comparison: see [docker-vs-windows-regression-audit.md](docker-vs-windows-regression-audit.md). The `poc-live-view-e2e-pass` tag is current HEAD; migration and later diagnostic/navigation changes are uncommitted. The best next discriminator is one read-only root navigation under each backend with passive main-document lifecycle evidence. No public workflow, provider call, or browser/network integration test ran for this audit.
