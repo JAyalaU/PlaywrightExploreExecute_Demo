@@ -131,6 +131,11 @@ export class DeferredViewerLifecycle {
   #lastSuccessfulFrameAt: string | undefined;
   #activeSession: ProtectedBrowserSession | undefined;
   #documentState: FrameDocumentState | undefined;
+  /** Observation only: no capture, control, or lifecycle mutation. */
+  get diagnosticState(): 'ready' | 'transient_unavailable' | 'terminal_unavailable' | 'closed' {
+    return this.#closed ? 'closed' : this.#failed ? 'terminal_unavailable' :
+      this.#frameUnavailable ? 'transient_unavailable' : 'ready';
+  }
 
   private constructor(socket: net.Socket, streamId: string, testSpecId: string, mode: 'rfb' | 'frame_stream',
     diagnostic?: DeferredBrowserDiagnosticSink) {

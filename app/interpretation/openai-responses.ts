@@ -16,6 +16,7 @@ import { ACTION_V2_PRIMARY_RESPONSE_FORMAT, ACTION_V2_INDEPENDENT_RESPONSE_FORMA
   PREVIOUS_CANONICAL_ACTION_V2_PRIMARY_RESPONSE_FORMAT,
   PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT } from './deferred-action-v2-wire.js';
 import { POC_PRIMARY_RESPONSE_FORMAT, POC_FIDELITY_RESPONSE_FORMAT } from './deferred-action-poc-wire.js';
+import { SEMANTIC_INTENT_PRIMARY_V3_FORMAT, SEMANTIC_INTENT_FIDELITY_V3_FORMAT } from './semantic-intent-v3-wire.js';
 import { ACTION_GROUNDING_RESPONSE_FORMAT, ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT } from './action-grounding-wire.js';
 import { NATIVE_OPTION_VERIFICATION_RESPONSE_FORMAT } from './native-option-verification-wire.js';
 import { liveProviderDebugEnabled, recordLiveProviderError } from './deferred-action-v2-live-debug.js';
@@ -25,6 +26,7 @@ type ResponseFormat = typeof INTERPRETATION_RESPONSE_FORMAT | typeof AGENTIC_INT
   typeof AGENTIC_DECISION_RESPONSE_FORMAT | typeof AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT |
   typeof DEFERRED_ACTION_INTERPRETATION_RESPONSE_FORMAT | typeof ACTION_V2_PRIMARY_RESPONSE_FORMAT |
   typeof PREVIOUS_ACTION_V2_PRIMARY_RESPONSE_FORMAT |
+  typeof SEMANTIC_INTENT_PRIMARY_V3_FORMAT | typeof SEMANTIC_INTENT_FIDELITY_V3_FORMAT |
   typeof ACTION_GROUNDING_RESPONSE_FORMAT | typeof NATIVE_OPTION_VERIFICATION_RESPONSE_FORMAT;
 export type OpenAIReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -194,7 +196,8 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
       const callId = randomUUID();
       const deferredSourceFormat = request.format === ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
         request.format === ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === POC_PRIMARY_RESPONSE_FORMAT || request.format === POC_FIDELITY_RESPONSE_FORMAT;
+        request.format === POC_PRIMARY_RESPONSE_FORMAT || request.format === POC_FIDELITY_RESPONSE_FORMAT ||
+        request.format === SEMANTIC_INTENT_PRIMARY_V3_FORMAT || request.format === SEMANTIC_INTENT_FIDELITY_V3_FORMAT;
       const stage = request.format === INTERPRETATION_RESPONSE_FORMAT ||
         request.format === AGENTIC_INTERPRETATION_RESPONSE_FORMAT ||
         request.format === STRUCTURED_ACTION_INTERPRETATION_RESPONSE_FORMAT ||
@@ -209,7 +212,8 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
         request.format === PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
         request.format === ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
         request.format === ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === POC_PRIMARY_RESPONSE_FORMAT || request.format === POC_FIDELITY_RESPONSE_FORMAT ? 'interpretation' :
+        request.format === POC_PRIMARY_RESPONSE_FORMAT || request.format === POC_FIDELITY_RESPONSE_FORMAT ||
+        request.format === SEMANTIC_INTENT_PRIMARY_V3_FORMAT || request.format === SEMANTIC_INTENT_FIDELITY_V3_FORMAT ? 'interpretation' :
         request.format === AGENTIC_DECISION_RESPONSE_FORMAT || request.format === ACTION_GROUNDING_RESPONSE_FORMAT ||
           request.format === ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT ? 'agentic_decision' :
           request.format === AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT ||
@@ -256,6 +260,8 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
             request.format !== ACTION_V2_INDEPENDENT_RESPONSE_FORMAT &&
             request.format !== POC_PRIMARY_RESPONSE_FORMAT &&
             request.format !== POC_FIDELITY_RESPONSE_FORMAT &&
+            request.format !== SEMANTIC_INTENT_PRIMARY_V3_FORMAT &&
+            request.format !== SEMANTIC_INTENT_FIDELITY_V3_FORMAT &&
             request.format !== ACTION_GROUNDING_RESPONSE_FORMAT &&
             request.format !== ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT &&
             request.format !== STEP_DECISION_RESPONSE_FORMAT &&

@@ -41,7 +41,7 @@ export const AgenticTerminalV2Schema = z.discriminatedUnion('status', [
   z.strictObject({ stage: z.literal('cancellation'), status: z.literal('CANCELLED'), reason: z.literal('CANCELLED') }),
 ]);
 export const ResultRecordV2Schema = z.strictObject({
-  resultVersion: z.literal('2'), workflowVersion: z.enum(['agentic-exploration-v1', 'goal-directed-v1', 'structured-action-v1', 'deferred-action-v1']),
+  resultVersion: z.literal('2'), workflowVersion: z.enum(['agentic-exploration-v1', 'goal-directed-v1', 'structured-action-v1', 'deferred-action-v1', 'semantic-general-v1']),
   testSpecId: id, executionProfileRef: profileRef, profileFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   presentationMode: z.enum(['headless', 'headed']),
   observation: z.enum(['unobserved', 'no_intervention', 'intervened', 'observational']),
@@ -58,12 +58,30 @@ export const ResultRecordV2Schema = z.strictObject({
     resolvedDigest: z.string().regex(/^[a-f0-9]{64}$/), orchestrationDigest: z.string().regex(/^[a-f0-9]{64}$/),
     executionSessionIds: z.array(id).max(2), runDigests: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(2),
   }).optional(),
+  semanticReplay: z.strictObject({ sourceSchemaVersion: z.literal('7'), sourceContractVersion: z.literal('3'),
+    groundingVersion: z.literal('semantic_capability_discovery_v1'),
+    traceVersion: z.literal('semantic_grounded_trace_v1'), compilerVersion: z.literal('5'),
+    resolvedSchemaVersion: z.literal('10'), runnerVersion: z.literal('10'),
+    replayPairVersion: z.literal('2'), orchestrationId: id, traceDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    resolvedDigest: z.string().regex(/^[a-f0-9]{64}$/), pairDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    executionSessionIds: z.array(id.nullable()).max(2), runDigests: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(2),
+  }).optional(),
 }).superRefine((value, issue) => {
   const fail = (path: string, message: string): void => issue.addIssue({ code: 'custom', path: [path], message });
   const runs = value.executionRunIds;
   if ((value.workflowVersion === 'deferred-action-v1') !== (!!value.deferredReplay || !!value.deferredStage) ||
     !!value.deferredReplay && !!value.deferredStage)
     fail('deferredReplay', 'Deferred route requires isolated version and artifact linkage');
+  if (value.workflowVersion === 'semantic-general-v1' ?
+      (!!value.resolvedSpecId !== !!value.semanticReplay || !!value.deferredReplay || !!value.deferredStage) :
+      !!value.semanticReplay)
+    fail('semanticReplay', 'Semantic route requires isolated v10 replay linkage');
+  if (value.semanticReplay && (value.semanticReplay.runDigests.length !== runs.length ||
+    value.semanticReplay.executionSessionIds.length !== runs.length ||
+    new Set(value.semanticReplay.executionSessionIds.filter(Boolean)).size !==
+      value.semanticReplay.executionSessionIds.filter(Boolean).length ||
+    value.terminal.stage === 'qa' && value.semanticReplay.executionSessionIds.some(id => id === null)))
+    fail('semanticReplay', 'Semantic replay linkage must match fresh run count');
   if (value.deferredStage && (runs.length || value.resolvedSpecId ||
     !['interpretation', 'exploration', 'compilation', 'environment', 'cancellation'].includes(value.terminal.stage)))
     fail('deferredStage', 'Pre-replay stops cannot claim resolved execution or QA');

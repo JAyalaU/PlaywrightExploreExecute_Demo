@@ -10,7 +10,7 @@ import { SubprocessProtocolError } from './protocol.js';
 export async function runAgenticSubprocessAdapterV2(input: Readable,
   loadConfiguration: () => Promise<unknown>, dependencies: LocalWorkflowTrustedDependencies,
   options: { signal?: AbortSignal;
-    workflowVersion?: 'agentic-exploration-v1' | 'goal-directed-v1' | 'structured-action-v1' | 'deferred-action-v1';
+    workflowVersion?: 'agentic-exploration-v1' | 'goal-directed-v1' | 'structured-action-v1' | 'deferred-action-v1' | 'semantic-general-v1';
     workflow?: typeof runAgenticLocalWorkflow } = {}): Promise<SubprocessResponseV2> {
   let started = false;
   try {

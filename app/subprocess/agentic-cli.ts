@@ -20,7 +20,8 @@ try {
   const args = process.argv.slice(2);
   const path = args.length === 2 && args[0] === '--config' && args[1] ? args[1] : undefined;
   const selected = process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION ?? 'agentic-exploration-v1';
-  const workflowVersion = selected === 'deferred-action-v1' && process.env.PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE === 'offline-review' ||
+  const workflowVersion = selected === 'semantic-general-v1' && process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE === 'offline-review' ||
+    selected === 'deferred-action-v1' && process.env.PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE === 'offline-review' ||
     selected === 'structured-action-v1' || selected === 'goal-directed-v1' || selected === 'agentic-exploration-v1'
     ? selected : undefined;
   const response = path && workflowVersion ? await runAgenticSubprocessAdapterV2(process.stdin,

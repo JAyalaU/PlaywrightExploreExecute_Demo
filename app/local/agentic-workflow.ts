@@ -15,26 +15,32 @@ import { projectStoredAgenticReportV2 } from '../subprocess/report-projection-v2
 import { LocalWorkflowError } from './workflow.js';
 import { runDeferredLocalWorkflowV1, deferredWorkflowOfflineReviewEnabled } from './deferred-workflow.js';
 import type { DeferredProductionModelsV1 } from '../interpretation/deferred-action-production.js';
+import { runSemanticGeneralLocalWorkflowV1, type SemanticGeneralLocalOptionsV1 } from './semantic-general-workflow.js';
 import { LocalWorkflowRequestSchema, parseTrustedLocalConfiguration, selectActivePocBrowserProfile,
   toInterpretationRequest, type LocalWorkflowTrustedDependencies } from './contracts.js';
 
 /** One trusted v2 job. The request never chooses its workflow or policy. */
 export async function runAgenticLocalWorkflow(requestInput: unknown, configInput: unknown,
   dependencies: LocalWorkflowTrustedDependencies, options: { signal?: AbortSignal;
-    workflowVersion?: 'agentic-exploration-v1' | 'goal-directed-v1' | 'structured-action-v1' | 'deferred-action-v1';
+    workflowVersion?: 'agentic-exploration-v1' | 'goal-directed-v1' | 'structured-action-v1' | 'deferred-action-v1' | 'semantic-general-v1';
     deferredModels?: DeferredProductionModelsV1;
     interpretationModel?: InterpretationModel; decisionModel?: AgenticDecisionModelV3;
-    verificationModel?: AgenticVerificationModelV4 } = {},
+    verificationModel?: AgenticVerificationModelV4 } & SemanticGeneralLocalOptionsV1 = {},
 ): Promise<SubprocessResponseV2> {
   const workflowVersion = options.workflowVersion ?? 'agentic-exploration-v1';
   if (workflowVersion === 'deferred-action-v1' && !deferredWorkflowOfflineReviewEnabled())
     throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
+  if (workflowVersion === 'semantic-general-v1' &&
+      (process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION !== 'semantic-general-v1' ||
+       process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE !== 'offline-review'))
+    throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
   if (workflowVersion !== 'agentic-exploration-v1' && workflowVersion !== 'goal-directed-v1' &&
-      workflowVersion !== 'structured-action-v1' && workflowVersion !== 'deferred-action-v1')
+      workflowVersion !== 'structured-action-v1' && workflowVersion !== 'deferred-action-v1' &&
+      workflowVersion !== 'semantic-general-v1')
     throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
   const request = LocalWorkflowRequestSchema.parse(requestInput);
   let config = parseTrustedLocalConfiguration(configInput);
-  if (workflowVersion === 'deferred-action-v1') {
+  if (workflowVersion === 'deferred-action-v1' || workflowVersion === 'semantic-general-v1') {
     try {
       const backend = parseTrustedBrowserBackend(process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND);
       if (backend === 'local-windows') {
@@ -54,6 +60,8 @@ export async function runAgenticLocalWorkflow(requestInput: unknown, configInput
   const gate = undefined;
 
   if (workflowVersion === 'deferred-action-v1') return runDeferredLocalWorkflowV1(request, config, catalog, gate, dependencies, options);
+  if (workflowVersion === 'semantic-general-v1') return runSemanticGeneralLocalWorkflowV1(
+    request, config, catalog, gate, dependencies, options);
 
   let interpretationModel: InterpretationModel;
   let decisionModel: AgenticDecisionModelV3;

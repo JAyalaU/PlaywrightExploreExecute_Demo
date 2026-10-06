@@ -65,8 +65,8 @@ class UiRun:
 
     def __init__(self, request: UiRequest, execute: Callable[..., UiFinalResult | None]):
         self.request = request
-        self.deferred_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") == "deferred-action-v1"
-        self.agentic = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"}
+        self.deferred_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") in {"deferred-action-v1", "semantic-general-v1"}
+        self.agentic = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}
         self.events = LiveEventBuffer()
         self.images = LiveImageBuffer(self.events)
         _viewer_buffers[self] = LiveViewerBuffer(self.events)
@@ -399,13 +399,13 @@ def _render_result(result: UiFinalResult) -> None:
         st.error("The engine result did not match the approved profile. No trusted QA result is available.")
         return
     if result.kind == "workflow_unavailable":
-        st.error("The selected agentic workflow is unavailable in this build. No test started.")
+        st.error("The selected workflow is unavailable or its trusted gate is not enabled. No test started.")
         return
     outcome = result.outcome
     if outcome is None:
         st.error("No trusted engine result is available.")
         return
-    if result.workflow_version in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"}:
+    if result.workflow_version in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}:
         _render_agentic_result(result)
         return
     kind = outcome["kind"]
@@ -516,6 +516,8 @@ def _render_agentic_result(result: UiFinalResult) -> None:
     if "deferredStage" in record:
         stop = record["deferredStage"]
         st.caption(f"Deferred stage: {stop['stage']} · Category: {stop['category']} · Code: {stop['code']}")
+    if "semanticReplay" in record:
+        st.caption("Semantic lineage: TestSpec v7, grounding v1, compiler v5, resolved v10, runner v10, replay pair v2")
     st.caption(f"Cleanup: {record['cleanup']}")
     if record["presentationMode"] == "headed":
         st.caption("Headed execution is observational. A separate fresh headless workflow establishes autonomous equivalence.")
@@ -570,10 +572,12 @@ def render_shell(execute: Callable[..., UiFinalResult | None] | None = None,
     st.caption("Local, single-operator workflow. Public targets require trusted approval.")
     selected_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION", "legacy")
     st.caption(f"Trusted workflow: {selected_workflow}" if selected_workflow in
-               {"legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"} else
+               {"legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"} else
                "Trusted workflow: invalid selection")
     if selected_workflow == "deferred-action-v1":
         st.caption("Deferred workflow is gated for offline review pending the independent release gate.")
+    if selected_workflow == "semantic-general-v1":
+        st.caption("Semantic generalization route - offline-review gate (experimental).")
     # Populate this slot after submission, but render it before the form and
     # the independently refreshing timeline so page growth cannot move it.
     live_view_slot = st.container()

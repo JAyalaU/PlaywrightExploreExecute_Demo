@@ -234,7 +234,7 @@ def call_node(
     if protocol_version == "2" and any(item is not None for item in (live_events, live_images, live_viewer)):
         raise ValueError("Agentic observability channel is not reviewed")
     if deferred_viewer is not None and (protocol_version != "2" or
-                                        os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") != "deferred-action-v1" or
+                                        os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") not in {"deferred-action-v1", "semantic-general-v1"} or
                                         os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") != "1"):
         raise ValueError("Deferred viewer requires trusted deferred live-view selection")
     data = (request_bytes_v2 if protocol_version == "2" else request_bytes)(request)

@@ -27,6 +27,9 @@ export interface BrowserVersions {
 export interface ProtectedSessionOptions {
   videoDir?: string;
   observationOwner?: { kind: 'attempt' | 'run'; id: string };
+  /** Private, non-authoritative lifecycle observation. Sink errors are ignored. */
+  observeLifecycle?: (boundary: 'browser_launch_started' | 'browser_launch_completed' |
+    'context_create_started' | 'context_create_completed') => void;
 }
 
 /** Trusted presentation choice. It does not alter the execution profile or QA artifacts. */
@@ -151,7 +154,11 @@ export class ProtectedContextFactory {
 
     let browser: Browser | undefined;
     let isolated: IsolatedBrowser | undefined;
+    const observe = (boundary: Parameters<NonNullable<ProtectedSessionOptions['observeLifecycle']>>[0]) => {
+      try { options?.observeLifecycle?.(boundary); } catch { /* Diagnostics cannot affect launch. */ }
+    };
     try {
+      observe('browser_launch_started');
       if (isolation === 'docker') {
         isolated = await IsolatedBrowser.open(this.presentationOptions.viewOnlyHeaded
           ? 'headed' : profilePresentationMode(effective.profile),
@@ -165,10 +172,12 @@ export class ProtectedContextFactory {
           '--disable-quic',
         ],
       });
+      observe('browser_launch_completed');
       const authState = effective.profile.authStateRef
         ? await this.authProvider!.load(effective.profile.authStateRef)
         : undefined;
       const profile = effective.profile;
+      observe('context_create_started');
       const context = await browser.newContext({
         viewport: profile.viewport,
         locale: profile.locale,
@@ -187,6 +196,7 @@ export class ProtectedContextFactory {
       });
       context.setDefaultTimeout(profile.timeoutPolicy.actionMs);
       context.setDefaultNavigationTimeout(profile.timeoutPolicy.navigationMs);
+      observe('context_create_completed');
       return new ProtectedBrowserSession(browser, context, effective, isolated);
     } catch (error) {
       try {

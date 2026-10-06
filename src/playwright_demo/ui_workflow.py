@@ -80,7 +80,7 @@ class UiFinalResult:
     outcome: Mapping[str, Any] | None = None
     projection: Mapping[str, Any] | None = None
     projection_failed: bool = False
-    workflow_version: Literal["legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"] = "legacy"
+    workflow_version: Literal["legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"] = "legacy"
 
 
 def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
@@ -91,22 +91,24 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
                     live_viewer: LiveViewerBuffer | None = None,
                     deferred_viewer: DeferredViewerBuffer | None = None,
                     cancel_event: threading.Event | None = None,
-                    workflow_version: Literal["legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"] = "legacy") -> UiFinalResult:
+                    workflow_version: Literal["legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"] = "legacy") -> UiFinalResult:
     """Select trusted authority, execute one v1 request, then fetch safe metadata.
 
     The config and executable are host inputs. Form fields never select either.
     """
-    if workflow_version not in {"legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"}:
+    if workflow_version not in {"legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}:
         raise ValueError("Unsupported trusted workflow selection")
     if workflow_version == "deferred-action-v1" and os.environ.get("PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE") != "offline-review":
         return UiFinalResult("workflow_unavailable", workflow_version=workflow_version)
-    if deferred_viewer is not None and (workflow_version != "deferred-action-v1" or
+    if workflow_version == "semantic-general-v1" and os.environ.get("PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE") != "offline-review":
+        return UiFinalResult("workflow_unavailable", workflow_version=workflow_version)
+    if deferred_viewer is not None and (workflow_version not in {"deferred-action-v1", "semantic-general-v1"} or
                                         os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") != "1"):
         raise ValueError("Deferred viewer requires trusted live-view selection")
     # Trusted workflow selection, not task/form input, chooses the gated demo default.
     # An explicit host deadline remains an operator/test override validated by call_node.
     host_deadline_ms = deadline_ms if deadline_ms is not None else (
-        _DEFERRED_DEMO_HOST_DEADLINE_MS if workflow_version == "deferred-action-v1" else DEFAULT_DEADLINE_MS)
+        _DEFERRED_DEMO_HOST_DEADLINE_MS if workflow_version in {"deferred-action-v1", "semantic-general-v1"} else DEFAULT_DEADLINE_MS)
     _diagnostic("submitted")
     if not config_path:
         _diagnostic("admission_unavailable")
@@ -115,7 +117,7 @@ def run_ui_workflow(request: UiRequest, *, config_path: str | Path | None,
     admission_entry = root / "dist" / "profile" / "admission-cli.js"
     engine_entry = root / "dist" / "subprocess" / "cli.js"
     projection_entry = root / "dist" / "subprocess" / "report-projection-cli.js"
-    if workflow_version in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"}:
+    if workflow_version in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}:
         engine_entry = root / "dist" / "subprocess" / "agentic-cli.js"
         projection_entry = root / "dist" / "subprocess" / "report-projection-v2-cli.js"
         if workflow_version == "deferred-action-v1":
@@ -227,7 +229,7 @@ def run_local_ui_request(request: UiRequest, *, live_events: LiveEventBuffer | N
 
 def _agentic_result(outcome: Mapping[str, Any], approval: Mapping[str, Any],
                     config_path: str | Path, projection_entry: Path,
-                    node_executable: str | Path, workflow_version: Literal["agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1"]) -> UiFinalResult:
+                    node_executable: str | Path, workflow_version: Literal["agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"]) -> UiFinalResult:
     """Keep v2 terminal authoritative even if read-only projection fails."""
     if outcome["kind"] == "process_failure":
         return UiFinalResult("engine", outcome=outcome, workflow_version=workflow_version)
