@@ -33,7 +33,8 @@ export const SuccessfulActionGroundingRecordV5Schema = z.strictObject({ ...base,
     z.strictObject({ nextActionWitnessId: id, after: TraceStateV5Schema }),
   ]).optional() });
 export const SuccessfulNavigationRecordV5Schema = z.strictObject({ ...base, type: z.literal('navigate'),
-  url: ApprovedAbsoluteUrlSchema, before: TraceStateV5Schema, after: TraceStateV5Schema, observedAt: z.iso.datetime() });
+  url: ApprovedAbsoluteUrlSchema, before: TraceStateV5Schema, after: TraceStateV5Schema, observedAt: z.iso.datetime(),
+  bootstrapAdopted: z.literal(true).optional() });
 export const SuccessfulPathRecordV5Schema = z.union([
   SuccessfulActionGroundingRecordV5Schema, SuccessfulNavigationRecordV5Schema, SuccessfulVerificationRecordV3Schema, NativeOptionVerificationRecordV5Schema,
 ]);
@@ -158,6 +159,9 @@ export function parseSuccessfulExplorationTraceV5(input: unknown,
         stateEpoch: actionAfter.stateEpoch, mutationEpoch: actionAfter.mutationEpoch }; actions++;
     } else if (record.type === 'navigate' && step.type === 'navigate') {
       requireFact(record.url === step.url && same(record.before, current) && record.after.sessionId === trace.sessionId &&
+        (!record.bootstrapAdopted || source.semanticMode === 'poc_v1' && index === 0 &&
+          step.url === new URL(step.url).href &&
+          new URL(source.startState.url).href === new URL(step.url).href) &&
         record.after.pageId === current.pageId && record.after.stateDigest === record.postStateDigest &&
         record.after.stateEpoch > current.stateEpoch && record.after.mutationEpoch > current.mutationEpoch &&
         Date.parse(record.observedAt) >= Date.parse(trace.startedAt) && Date.parse(record.observedAt) <= Date.parse(trace.finishedAt),

@@ -1,5 +1,34 @@
 # Current status
 
+## Active PoC candidate state capture (2026-10-05)
+
+`poc_v1` candidate grounding no longer requires a whole-body ARIA snapshot. Its state, freshness, continuity, and evidence digests use the existing bounded frame content, frame URL/identity, page ownership, and navigation/mutation/revision epochs. Targeted candidate/ref, actionability, and native-option proofs remain unchanged; historical grounding still reads whole-body ARIA. Focused tests and the local five-step view-off/view-on closures pass. A public rerun is still required to confirm the live failure is resolved.
+
+## Windows-native deferred live view (2026-10-05)
+
+The `local-windows` deferred production path now publishes bounded JPEG frames from the actual active Playwright page through the authenticated private deferred viewer channel. Streamlit keeps only the current phase's latest frame, clears it on owner transition or close, and offers no input channel. A capture/display failure removes the view while authoritative QA continues. The existing Docker backend retains its RFB/noVNC viewer and remains the supported default. Offline local five-step fixtures prove the same QA pass with viewing off and on, four distinct viewer owners, verified browser cleanup, and zero Docker launches; actual Streamlit pixels on the intended work laptop still need manual validation.
+
+## Windows-native deferred production (2026-10-05)
+
+A versioned `local-windows` profile and trusted `PLAYWRIGHT_DEMO_BROWSER_BACKEND=local-windows` selection now run the complete deferred five-step production QA path on bundled Windows Playwright Chromium. Trusted `select` and the deferred runtime derive the same distinct local profile from the operator configuration; task/request data cannot choose the backend. Offline fixture proof covers MCP exploration, trace v5, compiler v4/resolved v9, two agreeing fresh replays, authoritative QA, four distinct closed browser owners, and no Docker invocation. Docker remains the supported default and working baseline. The local frame viewer is described above.
+
+## Deferred public navigation performance (2026-10-05)
+
+The active `poc_v1` path now adopts the first completed bootstrap navigation as the first authored navigation when their canonical URLs match, the owned page ends at that exact URL, and the request did not redirect. Exploration, fresh compiler v4, and both runner v9 replays each make one root document request in that case. Trace v5, compiler v4, and runner v9 record the adoption explicitly while retaining the authored step, ordered state transition, fresh target proof, two independent replays, and QA authority. Different initial URLs still perform both transitions. A redirected bootstrap is not adopted; the protected start-state check retains its existing non-QA stop when the redirect leaves the requested URL. Runner `page.goto()` now waits for `domcontentloaded` with the existing 90-second active profile ceiling. Its first action after navigation retries only a missing or not-yet-actionable target for the profile's bounded default wait, then reruns the complete unique fresh proof; absence remains non-QA. Private opt-in timing reports request start, DOMContentLoaded, target proof, and first authored action processing per phase without adding public result fields.
+
+Offline validation: `npm test` 188/188; full five-step functional closure 24/24 with the Docker viewer fixture outside the command sandbox; focused compiler v4 45/45; focused runner v9 38/39 with only the documented pre-existing profile-fingerprint fixture mismatch; `test:current` 188 + 8 + 48 Node and 55 Python; typecheck and build passed. Local fixtures covered one request for matching URLs in all four sessions, both transitions for a differing URL, redirect non-adoption, delayed irrelevant load, a target that appears after DOMContentLoaded, a missing target's non-QA stop, two agreeing true replays, and identical view-disabled/view-enabled QA classification.
+
+After offline validation, one gated read-only protected public navigation spike used four fresh sessions and no provider call or page action. It measured start of each session to the first unique actionable `Dropdown` target, with verified cleanup. The previous authenticated observations were approximately 30.7 s for exploration's initial navigation, 31.9 s for replay 1 start-to-click, and 62.2 s for replay 2 start-to-click; compiler start-to-click was only described as tens of seconds. The new spike recorded:
+
+| Phase | Request start | DOMContentLoaded | Fresh target / would-start action | Comparison |
+|---|---:|---:|---:|---|
+| Exploration | 1.3 s | 32.0 s | 32.0 s | Near previous 30.7 s initial-navigation observation |
+| Compiler | 0.7 s | 31.4 s | 31.4 s | Earlier figure was not precise enough for a numeric delta |
+| Replay 1 | 0.8 s | 31.3 s | 31.3 s | Near previous 31.9 s start-to-click |
+| Replay 2 | 0.8 s | 31.3 s | 31.4 s | About 30.8 s faster than previous 62.2 s start-to-click |
+
+Spike times include protected session startup; request start is shown separately. The spike did not execute the five-step workflow or enable the viewer, so it measures navigation and target readiness, not a new public QA pass. Approximately 30 seconds remains before DOMContentLoaded on this target.
+
 Deferred live viewing uses a physically headed Chromium session for observation while retaining the accepted headless execution-profile metadata; the Streamlit panel states this distinction without changing QA authority.
 
 ## Deferred PoC replay target freshness (offline)

@@ -7,12 +7,17 @@ import type { TrustedDeferredWorkflowStopV1 } from '../interpretation/deferred-a
 import { DeferredWorkflowPrivateAccountingV1Schema } from '../domain/deferred-workflow-accounting.js';
 import { DeferredStartupDiagnosticV1Schema, type DeferredStartupDiagnosticV1 } from '../domain/deferred-startup-diagnostics.js';
 import { DeferredVerificationDiagnosticV1Schema, type DeferredVerificationDiagnosticV1 } from '../domain/deferred-verification-diagnostic.js';
+import { DeferredBrowserDiagnosticV1Schema, type DeferredBrowserDiagnosticV1 } from '../domain/deferred-browser-diagnostics.js';
 
 const namespace = 'deferred-workflow-stop-v1', id = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
 const envelope = z.strictObject({ storageVersion: z.literal('1'), namespace: z.literal(namespace),
   testSpecId: id, result: ResultRecordV2Schema, accounting: DeferredWorkflowPrivateAccountingV1Schema, authentication: z.string().regex(/^[a-f0-9]{64}$/) });
 const startupNamespace = 'deferred-startup-diagnostics-v1';
 const verificationNamespace = 'deferred-verification-diagnostics-v1';
+const browserNamespace = 'deferred-browser-diagnostics-v1';
+const browserEnvelope = z.strictObject({ storageVersion: z.literal('1'), namespace: z.literal(browserNamespace),
+  testSpecId: id, diagnostics: z.array(DeferredBrowserDiagnosticV1Schema).max(800),
+  authentication: z.string().regex(/^[a-f0-9]{64}$/) });
 const verificationEnvelope = z.strictObject({ storageVersion: z.literal('1'), namespace: z.literal(verificationNamespace),
   testSpecId: id, explorationAttemptId: id, profileFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   diagnostics: z.array(DeferredVerificationDiagnosticV1Schema).min(1).max(100),
@@ -52,6 +57,28 @@ export class DeferredWorkflowStopStoreV1 {
   #file(testSpecId: string) { return path.join(this.#root, namespace, id.parse(testSpecId), 'terminal.json'); }
   #startupFile(testSpecId: string) { return path.join(this.#root, startupNamespace, id.parse(testSpecId), 'startup.json'); }
   #verificationFile(testSpecId: string) { return path.join(this.#root, verificationNamespace, id.parse(testSpecId), 'verification.json'); }
+  #browserFile(testSpecId: string) { return path.join(this.#root, browserNamespace, id.parse(testSpecId), 'browser.json'); }
+  /** Private observation metadata only. It cannot authorize a workflow result. */
+  async writeBrowserDiagnostics(testSpecId: string, diagnostics: readonly DeferredBrowserDiagnosticV1[]) {
+    const data = { storageVersion: '1' as const, namespace: browserNamespace, testSpecId,
+      diagnostics: structuredClone(diagnostics) };
+    browserEnvelope.omit({ authentication: true }).parse(data);
+    const authentication = createHmac('sha256', await this.#authority()).update(JSON.stringify(data)).digest('hex');
+    const file = this.#browserFile(testSpecId); await this.#directory(path.dirname(file), true);
+    const temporary = path.join(path.dirname(file), `.pending-${randomUUID()}`), handle = await open(temporary, 'wx', 0o600);
+    try { await handle.writeFile(JSON.stringify({ ...data, authentication })); await handle.sync(); }
+    catch (error) { await handle.close(); await unlink(temporary); throw error; }
+    await handle.close(); try { await link(temporary, file); } finally { await unlink(temporary); }
+    return this.readBrowserDiagnostics(testSpecId);
+  }
+  async readBrowserDiagnostics(testSpecId: string) {
+    const file = this.#browserFile(testSpecId); await this.#directory(path.dirname(file), false);
+    const { authentication, ...data } = browserEnvelope.parse(JSON.parse((await regular(file, 1024 * 1024)).toString('utf8')));
+    const expected = createHmac('sha256', await this.#authority()).update(JSON.stringify(data)).digest();
+    if (!timingSafeEqual(expected, Buffer.from(authentication, 'hex')) || data.testSpecId !== testSpecId)
+      throw new Error('Browser diagnostic authentication mismatch');
+    return data.diagnostics;
+  }
   /** Successful exploration diagnostics remain private and have no QA authority. */
   async writeVerificationDiagnostics(testSpecId: string, explorationAttemptId: string, profileFingerprint: string,
     diagnostics: readonly DeferredVerificationDiagnosticV1[]) {

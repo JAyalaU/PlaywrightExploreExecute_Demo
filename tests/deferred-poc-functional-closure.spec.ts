@@ -5,7 +5,10 @@ import path from 'node:path';
 import net from 'node:net';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { ProtectedContextFactory } from '../app/profile/index.js';
+import { ProfileCatalog, ProtectedContextFactory, parseTrustedBrowserBackend } from '../app/profile/index.js';
+import { IsolatedBrowser } from '../app/profile/isolated-browser.js';
+import { parseTrustedLocalConfiguration, selectActivePocBrowserProfile } from '../app/local/contracts.js';
+import { McpExplorationSession } from '../app/exploration/mcp.js';
 import { runAgenticSubprocessAdapterV2 } from '../app/subprocess/agentic-entry.js';
 import { SuccessfulTraceV5Store } from '../app/evidence/trace-store-v5.js';
 import { DeferredCompilerV4Store } from '../app/evidence/deferred-compiler-store-v4.js';
@@ -16,7 +19,8 @@ import { successfulTraceDigestV5 } from '../app/domain/agentic-trace-v5.js';
 import { candidateGroundingDigest as hash } from '../app/domain/action-candidate-grounding.js';
 import { parseDeferredRunnerRecordV9 } from '../app/domain/deferred-action-runner.js';
 import { deferredFiveStepSource } from './helpers/deferred-five-step-source.js';
-import { DeferredViewerNoticeSchema, type DeferredViewerNotice } from '../app/observability/deferred-viewer-channel.js';
+import { DeferredViewerNoticeSchema, DeferredFrameNoticeSchema,
+  type DeferredViewerNotice, type DeferredFrameNotice } from '../app/observability/deferred-viewer-channel.js';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -33,22 +37,28 @@ type Case = 'normal' | 'duplicate_links' | 'wrong_url' | 'duplicate_selects' | '
   'replay_disagreement' | 'next_observation_unavailable' | 'compiler_url_snapshot_unavailable' |
   'runner_url_snapshot_unavailable' | 'runner_no_page' | 'runner_closed_page' | 'direct_action' |
   'runner_unrelated_drift' | 'runner_missing_select' | 'runner_duplicate_selects' |
-  'runner_missing_option' | 'runner_changed_option' | 'runner_frame_drift';
+  'runner_missing_option' | 'runner_changed_option' | 'runner_frame_drift' |
+  'different_initial' | 'redirect_initial' | 'delayed_load' | 'delayed_target' | 'missing_target' |
+  'runner_state_read_timeout';
 
-async function fixture(mode: Case, isolated = false) {
+async function fixture(mode: Case, isolated = false, localWindows = false, failFrameCapture = false,
+  slowCandidateRead = false) {
   const artifactRoot = await mkdtemp(path.join(tmpdir(), 'deferred-poc-closure-'));
   const config = {
     profiles: [{ id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 },
       locale: 'en-US', timeoutPolicy: { actionMs: 5000, navigationMs: 5000, waits: { default: 3000 } },
       networkPolicyRef: { id: 'fixture', version: '1' },
-      ...(isolated ? { profileSchemaVersion: '3', presentationMode: 'headless', browserIsolation: 'docker' } : {}) }],
+      ...(isolated || localWindows ? { profileSchemaVersion: '3', presentationMode: 'headless', browserIsolation: 'docker' } : {}) }],
     networkPolicies: [{ id: 'fixture', version: '1', destinations: [{ host: 'the-internet.herokuapp.com',
       ports: [443], addresses: ['127.0.0.1'] }] }],
     evidencePolicy: { finalScreenshot: false, failureScreenshot: false, failureTrace: false,
       failureVideo: false, sensitiveBinaryApproved: false }, artifactRoot, retentionDays: 7,
   };
   const request = { taskText: mode === 'direct_action' ? directActionTask : authoredTask,
-    targetUrl: rootUrl, executionProfileRef: { id: 'desktop', version: '1' } };
+    targetUrl: mode === 'different_initial' ? `${rootUrl}start` : rootUrl,
+    executionProfileRef: { id: 'desktop', version: '1' } };
+  if (localWindows) request.executionProfileRef = selectActivePocBrowserProfile(
+    parseTrustedLocalConfiguration(config), 'local-windows').reference;
   const providerFormats: string[] = [];
   const primary = [
     { id: 's1', type: 'navigate', url: rootUrl },
@@ -94,11 +104,26 @@ async function fixture(mode: Case, isolated = false) {
   };
 
   const originalOpen = ProtectedContextFactory.prototype.open;
-  const routed: string[] = [], denied: string[] = [], openedContexts: object[] = [];
+  const routed: string[] = [], denied: string[] = [], openedContexts: object[] = [],
+    openedSessions: Awaited<ReturnType<typeof originalOpen>>[] = [], rootRequests: number[] = [];
   let runnerDrifts = 0;
   ProtectedContextFactory.prototype.open = async function (...args) {
     const browser = await originalOpen.apply(this, args);
+    openedSessions.push(browser);
     const ordinal = openedContexts.push(browser.context);
+    rootRequests.push(0);
+    if (failFrameCapture && ordinal === 1)
+      browser.context.newCDPSession = async () => { throw new Error('Fixture: observational frame capture unavailable'); };
+    if (slowCandidateRead && ordinal === 1)
+      browser.context.on('page', page => page.on('framenavigated', frame => {
+        if (frame !== page.mainFrame() || frame.url() !== dropdownUrl) return;
+        const original = frame.content.bind(frame);
+        let delayed = false;
+        frame.content = async () => {
+          if (!delayed) { delayed = true; await new Promise(resolve => setTimeout(resolve, 2200)); }
+          return original();
+        };
+      }));
     if (mode === 'next_observation_unavailable' && ordinal === 1 ||
         mode === 'compiler_url_snapshot_unavailable' && ordinal === 2 ||
         mode === 'runner_url_snapshot_unavailable' && ordinal >= 3)
@@ -126,16 +151,50 @@ async function fixture(mode: Case, isolated = false) {
           return snapshot;
         };
       }));
+    if (mode === 'runner_state_read_timeout' && ordinal >= 3)
+      browser.context.on('page', page => page.on('framenavigated', frame => {
+        if (frame !== page.mainFrame() || frame.url() !== dropdownUrl) return;
+        const originalLocator = frame.locator.bind(frame);
+        frame.locator = ((selector: string) => {
+          const locator = originalLocator(selector);
+          if (selector !== 'body') return locator;
+          const originalNested = locator.locator.bind(locator);
+          locator.locator = ((nested: string) => {
+            const value = originalNested(nested);
+            if (nested === 'runner_v9_state=') value.textContent = async () => {
+              await new Promise(resolve => setTimeout(resolve, 3_050));
+              const error = new Error('locator.textContent: Timeout 3000ms exceeded; private body text');
+              error.name = 'TimeoutError'; throw error;
+            };
+            return value;
+          }) as typeof locator.locator;
+          return locator;
+        }) as typeof frame.locator;
+      }));
     await browser.context.route('**/*', async (route) => {
       const url = route.request().url();
       routed.push(url);
       if (route.request().method() !== 'GET') { denied.push(url); await route.abort('blockedbyclient'); return; }
       const disagreement = mode === 'replay_disagreement' && ordinal === 4;
       if (url === rootUrl) {
+        rootRequests[ordinal - 1]!++;
+        if(mode === 'redirect_initial' && rootRequests[ordinal - 1] === 1){
+          await route.fulfill({status:302,headers:{location:`${rootUrl}bounce`},body:''});return;
+        }
         const href = mode === 'wrong_url' || disagreement ? '/wrong' : '/dropdown';
         const links = `<a href="${href}">Dropdown</a>`;
+        const runner = ordinal >= 3;
+        const body = runner && mode === 'delayed_target' ?
+          `<script>setTimeout(() => document.body.innerHTML = ${JSON.stringify(links)}, 350)</script>` :
+          runner && mode === 'missing_target' ? '<main></main>' :
+          runner && mode === 'delayed_load' ? links + '<img src="/slow-resource">' : links;
         await route.fulfill({ status: 200, contentType: 'text/html',
-          body: mode === 'duplicate_links' ? links + links : links });
+          body: mode === 'duplicate_links' ? links + links : body });
+      } else if (url === `${rootUrl}start` || url === `${rootUrl}bounce`) {
+        await route.fulfill({ status: 200,contentType:'text/html',body:'' });
+      } else if (url === `${rootUrl}slow-resource`) {
+        await new Promise(resolve=>setTimeout(resolve,1500));
+        await route.fulfill({ status:200,contentType:'image/png',body:Buffer.from('iVBORw0KGgo=', 'base64') }).catch(()=>{});
       } else if (url === dropdownUrl || url === wrongUrl) {
         const runner = ordinal >= 3;
         const options = mode === 'missing_option' || runner && mode === 'runner_missing_option' ?
@@ -150,8 +209,11 @@ async function fixture(mode: Case, isolated = false) {
     return browser;
   };
   const oldGate = process.env[gate]; process.env[gate] = 'offline-review';
+  const oldBackend = process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND;
+  if (localWindows) process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
+  else delete process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND;
   return {
-    artifactRoot, config, request, providerFormats, routed, denied, openedContexts,
+    artifactRoot, config, request, providerFormats, routed, denied, openedContexts, openedSessions, rootRequests,
     runnerDrifts: () => runnerDrifts,
     run: () => runAgenticSubprocessAdapterV2(Readable.from([JSON.stringify({ protocolVersion: '2', request })]),
       async () => config, { provider: { apiKey: () => 'MOCK_ONLY', fetchImpl } },
@@ -159,10 +221,347 @@ async function fixture(mode: Case, isolated = false) {
     close: async () => {
       ProtectedContextFactory.prototype.open = originalOpen;
       if (oldGate === undefined) delete process.env[gate]; else process.env[gate] = oldGate;
+      if (oldBackend === undefined) delete process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND;
+      else process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = oldBackend;
       await rm(artifactRoot, { recursive: true, force: true });
     },
   };
 }
+
+async function withoutDocker<T>(run: () => Promise<T>): Promise<T> {
+  const original = IsolatedBrowser.open;
+  IsolatedBrowser.open = async () => { throw new Error('Docker path reached'); };
+  try { return await run(); }
+  finally { IsolatedBrowser.open = original; }
+}
+
+test('local-windows MCP controls the owned context with navigate, snapshot and query', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const f = await fixture('normal', false, true);
+  try {
+    await withoutDocker(async () => {
+      const selected = selectActivePocBrowserProfile(parseTrustedLocalConfiguration(f.config), 'local-windows');
+      const catalog = new ProfileCatalog(selected.config.profiles, selected.config.networkPolicies);
+      const mcp = await McpExplorationSession.open(new ProtectedContextFactory(catalog),
+        selected.reference, catalog.resolve(selected.reference));
+      try {
+        await mcp.navigate(rootUrl);
+        expect(await mcp.snapshot()).toContain('Dropdown');
+        expect(await mcp.find('Dropdown')).toContain('Dropdown');
+        expect(mcp.browserSession.context.pages()).toHaveLength(1);
+      } finally { await mcp.close(); }
+    });
+    expect(f.openedSessions).toHaveLength(1);
+    expect(f.openedSessions[0]!.context.browser()?.isConnected()).toBe(false);
+  } finally { await f.close(); }
+});
+
+test('local-windows trusted selection completes five-step production QA with four owned browsers and no Docker', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const f = await fixture('normal', false, true);
+  try {
+    await withoutDocker(async () => {
+      const selected = selectActivePocBrowserProfile(parseTrustedLocalConfiguration(f.config), 'local-windows');
+      expect(selected.reference).toEqual(f.request.executionProfileRef);
+      expect(selected.config.profiles.at(-1)).toMatchObject({ profileSchemaVersion: '5',
+        browserIsolation: 'local-windows', browserRuntime: 'playwright-chromium-windows' });
+      expect(selected.fingerprint).not.toBe(new ProfileCatalog(f.config.profiles, f.config.networkPolicies)
+        .resolve({ id: 'desktop', version: '1' }).fingerprint);
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error(`Bridge error: ${response.code}`);
+      const result = response.context.result;
+      expect(result.terminal.status, JSON.stringify(response)).toBe('QA_ASSERTION_PASSED');
+      expect(result.cleanup).toBe('verified');
+      expect(result.executionProfileRef).toEqual(selected.reference);
+      expect(result.profileFingerprint).toBe(selected.fingerprint);
+      expect(result.executionRunIds).toHaveLength(2);
+      expect(f.denied).toEqual([]);
+      expect(new Set(f.routed)).toEqual(new Set([rootUrl, dropdownUrl]));
+      expect(f.openedSessions).toHaveLength(4);
+      expect(new Set(f.openedContexts).size).toBe(4);
+      const browsers = f.openedSessions.map(session => session.context.browser());
+      expect(new Set(browsers).size).toBe(4);
+      for (const session of f.openedSessions) {
+        expect(session.isClosed).toBe(true);
+        expect(session.context.browser()?.isConnected()).toBe(false);
+        expect(session.isolationContainerId).toBeUndefined();
+        await expect(session.context.newPage()).rejects.toThrow();
+      }
+      expect(f.providerFormats).toEqual([
+        'qa_deferred_semantic_poc_primary_v1', 'qa_deferred_semantic_poc_fidelity_v1']);
+      const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+        .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+      expect(trace.protectedArtifact().trace.traceVersion).toBe('5');
+      const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
+        .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+      expect(compiler.protectedArtifact().compiler.compilerVersion).toBe('4');
+      expect(compiler.protectedArtifact().resolved?.schemaVersion).toBe('9');
+      const pair = await new DeferredReplayV9Store(f.artifactRoot)
+        .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiler);
+      const replay = requireTrustedDeferredReplayReadbackV1(pair).record;
+      expect(replay.agreement).toBe('agreed');
+      expect(replay.runs.map(run => run.result)).toEqual([
+        { kind: 'completed', passed: true, assertions: 2 },
+        { kind: 'completed', passed: true, assertions: 2 },
+      ]);
+      expect(replay.runs.map(run => run.cleanup)).toEqual(['verified', 'verified']);
+      const diagnostics = await new DeferredWorkflowStopStoreV1(f.artifactRoot).readBrowserDiagnostics(result.testSpecId);
+      const bootstrapEvents = diagnostics.filter(event => event.source === 'grounding' &&
+        event.ownerId === result.explorationAttemptId && event.operation === 'main_document_navigation' &&
+        event.currentUrl === rootUrl);
+      const rootStart = bootstrapEvents.find(event => event.outcome === 'started');
+      const rootCommit = bootstrapEvents.find(event => event.outcome === 'success' && event.navigationCommitted);
+      const rootResponse = diagnostics.find(event => event.source === 'grounding' &&
+        event.ownerId === result.explorationAttemptId && event.operation === 'main_document_response' &&
+        event.currentUrl === rootUrl && event.mainResponseStatusClass === '2xx');
+      const firstCandidate = diagnostics.find(event => event.source === 'grounding' &&
+        event.ownerId === result.explorationAttemptId && event.operation === 'candidate_enumeration' &&
+        event.stepId === 's2');
+      const rootQuery = diagnostics.find(event => event.source === 'grounding' &&
+        event.ownerId === result.explorationAttemptId && event.operation === 'document_readiness' &&
+        event.readinessBoundary === 'before_candidate_query' && event.stepId === 's2' && event.outcome === 'success');
+      expect(rootStart).toMatchObject({ pageId: rootCommit?.pageId, mainFrameId: rootCommit?.mainFrameId });
+      expect(rootCommit).toMatchObject({ documentGenerationId: rootStart?.documentGenerationId,
+        navigationCommitted: true });
+      expect(rootResponse).toMatchObject({ documentGenerationId: rootCommit?.documentGenerationId });
+      expect(rootQuery).toMatchObject({ documentGenerationId: rootCommit?.documentGenerationId,
+        pageId: rootCommit?.pageId, mainFrameId: rootCommit?.mainFrameId,
+        documentReadyState: 'complete', domContentLoadedObserved: true, loadObserved: true });
+      expect(firstCandidate).toMatchObject({ documentGenerationId: rootCommit?.documentGenerationId,
+        pageId: rootCommit?.pageId, mainFrameId: rootCommit?.mainFrameId });
+      const readiness = diagnostics.filter(event => event.source === 'grounding' &&
+        event.operation === 'document_readiness' && event.outcome !== 'started' &&
+        event.ownerId === result.explorationAttemptId);
+      expect(readiness.map(event => event.readinessBoundary)).toEqual(expect.arrayContaining([
+        'before_click', 'after_click', 'url_observation', 'before_candidate_query']));
+      const urlRead = readiness.filter(event => event.readinessBoundary === 'url_observation').at(-1);
+      const candidateRead = readiness.find(event => event.readinessBoundary === 'before_candidate_query' && event.stepId === 's4');
+      expect(candidateRead).toMatchObject({ documentReplacedSinceUrlObservation: false,
+        documentGenerationId: urlRead?.documentGenerationId, mainResponseStatusClass: '2xx' });
+      const inventory = diagnostics.find(event => event.source === 'grounding' && event.stepId === 's4' &&
+        event.operation === 'native_select_inventory');
+      expect(inventory).toMatchObject({ documentGenerationId: candidateRead?.documentGenerationId,
+        nativeSelectCount: 1, visibleNativeSelectCount: 1, enabledNativeSelectCount: 1 });
+      expect(JSON.stringify(response.context.result)).not.toContain('documentGenerationId');
+      for (const run of replay.runs) {
+        const owner = diagnostics.filter(event => event.source === 'runner' && event.ownerId === run.executionRunId);
+        expect(owner.some(event => event.operation === 'pre_action_ownership' && event.outcome === 'success')).toBe(true);
+        expect(owner.some(event => event.operation === 'rich_after_url' && event.outcome === 'success')).toBe(true);
+        expect(owner.some(event => event.operation === 'frame_content' && event.outcome === 'success')).toBe(true);
+        expect(owner.some(event => event.operation === 'runner_v9_state' && event.outcome === 'success')).toBe(true);
+        expect(owner.some(event => event.operation === 'execution_entry_ownership' && event.outcome === 'success')).toBe(true);
+      }
+    });
+  } finally { await f.close(); }
+});
+
+test('local-windows live frames follow all four owners without changing five-step QA or cleanup', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  test.setTimeout(180_000);
+  const streamId = randomUUID(), capability = randomBytes(32).toString('hex');
+  const notices: DeferredFrameNotice[] = [];
+  let wireError: unknown;
+  let finishWire!: () => void;
+  const wireEnded = new Promise<void>(resolve => { finishWire = resolve; });
+  const wireSockets = new Set<net.Socket>();
+  const server = net.createServer(socket => {
+    wireSockets.add(socket);
+    let pending = '', greeted = false;
+    socket.on('data', bytes => {
+      pending += bytes.toString('utf8');
+      let end: number;
+      while ((end = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, end); pending = pending.slice(end + 1);
+        try {
+          const value: unknown = JSON.parse(line);
+          if (!greeted) {
+            expect(value).toEqual({ deferredViewerVersion: '1', kind: 'hello', streamId, capability });
+            greeted = true;
+            socket.write(JSON.stringify({ deferredViewerVersion: '1', kind: 'ready', streamId }) + '\n');
+          } else notices.push(DeferredFrameNoticeSchema.parse(value));
+        } catch (error) { wireError = error; socket.destroy(); }
+      }
+    });
+    socket.on('close', () => { wireSockets.delete(socket); finishWire(); });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('No viewer loopback listener');
+  const envKeys = ['PLAYWRIGHT_DEMO_LIVE_VIEW', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT',
+    'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_STREAM_ID', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_CAPABILITY'] as const;
+  const oldEnv = envKeys.map(key => process.env[key]);
+  process.env[envKeys[0]] = '1'; process.env[envKeys[1]] = String(address.port);
+  process.env[envKeys[2]] = streamId; process.env[envKeys[3]] = capability;
+  const f = await fixture('normal', false, true, false, true);
+  try {
+    await withoutDocker(async () => {
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error(`Live-view bridge error: ${response.code}`);
+      await Promise.race([wireEnded, new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error('Frame viewer channel did not close')), 5000))]);
+      if (wireError) throw wireError;
+      const result = response.context.result;
+      expect(result.terminal.status, JSON.stringify(result)).toBe('QA_ASSERTION_PASSED');
+      expect(result.cleanup).toBe('verified');
+      expect(result.executionRunIds).toHaveLength(2);
+      expect(new Set(f.openedContexts).size).toBe(4);
+      expect(f.openedSessions.every(session => session.context.browser()?.isConnected() === false)).toBe(true);
+      const phases = ['exploration', 'compilation', 'replay_1', 'replay_2'];
+      const owners = [result.explorationAttemptId, result.compilerAttemptId, ...result.executionRunIds];
+      expect(notices.filter(notice => notice.kind === 'ready').map(notice => notice.phase)).toEqual(phases);
+      expect(notices.filter(notice => notice.kind === 'ready').map(notice => notice.ownerId)).toEqual(owners);
+      expect(notices.filter(notice => notice.kind === 'closed').map(notice => notice.phase)).toEqual(phases);
+      expect(notices.filter(notice => notice.kind === 'transition').map(notice => notice.phase)).toEqual(phases.slice(0, 3));
+      expect(notices.some(notice => notice.kind === 'frame')).toBe(true);
+      expect(notices.filter(notice => notice.kind === 'frame').every(notice =>
+        owners[phases.indexOf(notice.phase)] === notice.ownerId)).toBe(true);
+      expect(notices.every(notice => !('port' in notice) && !('path' in notice))).toBe(true);
+      expect(notices.some(notice => notice.kind === 'unavailable')).toBe(false);
+      expect(JSON.stringify(result)).not.toContain('imageBase64');
+      expect(JSON.stringify(result)).not.toContain('frame_stream');
+      const diagnostics = await new DeferredWorkflowStopStoreV1(f.artifactRoot)
+        .readBrowserDiagnostics(result.testSpecId);
+      const captures = diagnostics.filter(item => item.source === 'viewer' && item.phase === 'exploration' &&
+        item.operation === 'capture' && item.outcome === 'success');
+      const selectRead = diagnostics.find(item => item.source === 'grounding' && item.stepId === 's4' &&
+        item.operation === 'initial_state');
+      expect(captures.length).toBeGreaterThanOrEqual(2);
+      expect(selectRead).toBeDefined();
+      expect(captures.some(item => item.startedAtMs < selectRead!.endedAtMs &&
+        item.endedAtMs > selectRead!.startedAtMs)).toBe(true);
+      for (const runId of result.executionRunIds) {
+        const runner = diagnostics.filter(item => item.source === 'runner' && item.ownerId === runId);
+        const viewer = diagnostics.filter(item => item.source === 'viewer' && item.ownerId === runId);
+        expect(runner.some(item => item.operation === 'rich_after_url' && item.outcome === 'success')).toBe(true);
+        expect(viewer.some(item => item.operation === 'ready')).toBe(true);
+        expect(runner.every(item => Number.isFinite(item.startedAtMs) && Number.isFinite(item.endedAtMs))).toBe(true);
+      }
+      expect(diagnostics.every(item => item.ownerId === result.explorationAttemptId ||
+        item.ownerId === result.compilerAttemptId || result.executionRunIds.includes(item.ownerId!))).toBe(true);
+      expect(JSON.stringify(diagnostics)).not.toContain('imageBase64');
+      expect(JSON.stringify(diagnostics)).not.toContain('<select>');
+      const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+        .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+      const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
+        .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+      const pair = await new DeferredReplayV9Store(f.artifactRoot)
+        .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiler);
+      expect(requireTrustedDeferredReplayReadbackV1(pair).record.agreement).toBe('agreed');
+    });
+  } finally {
+    await f.close();
+    envKeys.forEach((key, index) => { if (oldEnv[index] === undefined) delete process.env[key]; else process.env[key] = oldEnv[index]; });
+    wireSockets.forEach(socket => socket.destroy());
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('local-windows frame capture loss leaves the five-step QA result authoritative', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  test.setTimeout(180_000);
+  const streamId = randomUUID(), capability = randomBytes(32).toString('hex');
+  const notices: DeferredFrameNotice[] = [];
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    let pending = '', greeted = false;
+    socket.on('data', bytes => {
+      pending += bytes.toString('utf8');
+      let end: number;
+      while ((end = pending.indexOf('\n')) >= 0) {
+        const value: unknown = JSON.parse(pending.slice(0, end)); pending = pending.slice(end + 1);
+        if (!greeted) {
+          greeted = true;
+          socket.write(JSON.stringify({ deferredViewerVersion: '1', kind: 'ready', streamId }) + '\n');
+        } else notices.push(DeferredFrameNoticeSchema.parse(value));
+      }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('No viewer loopback listener');
+  const envKeys = ['PLAYWRIGHT_DEMO_LIVE_VIEW', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT',
+    'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_STREAM_ID', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_CAPABILITY'] as const;
+  const oldEnv = envKeys.map(key => process.env[key]);
+  process.env[envKeys[0]] = '1'; process.env[envKeys[1]] = String(address.port);
+  process.env[envKeys[2]] = streamId; process.env[envKeys[3]] = capability;
+  const f = await fixture('normal', false, true, true);
+  try {
+    await withoutDocker(async () => {
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error(`Live-view bridge error: ${response.code}`);
+      expect(response.context.result.terminal.status).toBe('QA_ASSERTION_PASSED');
+      expect(response.context.result.cleanup).toBe('verified');
+      expect(f.openedSessions).toHaveLength(4);
+      expect(f.openedSessions.every(session => session.context.browser()?.isConnected() === false)).toBe(true);
+      expect(notices.some(notice => notice.kind === 'unavailable' && notice.phase === 'exploration')).toBe(true);
+      const diagnostics = await new DeferredWorkflowStopStoreV1(f.artifactRoot)
+        .readBrowserDiagnostics(response.context.result.testSpecId);
+      expect(diagnostics).toEqual(expect.arrayContaining([
+        expect.objectContaining({ source: 'viewer', phase: 'exploration', operation: 'capture', outcome: 'failure' }),
+        expect.objectContaining({ source: 'viewer', phase: 'exploration', operation: 'unavailable', outcome: 'success' }),
+      ]));
+      expect(JSON.stringify(response.context.result)).not.toContain('diagnostics');
+    });
+  } finally {
+    await f.close();
+    envKeys.forEach((key, index) => { if (oldEnv[index] === undefined) delete process.env[key]; else process.env[key] = oldEnv[index]; });
+    sockets.forEach(socket => socket.destroy());
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('local-windows rejects profile mismatch and missing trusted viewer channel before browser or Docker launch', async () => {
+  const f = await fixture('normal', false, true);
+  const oldView = process.env.PLAYWRIGHT_DEMO_LIVE_VIEW;
+  try {
+    await withoutDocker(async () => {
+      f.request.executionProfileRef = { id: 'desktop', version: '1' };
+      expect(await f.run()).toMatchObject({ kind: 'bridge_error', code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
+      expect(f.openedSessions).toHaveLength(0);
+      f.request.executionProfileRef = selectActivePocBrowserProfile(
+        parseTrustedLocalConfiguration(f.config), 'local-windows').reference;
+      delete process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND;
+      expect(await f.run()).toMatchObject({ kind: 'bridge_error', code: 'PROFILE_UNAVAILABLE', cleanup: 'not_started' });
+      process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
+      process.env.PLAYWRIGHT_DEMO_LIVE_VIEW = '1';
+      expect(await f.run()).toMatchObject({ kind: 'bridge_error', code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
+      expect(f.openedSessions).toHaveLength(0);
+    });
+  } finally {
+    if (oldView === undefined) delete process.env.PLAYWRIGHT_DEMO_LIVE_VIEW;
+    else process.env.PLAYWRIGHT_DEMO_LIVE_VIEW = oldView;
+    await f.close();
+  }
+});
+
+test('absent backend selection retains the trusted Docker profile and fingerprint', async () => {
+  const f = await fixture('normal', true);
+  try {
+    const config = parseTrustedLocalConfiguration(f.config);
+    const selected = selectActivePocBrowserProfile(config, parseTrustedBrowserBackend(undefined));
+    expect(selected.config).toBe(config);
+    expect(selected.reference).toEqual({ id: 'desktop', version: '1' });
+    expect(selected.fingerprint).toBe(new ProfileCatalog(config.profiles, config.networkPolicies)
+      .resolve(selected.reference).fingerprint);
+  } finally { await f.close(); }
+});
+
+test('local-windows ambiguous target remains non-QA and closes its browser', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const f = await fixture('duplicate_links', false, true);
+  try {
+    await withoutDocker(async () => {
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error(`Bridge error: ${response.code}`);
+      expect(response.context.result.terminal.stage).toBe('exploration');
+      expect(response.context.result.deferredStage?.code).toBe('NON_UNIQUE');
+      expect(response.context.result.cleanup).toBe('verified');
+      expect(f.openedSessions).toHaveLength(1);
+      expect(f.openedSessions[0]!.context.browser()?.isConnected()).toBe(false);
+    });
+  } finally { await f.close(); }
+});
 
 test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 replays and authoritative QA pass', async () => {
   const f = await fixture('normal');
@@ -177,6 +576,7 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     expect(f.denied).toEqual([]);
     expect(new Set(f.routed)).toEqual(new Set([rootUrl, dropdownUrl]));
     expect(new Set(f.openedContexts).size).toBe(4);
+    expect(f.rootRequests).toEqual([1,1,1,1]);
     expect(f.providerFormats.slice(0, 2)).toEqual([
       'qa_deferred_semantic_poc_primary_v1', 'qa_deferred_semantic_poc_fidelity_v1']);
     expect(new Set(f.providerFormats)).toEqual(new Set([
@@ -189,6 +589,7 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     expect(artifact.source.sourceInstruction).toBe(authoredTask);
     expect(artifact.source.steps.map((step) => step.type)).toEqual([
       'navigate', 'action_goal', 'verification_goal', 'action_goal', 'verification_goal']);
+    expect(artifact.successfulPath[0]).toMatchObject({type:'navigate',bootstrapAdopted:true});
     const linkSource = artifact.source.steps[1]!;
     expect(linkSource.type === 'action_goal' ? linkSource.obligations : []).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'constraint', constraint: 'role', authoredText: 'link' }),
@@ -235,6 +636,7 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
       .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
     expect(compiler.protectedArtifact().compiler.compilerVersion).toBe('4');
+    expect(compiler.protectedArtifact().compiler.freshNavigations[0]).toMatchObject({bootstrapAdopted:true});
     const freshLink = compiler.protectedArtifact().compiler.freshActions.find((action) => action.traceRecordId === link.recordId);
     expect(freshLink?.retirement).toBeUndefined();
     expect(freshLink?.witness.postEffect.after).toBeUndefined();
@@ -256,6 +658,7 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
     expect(replay.runs).toHaveLength(2);
     expect(new Set(replay.runs.map((run) => run.provenance?.sessionId)).size).toBe(2);
     for (const run of replay.runs) {
+      expect(run.steps[0]).toMatchObject({type:'navigate',bootstrapAdopted:true});
       expect(run.result).toMatchObject({ kind: 'completed', passed: true, assertions: 2 });
       expect(run.cleanup).toBe('verified');
       expect(run.steps.filter((step) => step.type === 'verification_goal').map((step) => step.status))
@@ -277,6 +680,45 @@ test('exact five-line PoC reaches trace v5, compiler v4, two model-free v9 repla
       expect(() => parseDeferredRunnerRecordV9(drifted)).toThrow('INVALID_RUN_STEP_V9');
     }
   } finally { await f.close(); }
+});
+
+for(const [mode,expected] of [['different_initial',[1,1,1,1]]] as const){
+  test(`${mode} keeps required physical navigation transitions`,async()=>{
+    const f=await fixture(mode);
+    try{const response=await f.run();if(response.kind==='bridge_error')throw new Error('Bridge error');
+      expect(response.context.result.terminal.status,JSON.stringify(response)).toBe('QA_ASSERTION_PASSED');
+      expect(f.rootRequests).toEqual(expected);
+      expect(f.routed.filter(url=>url===`${rootUrl}start`)).toHaveLength(4);
+      expect(response.context.result.cleanup).toBe('verified');
+    }finally{await f.close();}
+  });
+}
+
+test('redirected bootstrap never adopts the authored navigation',async()=>{
+  const f=await fixture('redirect_initial');
+  try{const response=await f.run();if(response.kind==='bridge_error')throw new Error('Bridge error');
+    expect(response.context.result.terminal.status).toBe('ENVIRONMENT_FAILED');
+    expect(f.rootRequests).toEqual([1]);
+    expect(response.context.result.cleanup).toBe('verified');
+  }finally{await f.close();}
+});
+
+for(const mode of ['delayed_load','delayed_target'] as const){
+  test(`${mode} continues after DOMContentLoaded with a fresh unique target`,async()=>{
+    const f=await fixture(mode);
+    try{const response=await f.run();if(response.kind==='bridge_error')throw new Error('Bridge error');
+      expect(response.context.result.terminal.status,JSON.stringify(response)).toBe('QA_ASSERTION_PASSED');
+      expect(f.rootRequests).toEqual([1,1,1,1]);
+    }finally{await f.close();}
+  });
+}
+
+test('missing post-DOMContentLoaded target remains a non-QA runner stop',async()=>{
+  const f=await fixture('missing_target');
+  try{const response=await f.run();if(response.kind==='bridge_error')throw new Error('Bridge error');
+    expect(response.context.result.terminal.status).toBe('REPLAY_EXECUTION_FAILED');
+    expect(response.context.result.cleanup).toBe('verified');
+  }finally{await f.close();}
 });
 
 test('trusted live view follows the same four protected sessions and preserves five-step QA', async () => {
@@ -337,6 +779,16 @@ test('trusted live view follows the same four protected sessions and preserves f
     expect(result.presentationMode).toBe('headless'); // Accepted profile mode; live rendering is view-only.
     expect(result.observation).toBe('unobserved');
     expect(result.executionRunIds).toHaveLength(2);
+    const liveTrace=await new SuccessfulTraceV5Store(live.artifactRoot)
+      .readSuccessfulExplorationV5(result.testSpecId,result.explorationAttemptId!);
+    const liveCompiler=await new DeferredCompilerV4Store(live.artifactRoot)
+      .readResolvedV9(result.testSpecId,result.compilerAttemptId!,liveTrace);
+    const livePair=await new DeferredReplayV9Store(live.artifactRoot)
+      .readReplayV1(result.testSpecId,result.deferredReplay!.orchestrationId,liveCompiler);
+    const liveReplay=requireTrustedDeferredReplayReadbackV1(livePair).record;
+    expect(liveReplay.agreement).toBe('agreed');
+    expect(liveReplay.runs).toHaveLength(2);
+    expect(liveReplay.runs.every(run=>run.result.kind==='completed'&&run.result.passed)).toBe(true);
     expect(new Set(live.openedContexts).size).toBe(4);
     expect(live.denied).toEqual([]);
     const phases = ['exploration', 'compilation', 'replay_1', 'replay_2'];
@@ -463,6 +915,42 @@ test('runner URL assertion succeeds without a document snapshot; the next DOM ac
         .toMatchObject({status:'assertion_passed',verification:{actual:dropdownUrl,evaluated:true}});
       expect(run.result).toMatchObject({kind:'non_qa_stop',failedStepId:expect.any(String)});
     }
+  } finally { await f.close(); }
+});
+
+test('local-windows delayed runner-v9 state read remains non-QA and identifies the exact timeout', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const f = await fixture('runner_state_read_timeout', false, true);
+  try {
+    await withoutDocker(async () => {
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error('Bridge error');
+      const result = response.context.result;
+      expect(result.terminal.status).toBe('ENVIRONMENT_FAILED');
+      expect(result.cleanup).toBe('verified');
+      const trace = await new SuccessfulTraceV5Store(f.artifactRoot)
+        .readSuccessfulExplorationV5(result.testSpecId, result.explorationAttemptId!);
+      const compiler = await new DeferredCompilerV4Store(f.artifactRoot)
+        .readResolvedV9(result.testSpecId, result.compilerAttemptId!, trace);
+      const pair = await new DeferredReplayV9Store(f.artifactRoot)
+        .readReplayV1(result.testSpecId, result.deferredReplay!.orchestrationId, compiler);
+      const run = requireTrustedDeferredReplayReadbackV1(pair).record.runs[0]!;
+      expect(run.result).toMatchObject({ kind: 'non_qa_stop', reasonCode: 'ENVIRONMENT_FAILURE' });
+      expect(run.steps.find(step => step.originStepId === 's3')?.status).toBe('assertion_passed');
+      expect(run.steps.find(step => step.originStepId === 's4')).toBeUndefined();
+      const diagnostics = await new DeferredWorkflowStopStoreV1(f.artifactRoot).readBrowserDiagnostics(result.testSpecId);
+      const owner = diagnostics.filter(event => event.source === 'runner' && event.ownerId === run.executionRunId);
+      expect(owner.some(event => event.operation === 'pre_action_ownership' && event.outcome === 'success')).toBe(true);
+      expect(owner.some(event => event.operation === 'frame_content' && event.outcome === 'success' &&
+        event.currentUrl === dropdownUrl)).toBe(true);
+      expect(owner).toEqual(expect.arrayContaining([
+        expect.objectContaining({ operation: 'runner_v9_state', outcome: 'failure',
+          runnerExceptionCategory: 'PLAYWRIGHT_TIMEOUT', playwrightTimeout: true }),
+        expect.objectContaining({ operation: 'rich_after_url', outcome: 'failure',
+          runnerExceptionCategory: 'PLAYWRIGHT_TIMEOUT' }),
+      ]));
+      expect(JSON.stringify(owner)).not.toContain('private body text');
+    });
   } finally { await f.close(); }
 });
 

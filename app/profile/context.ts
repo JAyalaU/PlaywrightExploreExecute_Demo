@@ -34,6 +34,15 @@ export interface ProtectedFactoryPresentationOptions {
   viewOnlyHeaded?: boolean;
 }
 
+export type TrustedBrowserBackend = 'docker-isolated' | 'local-windows';
+
+/** Read only from the operator process environment, never from task or request data. */
+export function parseTrustedBrowserBackend(value: string | undefined): TrustedBrowserBackend {
+  if (value === undefined || value === '' || value === 'docker-isolated') return 'docker-isolated';
+  if (value === 'local-windows') return value;
+  throw new Error('Unsupported trusted browser backend');
+}
+
 /** Cleanup completed, but the trusted final read before teardown failed. */
 export class ProtectedFinalCheckError extends Error {
   constructor(readonly checkError: unknown) { super('Protected final read failed'); }
@@ -111,9 +120,12 @@ export class ProtectedBrowserSession {
 }
 
 export class ProtectedContextFactory {
+  readonly browserBackend: TrustedBrowserBackend;
   constructor(readonly catalog: ProfileCatalog, readonly authProvider?: AuthStateProvider,
     readonly externalTargetGate?: ExternalTargetGate,
-    readonly presentationOptions: ProtectedFactoryPresentationOptions = {}) {}
+    readonly presentationOptions: ProtectedFactoryPresentationOptions = {}) {
+    this.browserBackend = parseTrustedBrowserBackend(process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND);
+  }
 
   /** Optional bounded presentation pause; ordinary and headless factories do nothing. */
   async pauseForObservation(_session: ProtectedBrowserSession): Promise<void> {}
@@ -122,6 +134,15 @@ export class ProtectedContextFactory {
   async open(reference: ProfileRef, expected?: EffectiveProfile, options?: ProtectedSessionOptions): Promise<ProtectedBrowserSession> {
     const effective = this.catalog.resolve(reference);
     if (expected) assertEquivalentEffectiveProfile(expected, effective);
+    const isolation = 'browserIsolation' in effective.profile ? effective.profile.browserIsolation : undefined;
+    if (isolation === 'local-windows' && this.browserBackend !== 'local-windows' ||
+        isolation === 'docker' && this.browserBackend !== 'docker-isolated' ||
+        isolation === undefined && this.browserBackend === 'local-windows') {
+      throw new Error('Browser backend and execution profile mismatch');
+    }
+    if (isolation === 'local-windows' && process.platform !== 'win32') {
+      throw new Error('Local Windows browser backend requires Windows');
+    }
     if (effective.profile.authStateRef && !this.authProvider) throw new Error('Protected auth-state provider is unavailable');
     if (this.presentationOptions.viewOnlyHeaded &&
         (!('browserIsolation' in effective.profile) || effective.profile.browserIsolation !== 'docker')) {
@@ -131,7 +152,7 @@ export class ProtectedContextFactory {
     let browser: Browser | undefined;
     let isolated: IsolatedBrowser | undefined;
     try {
-      if ('browserIsolation' in effective.profile && effective.profile.browserIsolation === 'docker') {
+      if (isolation === 'docker') {
         isolated = await IsolatedBrowser.open(this.presentationOptions.viewOnlyHeaded
           ? 'headed' : profilePresentationMode(effective.profile),
         { observationalSlowMo: !this.presentationOptions.viewOnlyHeaded });

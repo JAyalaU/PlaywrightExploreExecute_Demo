@@ -7,6 +7,8 @@ import { candidateGroundingDigest as hash } from '../domain/action-candidate-gro
 import { DeferredReplayRecordV1Schema, deriveDeferredAgreementV1, parseDeferredReplayRecordV1, deferredResultRecordV2,
   type DeferredReplayRecordV1 } from '../domain/deferred-action-replay.js';
 import type { DeferredRunnerRecordV9 } from '../domain/deferred-action-runner.js';
+import type { DeferredNavigationTimingObserver } from '../domain/deferred-navigation-timing.js';
+import type { DeferredBrowserDiagnosticSink } from '../domain/deferred-browser-diagnostics.js';
 
 const issued = new WeakSet<object>(), authority = Symbol('deferred-two-replay-origin');
 export class TrustedDeferredReplayV1 {
@@ -23,7 +25,8 @@ export function requireTrustedDeferredReplayV1(input: TrustedDeferredReplayV1): 
 }
 /** Sequential fresh replays; each invocation owns and closes its protected session. No retry or repair. */
 export async function runDeferredTwoFreshReplaysV1(factory: ProtectedContextFactory, input: TrustedResolvedTestReadbackV9,
-  onRunStart?: (ordinal: 1 | 2) => void): Promise<TrustedDeferredReplayV1> {
+  onRunStart?: (ordinal: 1 | 2) => void,onNavigationTiming?:DeferredNavigationTimingObserver,
+  onBrowserDiagnostic?:DeferredBrowserDiagnosticSink): Promise<TrustedDeferredReplayV1> {
   const artifact = requireTrustedResolvedTestReadbackV9(input);
   // Approval, profile matching and fresh session launch remain entirely with the runner.
   let presentationMode: 'headless' | 'headed' = 'headless';
@@ -35,7 +38,7 @@ export async function runDeferredTwoFreshReplaysV1(factory: ProtectedContextFact
     let run: DeferredRunnerRecordV9;
     try {
       onRunStart?.(index === 0 ? 1 : 2);
-      run = requireTrustedDeferredRunV9(await runDeferredResolvedTestV9(factory, input));
+      run = requireTrustedDeferredRunV9(await runDeferredResolvedTestV9(factory, input,onNavigationTiming,index===0?'replay_1':'replay_2',onBrowserDiagnostic));
     }
     catch { hostStop = 'RUNNER_ENVIRONMENT_FAILURE'; break; }
     runs.push(run);

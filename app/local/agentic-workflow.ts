@@ -7,7 +7,7 @@ import { finalizeAgenticOutcomeV2, runAgenticProductionV1, runGoalDirectedProduc
   createOpenAIVerificationDecisionModel,
   type AgenticDecisionModelV3, type AgenticVerificationModelV4,
   type InterpretationModel } from '../interpretation/index.js';
-import { ProfileCatalog, ProtectedContextFactory, profilePresentationMode,
+import { ProfileCatalog, ProtectedContextFactory, parseTrustedBrowserBackend, profilePresentationMode,
   type EffectiveProfile, type ProfileRef, type ProtectedBrowserSession,
   type ProtectedSessionOptions } from '../profile/index.js';
 import { envelopeForAgenticTerminalV2, type SubprocessResponseV2 } from '../subprocess/protocol-v2.js';
@@ -15,7 +15,7 @@ import { projectStoredAgenticReportV2 } from '../subprocess/report-projection-v2
 import { LocalWorkflowError } from './workflow.js';
 import { runDeferredLocalWorkflowV1, deferredWorkflowOfflineReviewEnabled } from './deferred-workflow.js';
 import type { DeferredProductionModelsV1 } from '../interpretation/deferred-action-production.js';
-import { LocalWorkflowRequestSchema, parseTrustedLocalConfiguration,
+import { LocalWorkflowRequestSchema, parseTrustedLocalConfiguration, selectActivePocBrowserProfile,
   toInterpretationRequest, type LocalWorkflowTrustedDependencies } from './contracts.js';
 
 /** One trusted v2 job. The request never chooses its workflow or policy. */
@@ -33,7 +33,19 @@ export async function runAgenticLocalWorkflow(requestInput: unknown, configInput
       workflowVersion !== 'structured-action-v1' && workflowVersion !== 'deferred-action-v1')
     throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
   const request = LocalWorkflowRequestSchema.parse(requestInput);
-  const config = parseTrustedLocalConfiguration(configInput);
+  let config = parseTrustedLocalConfiguration(configInput);
+  if (workflowVersion === 'deferred-action-v1') {
+    try {
+      const backend = parseTrustedBrowserBackend(process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND);
+      if (backend === 'local-windows') {
+        const selected = selectActivePocBrowserProfile(config, backend);
+        if (request.executionProfileRef.id !== selected.reference.id ||
+            request.executionProfileRef.version !== selected.reference.version)
+          throw new Error('Request profile does not match trusted local selection');
+        config = selected.config;
+      }
+    } catch { throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION'); }
+  }
   const catalog = new ProfileCatalog(config.profiles, config.networkPolicies);
   let effective: EffectiveProfile;
   try { effective = catalog.resolve(request.executionProfileRef); }

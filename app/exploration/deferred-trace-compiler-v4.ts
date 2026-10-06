@@ -8,6 +8,7 @@ import { requireTrustedSuccessfulTraceReadbackV5, type TrustedSuccessfulTraceRea
 import { ProtectedContextFactory, assertEquivalentEffectiveProfile } from '../profile/index.js';
 import { McpExplorationSession, MCP_VERSION } from './mcp.js';
 import { DeferredViewerPreflightError } from '../observability/deferred-viewer-channel.js';
+import { navigationTiming } from '../domain/deferred-navigation-timing.js';
 import { ActionCandidateGroundingSessionV1, ActionCandidateGroundingError } from './action-candidate-grounding.js';
 import { TrustedObservationSessionV1 } from './trusted-observation.js';
 import { evaluateDeferredAssertionV1 as evaluation } from '../domain/deferred-action-compiler.js';
@@ -89,7 +90,8 @@ function diagnosticReason(error:unknown,snapshot:BrowserSnapshot,session:McpExpl
   return 'OBSERVATION_UNAVAILABLE';
 }
 /** No model calls, legacy compilers, locator copying, or authored-language interpretation. */
-export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextFactory,readback:TrustedSuccessfulTraceReadbackV5):Promise<{
+export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextFactory,readback:TrustedSuccessfulTraceReadbackV5,
+  onNavigationTiming?:import('../domain/deferred-navigation-timing.js').DeferredNavigationTimingObserver):Promise<{
   kind:'compiled'|'compilation_stop'|'compilation_unsupported';compiler:CompilerAttemptV4;resolved?:ResolvedTestSpecV9;artifact:TrustedDeferredCompilationV4}> {
   const {trace}=requireTrustedSuccessfulTraceReadbackV5(readback),source=trace.source;
   const compilerAttemptId=id('compiler'),resolvedSpecId=id('resolved'),startedAt=new Date(Math.max(Date.now(),Date.parse(trace.finishedAt))).toISOString(),deadline=Date.now()+120_000;
@@ -107,7 +109,17 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
     session=await McpExplorationSession.open(factory,source.executionProfileRef,profile,compilerAttemptId);
     assertEquivalentEffectiveProfile(profile,session.browserSession.effectiveProfile);
     mark('profile',session.browserSession.effectiveProfile.fingerprint===trace.profileFingerprint,'PROFILE_MISMATCH');
-    if(source.startState.url!=='about:blank')await session.navigate(source.startState.url);else await session.snapshot();
+    const navigationOrigin=performance.now();
+    if(source.startState.url!=='about:blank'){
+      navigationTiming(onNavigationTiming,'compilation','request_start',navigationOrigin);
+      await session.navigate(source.startState.url);
+      navigationTiming(onNavigationTiming,'compilation','domcontentloaded',navigationOrigin);
+    }else await session.snapshot();
+    const firstRecord=trace.successfulPath[0];
+    const adoptBootstrap=source.semanticMode==='poc_v1'&&firstRecord?.type==='navigate'&&
+      firstRecord.url===new URL(firstRecord.url).href&&
+      new URL(source.startState.url).href===new URL(firstRecord.url).href&&
+      session.consumeMatchingBootstrapNavigation(firstRecord.url);
     const fresh=ActionCandidateGroundingSessionV1.forFreshCompiler(session,readback,compilerAttemptId);runtime=fresh.runtime;
     const observer=new TrustedObservationSessionV1(session,runtime);
     const nativeObserver=new NativeOptionObservationSessionV2(session,runtime);
@@ -120,9 +132,11 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
       const base={id:id('step'),traceRecordId:record.recordId,originStepId:record.originStepId,source:'authored' as const};
       if(record.type==='navigate'){
         const before=await point();
-        await session.navigate(record.url);runtime.invalidate();
+        if(!(record===firstRecord&&adoptBootstrap))await session.navigate(record.url);
+        runtime.invalidate();
         mark('order',session.browserSession.context.pages().length===1&&session.browserSession.context.pages()[0]!.url()===new URL(record.url).href,'TARGET_MISMATCH');
-        freshNavigations.push({traceRecordId:record.recordId,url:record.url,before,after:await point(),observedAt:new Date().toISOString()});
+        freshNavigations.push({traceRecordId:record.recordId,url:record.url,before,after:await point(),observedAt:new Date().toISOString(),
+          ...(record===firstRecord&&adoptBootstrap?{bootstrapAdopted:true as const}:{})});
         steps.push({...base,type:'navigate',url:record.url});continue;
       }
       if(record.type==='verification_goal'){
@@ -170,11 +184,13 @@ export async function compileDeferredSuccessfulTraceV5(factory:ProtectedContextF
         mark('order',true,'SOURCE_CORRESPONDENCE');continue;
       }
       const original=record.witness.finalCheck,mapping=fresh.mappings.get(original.goalId)!;
+      if(!freshActions.length)navigationTiming(onNavigationTiming,'compilation','authored_action_start',navigationOrigin);
       mark('source',!!mapping&&same(mapping.correspondence,original.correspondence),'SOURCE_CORRESPONDENCE',mapping.correspondence);
       // Complete broad authored domain first. Options never narrow an ambiguous control set.
       const candidate=await runtime.query(original.candidateObservation.request,deadline);
       mark('predicate',candidate.status==='complete','INCOMPLETE_EVIDENCE',candidate);
       const prepared=await runtime.prepareGrounding(candidate,mapping,original.operation,deadline);
+      if(!freshActions.length)navigationTiming(onNavigationTiming,'compilation','fresh_target_ready',navigationOrigin);
       const selected=prepared.candidateObservation.status==='complete'&&prepared.candidateObservation.candidates.find(c=>c.selectedRef===prepared.selectedRef&&c.frameId===prepared.frameId);
       const prior=original.candidateObservation.status==='complete'&&original.candidateObservation.candidates.find(c=>c.selectedRef===original.selectedRef&&c.frameId===original.frameId);
       mark('frame',!!selected&&!!prior&&same(durableDeferredFrame(selected.frame),durableDeferredFrame(prior.frame)),'FRAME_MISMATCH');

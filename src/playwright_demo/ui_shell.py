@@ -71,7 +71,8 @@ class UiRun:
         self.images = LiveImageBuffer(self.events)
         _viewer_buffers[self] = LiveViewerBuffer(self.events)
         if self.deferred_workflow and os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") == "1":
-            _deferred_viewer_buffers[self] = DeferredViewerBuffer()
+            _deferred_viewer_buffers[self] = DeferredViewerBuffer(
+                "frame_stream" if os.environ.get("PLAYWRIGHT_DEMO_BROWSER_BACKEND") == "local-windows" else "rfb")
         if self.agentic:
             self.events.mark_unavailable()
             self.images.set_state("capture_disabled")
@@ -315,12 +316,34 @@ def _render_live_viewer(viewer: LiveViewerBuffer) -> None:
 def _render_deferred_viewer(viewer: DeferredViewerBuffer) -> None:
     state, phase, handle = viewer.snapshot()
     st.subheader("Live browser view")
-    st.caption("Live view launches Chromium in headed mode. Result/profile presentationMode: headless is accepted execution-profile metadata. Viewing is observational only and does not affect QA authority.")
+    frame_mode = handle is not None and handle.get("viewerMode") == "frame_stream"
+    if frame_mode or (handle is None and viewer.mode == "frame_stream"):
+        st.caption("Frames come from the active local Chromium page. Viewing is observational only and does not affect QA authority.")
+    else:
+        st.caption("Live view launches Chromium in headed mode. Result/profile presentationMode: headless is accepted execution-profile metadata. Viewing is observational only and does not affect QA authority.")
     labels = {"exploration": "Exploration", "compilation": "Compilation",
               "replay_1": "Replay 1", "replay_2": "Replay 2"}
     st.caption(f"Current phase: {labels.get(phase, 'Preparing')}" if state != "closed" else
                f"Completed phase: {labels.get(phase, 'Preparing')}")
-    if state == "available" and handle is not None:
+    if frame_mode:
+        st.html("<script>const p=window.__p4LiveViewer; if(p){p.cancelled=true;if(p.rfb)p.rfb.disconnect();if(p.socket)p.socket.close();p.screen.remove();delete window.__p4LiveViewer}</script>",
+                unsafe_allow_javascript=True)
+        if state == "available":
+            st.caption("View only. Automation controls this browser session.")
+            if handle is not None and handle.get("frame") is not None:
+                try:
+                    st.image(handle["frame"], caption="Current execution page")
+                except Exception:
+                    viewer.mark_unavailable()
+                    st.warning("Live browser view unavailable. The final QA result is unchanged.")
+            else:
+                st.caption("Preparing image from the execution browser.")
+        else:
+            if state in {"not_started", "connecting"}: st.caption("Waiting for the execution browser.")
+            elif state == "transitioning": st.caption("Switching to the next workflow browser session.")
+            elif state == "closed": st.caption("Live browser session closed.")
+            else: st.warning("Live browser view unavailable. The final QA result is unchanged.")
+    elif state == "available" and handle is not None:
         st.caption("View only. Browser input is disabled; automation controls this session.")
         try:
             st.html(_viewer_markup(handle, allow_expired_existing=True), unsafe_allow_javascript=True)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hmac
+import base64
+import binascii
 import json
 import re
 import secrets
@@ -10,7 +12,7 @@ import socket
 import threading
 from uuid import uuid4
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, BinaryIO
 
 from .live_viewer import InvalidViewerNotice, _unique
 
@@ -19,10 +21,13 @@ _TOKEN = re.compile(r"^[a-f0-9]{64}$")
 _PHASES = ("exploration", "compilation", "replay_1", "replay_2")
 _KINDS = {"ready", "transition", "closed", "unavailable"}
 _MAX_FRAME = 2048
+_MAX_IMAGE_FRAME = 180_000
+_MAX_IMAGE_BYTES = 128 * 1024
+_MAX_FRAME_NOTICES = 4096
 
 
 def parse_deferred_viewer_notice(frame: bytes, stream_id: str) -> dict[str, Any]:
-    if len(frame) > _MAX_FRAME or not frame.endswith(b"\n") or b"\n" in frame[:-1] or b"\r" in frame:
+    if len(frame) > _MAX_IMAGE_FRAME or not frame.endswith(b"\n") or b"\n" in frame[:-1] or b"\r" in frame:
         raise InvalidViewerNotice("Invalid deferred viewer frame")
     try:
         value = json.loads(frame[:-1].decode("utf-8"), object_pairs_hook=_unique)
@@ -30,7 +35,36 @@ def parse_deferred_viewer_notice(frame: bytes, stream_id: str) -> dict[str, Any]
         raise InvalidViewerNotice("Invalid deferred viewer JSON") from error
     base = {"deferredViewerVersion", "streamId", "sequence", "kind", "phase", "ownerId", "testSpecId"}
     if type(value) is not dict or value.get("kind") not in _KINDS:
-        raise InvalidViewerNotice("Invalid deferred viewer kind")
+        if type(value) is not dict or value.get("kind") != "frame":
+            raise InvalidViewerNotice("Invalid deferred viewer kind")
+    if value.get("deferredViewerVersion") == "2":
+        required = base | {"viewerMode"} | ({"mimeType", "width", "height", "byteCount", "imageBase64"}
+                                              if value["kind"] == "frame" else set())
+        if (set(value) != required or value["viewerMode"] != "frame_stream" or
+                value["streamId"] != stream_id or type(value["sequence"]) is not int or
+                not 1 <= value["sequence"] <= _MAX_FRAME_NOTICES or
+                value["phase"] not in _PHASES or
+                type(value["ownerId"]) is not str or not _ID.fullmatch(value["ownerId"]) or
+                type(value["testSpecId"]) is not str or not _ID.fullmatch(value["testSpecId"])):
+            raise InvalidViewerNotice("Invalid deferred frame envelope")
+        if value["kind"] == "frame":
+            if (value["mimeType"] != "image/jpeg" or type(value["width"]) is not int or
+                    type(value["height"]) is not int or not 1 <= value["width"] <= 800 or
+                    not 1 <= value["height"] <= 600 or type(value["byteCount"]) is not int or
+                    not 1 <= value["byteCount"] <= _MAX_IMAGE_BYTES or
+                    type(value["imageBase64"]) is not str):
+                raise InvalidViewerNotice("Invalid deferred image metadata")
+            try:
+                image = base64.b64decode(value["imageBase64"], validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise InvalidViewerNotice("Invalid deferred image encoding") from error
+            if len(image) != value["byteCount"] or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+                raise InvalidViewerNotice("Invalid deferred image bytes")
+            value["imageBytes"] = image
+            del value["imageBase64"]
+        return value
+    if len(frame) > _MAX_FRAME:
+        raise InvalidViewerNotice("Invalid deferred viewer frame")
     required = base | ({"port", "path", "connectionCapability", "expiresAt"} if value["kind"] == "ready" else set())
     if (set(value) != required or value["deferredViewerVersion"] != "1" or value["streamId"] != stream_id or
             type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 64 or
@@ -57,7 +91,9 @@ def parse_deferred_viewer_notice(frame: bytes, stream_id: str) -> dict[str, Any]
 class DeferredViewerBuffer:
     """Volatile current-phase handle; never part of the public QA result."""
 
-    def __init__(self):
+    def __init__(self, mode_hint: str | None = None):
+        if mode_hint not in (None, "rfb", "frame_stream"):
+            raise ValueError("Invalid trusted deferred viewer mode")
         self._lock = threading.Lock()
         self.state = "not_started"
         self.phase: str | None = None
@@ -65,12 +101,18 @@ class DeferredViewerBuffer:
         self._sequence = 0
         self._test_spec_id: str | None = None
         self._owner_id: str | None = None
+        self._mode: str | None = mode_hint
         self._handle: dict[str, Any] | None = None
         self._history: list[tuple[str, str, str]] = []
 
     @property
     def stream_id(self) -> str:
         return self._stream_id
+
+    @property
+    def mode(self) -> str | None:
+        with self._lock:
+            return self._mode
 
     def add(self, frame: bytes) -> None:
         try:
@@ -80,14 +122,22 @@ class DeferredViewerBuffer:
             raise
         with self._lock:
             phase = notice["phase"]
+            mode = "frame_stream" if notice["deferredViewerVersion"] == "2" else "rfb"
             if (self.state == "unavailable" or notice["sequence"] != self._sequence + 1 or
+                    self._mode is not None and mode != self._mode or
                     self._test_spec_id is not None and notice["testSpecId"] != self._test_spec_id or
                     self.phase is not None and _PHASES.index(phase) < _PHASES.index(self.phase) or
                     self.phase is not None and _PHASES.index(phase) > _PHASES.index(self.phase) + 1):
                 self._unavailable()
                 raise InvalidViewerNotice("Deferred viewer order invalid")
             kind, owner = notice["kind"], notice["ownerId"]
-            if kind == "ready":
+            if kind == "frame":
+                if (mode != "frame_stream" or self._owner_id != owner or self.phase != phase or
+                        self.state != "available" or self._handle is None):
+                    self._unavailable()
+                    raise InvalidViewerNotice("Deferred frame owner invalid")
+                self._handle["frame"] = notice["imageBytes"]
+            elif kind == "ready":
                 first = self.phase is None and self.state in {"not_started", "connecting"} and phase == "exploration"
                 next_phase = (self.state == "transitioning" and self.phase is not None and
                               _PHASES.index(phase) == _PHASES.index(self.phase) + 1)
@@ -95,8 +145,9 @@ class DeferredViewerBuffer:
                 if not (first or next_phase or reconnect):
                     self._unavailable()
                     raise InvalidViewerNotice("Deferred viewer owner transition missing")
-                self._handle = {key: notice[key] for key in
-                                ("port", "path", "connectionCapability", "expiresAt")}
+                self._handle = ({"viewerMode": "frame_stream", "frame": None} if mode == "frame_stream" else
+                                {key: notice[key] for key in
+                                 ("port", "path", "connectionCapability", "expiresAt")})
                 self._handle["owner"] = {"kind": "run" if phase.startswith("replay_") else "attempt", "id": owner}
                 self.state = "available"
             else:
@@ -109,6 +160,7 @@ class DeferredViewerBuffer:
             self.phase = phase
             self._test_spec_id = notice["testSpecId"]
             self._owner_id = owner
+            self._mode = mode
             self._history.append((kind, phase, owner))
 
     def _unavailable(self) -> None:
@@ -170,15 +222,12 @@ class DeferredViewerChannel:
         if self._thread.is_alive(): self._thread.join(timeout=0.5)
         self.buffer.close()
 
-    def _line(self, peer: socket.socket) -> bytes:
-        frame = bytearray()
-        while not self._closed.is_set():
-            char = peer.recv(1)
-            if not char: raise InvalidViewerNotice("Viewer EOF")
-            frame.extend(char)
-            if len(frame) > _MAX_FRAME: raise InvalidViewerNotice("Viewer frame too large")
-            if char == b"\n": return bytes(frame)
-        raise InvalidViewerNotice("Viewer closed")
+    def _line(self, reader: BinaryIO, limit: int) -> bytes:
+        frame = reader.readline(limit + 1)
+        if not frame: raise InvalidViewerNotice("Viewer EOF")
+        if len(frame) > limit or not frame.endswith(b"\n"):
+            raise InvalidViewerNotice("Viewer frame too large")
+        return frame
 
     def _run(self) -> None:
         authenticated = False
@@ -191,7 +240,8 @@ class DeferredViewerChannel:
                 self._peer = peer
                 peer.settimeout(5)
                 try:
-                    hello = json.loads(self._line(peer)[:-1].decode("utf-8"), object_pairs_hook=_unique)
+                    reader = peer.makefile("rb")
+                    hello = json.loads(self._line(reader, _MAX_FRAME)[:-1].decode("utf-8"), object_pairs_hook=_unique)
                     if (type(hello) is not dict or set(hello) != {"deferredViewerVersion", "kind", "streamId", "capability"} or
                             hello["deferredViewerVersion"] != "1" or hello["kind"] != "hello" or
                             hello["streamId"] != self.buffer.stream_id or type(hello["capability"]) is not str or
@@ -204,7 +254,7 @@ class DeferredViewerChannel:
                                               "streamId": self.buffer.stream_id}) + "\n").encode())
                     peer.settimeout(None)
                     while not self._closed.is_set():
-                        try: self.buffer.add(self._line(peer))
+                        try: self.buffer.add(self._line(reader, _MAX_IMAGE_FRAME))
                         except InvalidViewerNotice as error:
                             if str(error) == "Viewer EOF":
                                 if self.buffer.snapshot()[0] not in {"closed", "not_started"}:
@@ -212,6 +262,7 @@ class DeferredViewerChannel:
                                 break
                             raise
                 finally:
+                    reader.close()
                     peer.close()
                 return
             if not authenticated: self.buffer.mark_unavailable()

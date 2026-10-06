@@ -11,6 +11,7 @@ import { executeActionGoalGroundingV1 } from './action-grounding-execution-contr
 import { GoalDirectedVerificationControllerV1, type AgenticVerificationModelV4 } from './verification-strategy.js';
 import { McpExplorationSession, McpToolError } from '../exploration/mcp.js';
 import { ActionCandidateGroundingSessionV1, ActionCandidateGroundingError } from '../exploration/action-candidate-grounding.js';
+import { DeferredDocumentReadinessTracker } from '../exploration/deferred-document-readiness.js';
 import { TrustedObservationSessionV1 } from '../exploration/trusted-observation.js';
 import { SuccessfulTraceAssemblerV5 } from '../exploration/trace-assembly-v5.js';
 import { compileDeferredSuccessfulTraceV5, requireTrustedDeferredCompilationV4 } from '../exploration/deferred-trace-compiler-v4.js';
@@ -22,6 +23,7 @@ import { DeferredWorkflowStopStoreV1 } from '../evidence/deferred-workflow-store
 import { DeferredInterpretationAttemptStoreV1 } from '../evidence/deferred-interpretation-attempt-store.js';
 import { runDeferredTwoFreshReplaysV1, requireTrustedDeferredReplayV1 } from './deferred-action-replay.js';
 import { DeferredViewerPreflightError, type DeferredViewerPhase } from '../observability/deferred-viewer-channel.js';
+import type { DeferredBrowserDiagnosticSink } from '../domain/deferred-browser-diagnostics.js';
 import { DeferredGroundingStopDiagnosticV1Schema, DeferredWorkflowPrivateAccountingV1Schema } from '../domain/deferred-workflow-accounting.js';
 import { z } from 'zod';
 import { projectDeferredReportV2 } from '../subprocess/deferred-report-projection-v2.js';
@@ -32,6 +34,7 @@ import { DeferredVerificationDiagnosticV1Schema, diagnosticText, diagnosticOptio
   type DeferredVerificationObservationAttemptV1 } from '../domain/deferred-verification-diagnostic.js';
 import type { TrustedObservationResultV1 } from '../domain/observation-contracts.js';
 import type { NativeOptionObservationV2 } from '../domain/native-option-verification.js';
+import { navigationTiming, type DeferredNavigationTimingObserver } from '../domain/deferred-navigation-timing.js';
 
 export interface DeferredProductionModelsV1 {
   extraction: PocSemanticModels;
@@ -65,7 +68,9 @@ class StageStop extends Error {
 /** Single family composition. Every downstream stage receives the actual capability issued by its predecessor. */
 export async function runDeferredActionProductionV1(factory: ProtectedContextFactory, artifactRoot: string,
   request: InterpretationRequest, models: DeferredProductionModelsV1,
-  options: { signal?: AbortSignal; onBrowserPhase?: (phase: DeferredViewerPhase) => void } = {}): Promise<{
+  options: { signal?: AbortSignal; onBrowserPhase?: (phase: DeferredViewerPhase) => void;
+    onNavigationTiming?: DeferredNavigationTimingObserver;
+    onBrowserDiagnostic?: DeferredBrowserDiagnosticSink } = {}): Promise<{
     result: ResultRecordV2; reportAvailable: boolean;
   }> {
   const profile = factory.catalog.resolve(request.executionProfileRef);
@@ -163,8 +168,30 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
       throw error;
     }
     cleanup = 'verified';
-    await recordStartup('root_navigation', () => session!.navigate(source.startState.url)); cancelled();
-    const runtime = new ActionCandidateGroundingSessionV1(session, admission, explorationAttemptId);
+    const bootstrapReadiness = source.semanticMode === 'poc_v1' ? (() => {
+      const ids = new WeakMap<object, string>();
+      const identity = (object: object, prefix: string) => {
+        let value = ids.get(object);
+        if (!value) { value = `${prefix}-${randomUUID()}`; ids.set(object, value); }
+        return value;
+      };
+      return { identity, tracker: new DeferredDocumentReadinessTracker(session!.browserSession,
+        explorationAttemptId!, options.onBrowserDiagnostic, identity) };
+    })() : undefined;
+    bootstrapReadiness?.tracker.probe('bootstrap_start', 'root_navigation');
+    const navigationOrigin=performance.now(),navigationWall=Date.now();
+    navigationTiming(options.onNavigationTiming,'exploration','request_start',navigationOrigin);
+    try { await recordStartup('root_navigation', () => session!.navigate(source.startState.url)); }
+    finally { bootstrapReadiness?.tracker.probe('bootstrap_complete', 'root_navigation'); }
+    cancelled();
+    navigationTiming(options.onNavigationTiming,'exploration','domcontentloaded',navigationOrigin);
+    const firstNavigation = source.steps[0];
+    const adoptBootstrap = source.semanticMode === 'poc_v1' && firstNavigation?.type === 'navigate' &&
+      firstNavigation.url === new URL(firstNavigation.url).href &&
+      new URL(source.startState.url).href === new URL(firstNavigation.url).href &&
+      session.consumeMatchingBootstrapNavigation(firstNavigation.url);
+    const runtime = new ActionCandidateGroundingSessionV1(session, admission, explorationAttemptId,
+      Date.now, undefined, options.onBrowserDiagnostic, bootstrapReadiness);
     const observations = new TrustedObservationSessionV1(session, runtime);
     const verification = new GoalDirectedVerificationControllerV1(observations, runtime, models.verification);
     const nativeObservations=models.nativeVerification?new NativeOptionObservationSessionV2(session,runtime):undefined;
@@ -176,6 +203,8 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
     for (const [ordinal, goal] of source.steps.entries()) {
       cancelled();
       if (goal.type === 'action_goal') {
+        const firstAction=firstGroundingDecision;
+        if(firstAction)navigationTiming(options.onNavigationTiming,'exploration','authored_action_start',navigationOrigin);
         const outcome = await executeActionGoalGroundingV1({ admission, runtime, goalId: goal.id,
           model: models.grounding, independentModel: models.independentGrounding,
           ...(firstGroundingDecision ? { aroundFirstDecision: async (prepare: () => Promise<ActionGroundingOutcomeV1>) => {
@@ -204,10 +233,13 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
           }
           throw new StageStop('grounding', outcome.category, outcome.reason);
         }
+        if(firstAction)navigationTiming(options.onNavigationTiming,'exploration','fresh_target_ready',navigationOrigin,
+          Date.parse(outcome.witness.preparation.observedAt)-navigationWall);
         accounting.successfulWitnesses.push(outcome.witness);
         builder.appendActionGroundingWitness(outcome.witness); verification.noteSuccessfulGroundingWitness(outcome.witness);
       } else if (goal.type === 'navigate') {
-        await session.navigate(goal.url); runtime.invalidate(); await builder.appendObservedNavigation(goal.id);
+        if (!(ordinal === 0 && adoptBootstrap)) await session.navigate(goal.url);
+        runtime.invalidate(); await builder.appendObservedNavigation(goal.id, ordinal === 0 && adoptBootstrap);
       } else {
         const native = 'verificationVersion' in goal;
         const started = performance.now();
@@ -296,7 +328,7 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
     try { await session.close(); } catch { cleanup = 'unverified'; throw new StageStop('trace', 'environment', 'SESSION_CLEANUP_FAILED'); }
     session = undefined; cancelled(); stage = 'compilation';
     options.onBrowserPhase?.('compilation');
-    const compiled = await compileDeferredSuccessfulTraceV5(factory, trace);
+    const compiled = await compileDeferredSuccessfulTraceV5(factory, trace, options.onNavigationTiming);
     accounting.compilerAttempt = parseCompilerAttemptV4(requireTrustedDeferredCompilationV4(compiled.artifact).compiler,
       requireTrustedSuccessfulTraceReadbackV5(trace).trace);
     const compilerStore = new DeferredCompilerV4Store(artifactRoot);
@@ -311,7 +343,8 @@ export async function runDeferredActionProductionV1(factory: ProtectedContextFac
     cancelled(); stage = 'environment';
     // Exact unchanged WP4B handoff: authenticated v9 -> runtime pair -> authenticated pair/result -> safe projection.
     const pair = await runDeferredTwoFreshReplaysV1(factory, v9,
-      ordinal => options.onBrowserPhase?.(ordinal === 1 ? 'replay_1' : 'replay_2'));
+      ordinal => options.onBrowserPhase?.(ordinal === 1 ? 'replay_1' : 'replay_2'), options.onNavigationTiming,
+      options.onBrowserDiagnostic);
     accounting.replay = requireTrustedDeferredReplayV1(pair);
     let stored;
     try { stored = await new DeferredReplayV9Store(artifactRoot).writeReplayV1(pair, v9); }

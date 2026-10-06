@@ -240,7 +240,7 @@ function headedAdmissionProfileAndPolicy(candidate: ReturnType<typeof canonicalP
   const policy = { ...base.policy, id: `admitted-headed-egress-${identity}` };
   const profile: ExecutionProfile = {
     ...base.profile, id: `admitted-public-headed-${identity}`,
-    profileSchemaVersion: '4', presentationMode: 'headed',
+    profileSchemaVersion: '4', presentationMode: 'headed', browserIsolation: 'docker',
     networkPolicyRef: { id: policy.id, version: policy.version },
   };
   return { profile, policy };

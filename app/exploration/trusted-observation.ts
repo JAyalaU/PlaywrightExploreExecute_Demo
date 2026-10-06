@@ -254,6 +254,7 @@ export class TrustedObservationSessionV1 {
             .admission.spec.semanticMode === 'poc_v1') {
         const read = () => ActionCandidateGroundingSessionV1.prototype.protectedCurrentUrlState.call(this.#current);
         const before = read(), after = read();
+        ActionCandidateGroundingSessionV1.prototype.protectedUrlObservationDiagnostic.call(this.#current);
         const state: State = { page: after.page, pageId: after.pageId, stateDigest: after.stateDigest,
           stateEpoch: after.stateEpoch, mutationEpoch: after.mutationEpoch,
           frameDigests: new Map([[after.page.mainFrame(), hash({ kind: 'poc_current_url',

@@ -36,7 +36,15 @@ export type LiveImageSink = (frame: LiveImageFrame) => void | Promise<void>;
 
 class LiveImageCaptureTimeout extends Error {}
 
-function jpegDimensions(bytes: Buffer): { width: number; height: number } | undefined {
+export type LiveImageCaptureLifecycleEvent = {
+  kind: 'timeout_fired' | 'detach_requested' | 'detach_completed' | 'detach_failed' |
+    'detach_wait_expired' | 'capture_late_settled' | 'late_result_discarded';
+  outcome?: 'success' | 'failure';
+  error?: unknown;
+};
+export type LiveImageCaptureLifecycleSink = (event: LiveImageCaptureLifecycleEvent) => void;
+
+export function jpegDimensions(bytes: Buffer): { width: number; height: number } | undefined {
   if (bytes.length < 6 || bytes.readUInt16BE(0) !== 0xffd8 ||
       bytes.readUInt16BE(bytes.length - 2) !== 0xffd9) return undefined;
   let position = 2;
@@ -59,18 +67,41 @@ function jpegDimensions(bytes: Buffer): { width: number; height: number } | unde
 }
 
 /** Chrome's viewport capture uses CDP directly: no page script, scrolling, or runner step. */
-async function captureViewportJpeg(page: Page): Promise<Buffer> {
+export async function captureViewportJpeg(page: Page, onLifecycle?: LiveImageCaptureLifecycleSink): Promise<Buffer> {
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let session: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined;
+  let detach: Promise<boolean> | undefined;
+  const report = (event: LiveImageCaptureLifecycleEvent): void => {
+    try { onLifecycle?.(event); } catch { /* Observation cannot affect browser execution. */ }
+  };
+  const detachOwnedSession = (): Promise<boolean> | undefined => {
+    if (!session) return undefined;
+    if (!detach) {
+      report({ kind: 'detach_requested' });
+      const ownedSession = session;
+      detach = Promise.resolve().then(() => ownedSession.detach()).then(() => {
+        report({ kind: 'detach_completed' }); return true;
+      }, error => {
+        report({ kind: 'detach_failed', error }); return false;
+      });
+    }
+    return detach;
+  };
   const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => { timedOut = true; reject(new LiveImageCaptureTimeout('Live image capture timed out')); },
+    timer = setTimeout(() => {
+      timedOut = true;
+      report({ kind: 'timeout_fired' });
+      void detachOwnedSession();
+      reject(new LiveImageCaptureTimeout('Live image capture timed out'));
+    },
       LIVE_IMAGE_CAPTURE_TIMEOUT_MS);
     timer.unref?.();
   });
   const capture = (async (): Promise<Buffer> => {
-    const session = await page.context().newCDPSession(page);
+    session = await page.context().newCDPSession(page);
     try {
-      if (timedOut) throw new Error('Live image capture timed out');
+      if (timedOut) throw new LiveImageCaptureTimeout('Live image capture timed out');
       const metrics = await session.send('Page.getLayoutMetrics');
       const viewport = metrics.cssVisualViewport;
       if (!viewport || !Number.isFinite(viewport.clientWidth) || !Number.isFinite(viewport.clientHeight) ||
@@ -86,11 +117,42 @@ async function captureViewportJpeg(page: Page): Promise<Buffer> {
       }
       return Buffer.from(screenshot.data, 'base64');
     } finally {
-      // Detach even if the one-second deadline wins while CDP is still pending.
-      void session.detach().catch(() => undefined);
+      // A session created after the deadline is detached as soon as it arrives.
+      void detachOwnedSession();
     }
   })();
+  // Consume a late CDP result; it must never reach a frame sender after timeout.
+  void capture.then(() => {
+    if (timedOut) {
+      report({ kind: 'capture_late_settled', outcome: 'success' });
+      report({ kind: 'late_result_discarded' });
+    }
+  }, error => {
+    if (timedOut) {
+      report({ kind: 'capture_late_settled', outcome: 'failure', error });
+      report({ kind: 'late_result_discarded' });
+    }
+  });
   try { return await Promise.race([capture, deadline]); }
+  catch (error) {
+    if (error instanceof LiveImageCaptureTimeout && timedOut) {
+      // Detach is Playwright's per-attempt CDP cancellation mechanism. Bound the
+      // wait so browser/session cleanup never hangs behind an unresponsive CDP.
+      const cleanup = detachOwnedSession();
+      if (cleanup) {
+        let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([cleanup, new Promise<void>(resolve => {
+            cleanupTimer = setTimeout(() => {
+              report({ kind: 'detach_wait_expired' }); resolve();
+            }, LIVE_IMAGE_CAPTURE_TIMEOUT_MS);
+            cleanupTimer.unref?.();
+          })]);
+        } finally { if (cleanupTimer) clearTimeout(cleanupTimer); }
+      }
+    }
+    throw error;
+  }
   finally { if (timer) clearTimeout(timer); }
 }
 
@@ -220,8 +282,8 @@ export class LiveImageCaptureCoordinator {
       }
     } catch (error) {
       if (error instanceof LiveImageCaptureTimeout) {
-        // Promise.race does not cancel CDP. Disable every later capture while the
-        // underlying request may still be pending, including after session changes.
+        // Keep this legacy stream disabled after its bounded per-attempt CDP detach;
+        // a late response from the canceled request must never reach another owner.
         this.#failures = 3;
         if (this.#timer) clearTimeout(this.#timer);
         this.#timer = undefined;

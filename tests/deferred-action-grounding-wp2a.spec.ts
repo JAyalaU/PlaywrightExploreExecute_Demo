@@ -90,6 +90,19 @@ test('unique unnamed textbox: complete role-domain, protected ref membership and
   } finally { await run.close(); }
 });
 
+test('historical candidate state still requires whole-body ARIA', async () => {
+  const run = await open('<input>');
+  const locator = run.page.mainFrame().locator('body');
+  const prototype = Object.getPrototypeOf(locator) as typeof locator;
+  const original = prototype.ariaSnapshot;
+  let calls = 0;
+  try {
+    prototype.ariaSnapshot = async () => { calls++; throw new Error('Historical ARIA unavailable'); };
+    await expect(run.runtime.query(run.request)).rejects.toMatchObject({ reason: 'BROWSER_FAILURE' });
+    expect(calls).toBe(1);
+  } finally { prototype.ariaSnapshot = original; await run.close(); }
+});
+
 test('unique unnamed combobox binds as candidate; choice membership remains pending', async () => {
   const run = await open('<select><option>Option 1</option></select>', choose());
   try {

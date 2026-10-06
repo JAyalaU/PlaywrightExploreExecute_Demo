@@ -184,7 +184,7 @@ export class SuccessfulTraceAssemblerV5 {
     if (generic) this.#pendingGenericAction = this.#path.length - 1;
   }
   /** Existing navigation is evidenced by fresh protected URL/state, never model text. */
-  async appendObservedNavigation(stepId: string): Promise<void> {
+  async appendObservedNavigation(stepId: string, bootstrapAdopted = false): Promise<void> {
     const step = this.#step('navigate', stepId);
     requireFact(step.type === 'navigate', 'V5 navigation source required');
     const state = await ActionCandidateGroundingSessionV1.prototype.protectedTraceState.call(this.#runtime);
@@ -194,7 +194,8 @@ export class SuccessfulTraceAssemblerV5 {
       'V5 navigation lacks renewed protected state');
     this.#path.push({ type: 'navigate', recordId: `record-${randomUUID()}`, sequence: this.#path.length + 1,
       source: 'authored', originStepId: step.id, preStateDigest: this.#current.stateDigest, postStateDigest: after.stateDigest,
-      url: state.page.url(), before: this.#current, after, observedAt: new Date().toISOString() });
+      url: state.page.url(), before: this.#current, after, observedAt: new Date().toISOString(),
+      ...(bootstrapAdopted ? { bootstrapAdopted: true as const } : {}) });
     this.#current = after;
   }
   async appendVerificationGoal(goalId: string): Promise<void> {

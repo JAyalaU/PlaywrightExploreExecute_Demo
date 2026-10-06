@@ -28,6 +28,10 @@ import { ActionExecutionAttemptV1Schema, ActionPostEffectV1Schema, ActionGroundi
   type ActionPostEffectV1, type ActionGroundingWitnessV1, type ActionGroundingExecutionOutcomeV1 } from '../domain/action-grounding-execution.js';
 import { ActionGroundingRetirementV1Schema, parseActionGroundingRetirementV1,
   type ActionGroundingRetirementV1 } from '../domain/action-grounding-execution.js';
+import { diagnosticBrowserState, diagnosticBrowserUrl, diagnosticElapsed, diagnosticExceptionName,
+  type DeferredBrowserDiagnosticSink, type DeferredBrowserDiagnosticV1 } from '../domain/deferred-browser-diagnostics.js';
+import { readProtectedAriaState } from './protected-aria-state.js';
+import { DeferredDocumentReadinessTracker } from './deferred-document-readiness.js';
 
 const roles: Record<'activate' | 'enter_text' | 'choose', ActionCandidateRoleV1[]> = {
   activate: ['button', 'link', 'checkbox', 'radio', 'menuitem', 'tab', 'option', 'switch', 'treeitem'],
@@ -113,9 +117,20 @@ export class ActionCandidateGroundingSessionV1 {
   #closed = false;
   #busy = false;
   #deadline = Number.POSITIVE_INFINITY;
+  readonly #diagnostic: DeferredBrowserDiagnosticSink | undefined;
+  readonly #documentReadiness: DeferredDocumentReadinessTracker;
+  readonly #readinessIdentity: ((object: object, prefix: string) => string) | undefined;
+  #queryDiagnosticStepId: string | undefined;
+  #lastBrowserFailure: { browserOperation: NonNullable<DeferredBrowserDiagnosticV1['browserOperation']>;
+    exceptionName: DeferredBrowserDiagnosticV1['exceptionName'];
+    ariaFailureCategory?: DeferredBrowserDiagnosticV1['ariaFailureCategory'];
+    playwrightTimeout?: boolean; frameState?: DeferredBrowserDiagnosticV1['frameState'] } | undefined;
 
   constructor(session: McpExplorationSession, admission: TrustedSemanticAdmissionV2,
-    attemptId: string, clock: () => number = Date.now, compilerReadback?: TrustedSuccessfulTraceReadbackV5) {
+    attemptId: string, clock: () => number = Date.now, compilerReadback?: TrustedSuccessfulTraceReadbackV5,
+    diagnostic?: DeferredBrowserDiagnosticSink,
+    bootstrapReadiness?: { tracker: DeferredDocumentReadinessTracker;
+      identity: (object: object, prefix: string) => string }) {
     const historical = compilerReadback && requireTrustedSuccessfulTraceReadbackV5(compilerReadback).trace;
     if (historical) {
       if (!same(admission.spec, historical.source) || !same(admission.record, historical.semanticAdmission) ||
@@ -126,6 +141,11 @@ export class ActionCandidateGroundingSessionV1 {
     if (!same(admission.spec.executionProfileRef, { id: effective.profile.id, version: effective.profile.version }) ||
       !/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(attemptId)) stop('INVALID_REQUEST');
     this.#session = session; this.#admission = admission; this.#attempt = attemptId; this.#clock = clock;
+    this.#diagnostic = diagnostic;
+    this.#readinessIdentity = bootstrapReadiness?.identity;
+    this.#documentReadiness = bootstrapReadiness?.tracker ?? new DeferredDocumentReadinessTracker(
+      session.browserSession, attemptId, admission.spec.semanticMode === 'poc_v1' ? diagnostic : undefined,
+      (object, prefix) => this.#id(object, prefix));
     ActionCandidateGroundingSessionV1.#owners.get(session)?.invalidate();
     ActionCandidateGroundingSessionV1.#owners.set(session, this);
     const watch = (page: Page) => {
@@ -170,6 +190,7 @@ export class ActionCandidateGroundingSessionV1 {
     return this.#compilerHandoff ? { source: this.#admission.spec, semanticAdmission: this.#admission.record } : this.#admission;
   }
   #id(object: object, prefix: string): string {
+    if (this.#readinessIdentity) return this.#readinessIdentity(object, prefix);
     let id = this.#ids.get(object);
     if (!id) { id = `${prefix}-${randomUUID()}`; this.#ids.set(object, id); }
     return id;
@@ -227,6 +248,13 @@ export class ActionCandidateGroundingSessionV1 {
     const stateDigest = hash({ kind: 'poc_current_url', pageId, url, navigation, mutation, revision });
     if (stateDigest !== this.#stateKey) { this.#stateKey = stateDigest; this.#stateEpoch++; }
     return { page, pageId, url, stateDigest, stateEpoch: this.#stateEpoch, mutationEpoch: mutation };
+  }
+  /** One observational marker for the accepted URL-only read; never part of its state digest. */
+  protectedUrlObservationDiagnostic(): void {
+    if (this.#admission.spec.semanticMode !== 'poc_v1') return;
+    const stepId = this.#admission.spec.steps.find(step =>
+      step.type === 'verification_goal' && !('verificationVersion' in step))?.id ?? 'url_observation';
+    this.#documentReadiness.probe('url_observation', stepId);
   }
   protectedSuccessfulGroundingWitnesses(): readonly ActionGroundingWitnessV1[] {
     this.#owner(); return structuredClone([...this.#groundingWitnesses.values()]);
@@ -298,6 +326,95 @@ export class ActionCandidateGroundingSessionV1 {
       throw new ActionCandidateGroundingError('BROWSER_FAILURE',cause);
     }
   }
+  async #diagnosticRead<T>(browserOperation: NonNullable<DeferredBrowserDiagnosticV1['browserOperation']>,
+    read: () => Promise<T>): Promise<T> {
+    try { return await read(); }
+    catch (error) {
+      if (this.#queryDiagnosticStepId) this.#lastBrowserFailure = { browserOperation,
+        exceptionName: diagnosticExceptionName(error) };
+      throw error;
+    }
+  }
+  #recordQuery(operation: DeferredBrowserDiagnosticV1['operation'], outcome: DeferredBrowserDiagnosticV1['outcome'],
+    startedAtMs: number, error?: unknown, candidateCount?: number): void {
+    if (!this.#diagnostic || !this.#queryDiagnosticStepId) return;
+    const endedAtMs = performance.now();
+    const internalReason = error instanceof ActionCandidateGroundingError ?
+      error.browserFailureCause ?? error.reason : error ? 'OTHER' : undefined;
+    try { this.#diagnostic({ diagnosticVersion: '1', source: 'grounding', operation,
+      phase: 'exploration', ownerId: this.#attempt, stepId: this.#queryDiagnosticStepId, startedAtMs, endedAtMs,
+      elapsedMs: diagnosticElapsed(startedAtMs, endedAtMs), outcome,
+      ...diagnosticBrowserState(this.#session.browserSession),
+      ...this.#documentReadiness.currentIdentity(),
+      ...(candidateCount !== undefined ? { candidateCount } : {}),
+      ...(error ? { exceptionName: this.#lastBrowserFailure?.exceptionName ?? diagnosticExceptionName(error),
+        internalReason: internalReason as DeferredBrowserDiagnosticV1['internalReason'],
+        ...(this.#lastBrowserFailure ? { browserOperation: this.#lastBrowserFailure.browserOperation,
+          ...(this.#lastBrowserFailure.ariaFailureCategory ? { ariaFailureCategory: this.#lastBrowserFailure.ariaFailureCategory } : {}),
+          ...(this.#lastBrowserFailure.playwrightTimeout !== undefined ? { playwrightTimeout: this.#lastBrowserFailure.playwrightTimeout } : {}),
+          ...(this.#lastBrowserFailure.frameState ? { frameState: this.#lastBrowserFailure.frameState } : {}) } : {}) } : {}) }); }
+    catch { /* Diagnostics cannot affect protected candidate authority. */ }
+  }
+  async #queryOperation<T>(operation: DeferredBrowserDiagnosticV1['operation'], read: () => Promise<T>,
+    candidateCount?: (result: T) => number): Promise<T> {
+    const startedAtMs = performance.now(); this.#lastBrowserFailure = undefined;
+    try { const result = await read(); this.#recordQuery(operation, 'success', startedAtMs,
+      undefined, candidateCount?.(result)); return result; }
+    catch (error) { this.#recordQuery(operation, 'failure', startedAtMs, error); throw error; }
+  }
+  #enumerationPredicateDiagnostic(mapping: GroundingMapping): void {
+    if (!this.#diagnostic || !this.#queryDiagnosticStepId) return;
+    try {
+      const goal = mapping.goal;
+      const constraints = goal.obligations.flatMap(o => o.kind === 'constraint' && o.subject.kind === 'target' ? [o] : []);
+      const semantic = constraints.find(o => o.constraint === 'role' && o.polarity === 'positive');
+      const rawRole = semantic?.authoredText.toLocaleLowerCase('en-US');
+      const semanticTargetRole = rawRole === 'select box' ? 'select_box' :
+        rawRole && (['dropdown', 'select', ...roles.activate, ...roles.enter_text, ...roles.choose] as string[]).includes(rawRole)
+          ? rawRole as NonNullable<DeferredBrowserDiagnosticV1['semanticTargetRole']> : rawRole ? 'other' : 'absent';
+      const authoredOperation = goal.obligations.find(o => o.kind === 'operation')?.operation;
+      const now = performance.now();
+      this.#emitEnumerationDiagnostic({ operation: 'enumeration_predicate', outcome: 'success',
+        startedAtMs: now, endedAtMs: now, elapsedMs: 0,
+        ...(authoredOperation ? { authoredOperation } : {}), semanticTargetRole,
+        attemptedRoles: mapping.predicate.roles, exactNameConstraintPresent: mapping.predicate.names.length > 0,
+        // This obligation vocabulary has no label constraint; label association is a later targeted proof.
+        labelConstraintPresent: false,
+        contextConstraintPresent: constraints.some(o => o.constraint === 'context'),
+        choiceConstraintPresent: goal.obligations.some(o => o.kind === 'argument' && o.purpose === 'choice'),
+        sourceConstraintDigest: hash({ constraints, arguments: goal.obligations.filter(o => o.kind === 'argument') }) });
+    } catch { /* Predicate diagnostics cannot affect protected candidate authority. */ }
+  }
+  #emitEnumerationDiagnostic(fields: Pick<DeferredBrowserDiagnosticV1, 'operation' | 'outcome' | 'startedAtMs' |
+    'endedAtMs' | 'elapsedMs'> & Partial<DeferredBrowserDiagnosticV1>): void {
+    if (!this.#diagnostic || !this.#queryDiagnosticStepId) return;
+    try { this.#diagnostic({ diagnosticVersion: '1', source: 'grounding', phase: 'exploration',
+      ownerId: this.#attempt, stepId: this.#queryDiagnosticStepId,
+      ...diagnosticBrowserState(this.#session.browserSession), ...this.#documentReadiness.currentIdentity(), ...fields }); }
+    catch { /* Diagnostic accounting has no candidate authority. */ }
+  }
+  async #enumerationProbe(frame: Frame, operation: 'role_pre_name' | 'role_post_name' | 'native_select_inventory',
+    read: () => Promise<Partial<DeferredBrowserDiagnosticV1>>, role?: ActionCandidateRoleV1,
+    exactNameConstraintPresent?: boolean): Promise<void> {
+    if (!this.#diagnostic || !this.#queryDiagnosticStepId) return;
+    const startedAtMs = performance.now();
+    const frameId = this.#id(frame, 'frame');
+    let currentUrl: string | undefined;
+    try { currentUrl = diagnosticBrowserUrl(frame.url()); } catch { /* Detached-frame diagnostics are optional. */ }
+    try {
+      const counts = await read();
+      const endedAtMs = performance.now();
+      this.#emitEnumerationDiagnostic({ operation, outcome: 'success', startedAtMs, endedAtMs,
+        elapsedMs: diagnosticElapsed(startedAtMs, endedAtMs), frameId, currentUrl,
+        ...(role ? { concreteRole: role, exactNameConstraintPresent } : {}), ...counts });
+    } catch (error) {
+      const endedAtMs = performance.now();
+      this.#emitEnumerationDiagnostic({ operation, outcome: 'failure', startedAtMs, endedAtMs,
+        elapsedMs: diagnosticElapsed(startedAtMs, endedAtMs), frameId, currentUrl,
+        ...(role ? { concreteRole: role, exactNameConstraintPresent } : {}),
+        exceptionName: diagnosticExceptionName(error), internalReason: 'OTHER' });
+    }
+  }
   async #captureState(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
     this.#owner();
     const navigation = this.#navigationEpoch, mutation = this.#mutationEpoch, revision = this.#session.groundingRevision;
@@ -309,11 +426,15 @@ export class ActionCandidateGroundingSessionV1 {
     const readFrames = async () => {
       for (const frame of frames) {
         this.#owner();
-        const content = await frame.content();
-        const aria = await frame.locator('body').ariaSnapshot({ mode: 'ai', timeout: 3000 });
-        if (content.length > 262_144 || aria.length > 131_072) stop('RESULT_LIMIT');
-        frameDigests.set(frame, hash({ content, aria, url: frame.url(),
-          frameId: this.#id(frame, 'frame'), parent: frame.parentFrame() ? this.#id(frame.parentFrame()!, 'frame') : null }));
+        const content = await this.#diagnosticRead('frame_content', () => frame.content());
+        const poc = this.#admission.spec.semanticMode === 'poc_v1';
+        const aria = poc ? undefined : await readProtectedAriaState(frame, this.#session.browserSession, failure => {
+            if (this.#queryDiagnosticStepId) this.#lastBrowserFailure = { browserOperation: 'aria_snapshot', ...failure };
+          });
+        if (content.length > 262_144 || (aria !== undefined && aria.length > 131_072)) stop('RESULT_LIMIT');
+        const identity = { url: frame.url(), frameId: this.#id(frame, 'frame'),
+          parent: frame.parentFrame() ? this.#id(frame.parentFrame()!, 'frame') : null };
+        frameDigests.set(frame, poc ? hash({ content, ...identity }) : hash({ content, aria, ...identity }));
       }
     };
     if (aroundObservation) await aroundObservation(readFrames);
@@ -372,30 +493,41 @@ export class ActionCandidateGroundingSessionV1 {
     const held: Held[] = [];
     try {
       for (const frame of state.frames) {
+        await this.#enumerationProbe(frame, 'native_select_inventory', async () => ({
+          nativeSelectCount: await frame.locator('select').count(),
+          visibleNativeSelectCount: await frame.locator('select:visible').count(),
+          enabledNativeSelectCount: await frame.locator('select:enabled').count() }));
         for (const role of predicate.roles) {
+          await this.#enumerationProbe(frame, 'role_pre_name', async () => ({
+            preNameCount: await frame.getByRole(role, { includeHidden: true }).count() }),
+          role, predicate.names.length > 0);
           let locator = frame.getByRole(role, { includeHidden: true,
             ...(predicate.names.length ? { name: predicate.names[0], exact: true } : {}) });
           for (const name of predicate.names.slice(1)) locator = locator.and(frame.getByRole(role, { name, exact: true, includeHidden: true }));
-          const count = await locator.count();
+          if (predicate.names.length) await this.#enumerationProbe(frame, 'role_post_name', async () => ({
+            postNameCount: await locator.count() }), role, true);
+          const count = await this.#diagnosticRead('locator_count', () => locator.count());
           if (held.length + count > MAX_CANDIDATES) stop('RESULT_LIMIT');
           for (let i = 0; i < count; i++) {
             this.#owner();
             const target = locator.nth(i);
-            const handle = await target.elementHandle();
-            if (!handle || await handle.ownerFrame() !== frame) { await handle?.dispose(); stop('QUERY_UNEVALUABLE'); }
+            const handle = await this.#diagnosticRead('element_handle', () => target.elementHandle());
+            if (!handle || await this.#diagnosticRead('owner_frame', () => handle.ownerFrame()) !== frame) { await handle?.dispose(); stop('QUERY_UNEVALUABLE'); }
             try {
-              const raw = await target.ariaSnapshotJSON({ mode: 'ai', depth: 0, timeout: 3000 });
+              const raw = await this.#diagnosticRead('candidate_snapshot', () => target.ariaSnapshotJSON({ mode: 'ai', depth: 0, timeout: 3000 }));
               const node = Array.isArray(raw) ? raw[0] : raw;
               if (!node || typeof node !== 'object' || node.role !== role ||
                 node.name !== undefined && typeof node.name !== 'string' ||
                 typeof node.name === 'string' && node.name.length > 512 || typeof node.ref !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(node.ref)) stop('QUERY_UNEVALUABLE');
               const refLocator = frame.locator(`aria-ref=${node.ref}`);
-              if (await refLocator.count() !== 1 || await target.and(refLocator).count() !== 1) stop('QUERY_UNEVALUABLE');
+              if (await this.#diagnosticRead('ref_count', () => refLocator.count()) !== 1 ||
+                await this.#diagnosticRead('ref_count', () => target.and(refLocator).count()) !== 1) stop('QUERY_UNEVALUABLE');
               held.push({ frame, handle, candidate: { selectedRef: node.ref, frameId: this.#id(frame, 'frame'),
                 frame: await this.#frameProof(frame, state), role, accessibleName: typeof node.name === 'string' ? node.name : '',
-                visible: await target.isVisible(), enabled: await target.isEnabled(),
-                editable: await target.isEditable().catch(() => false),
-                nativeSelect: await target.and(frame.locator('select')).count() === 1 } });
+                visible: await this.#diagnosticRead('visibility', () => target.isVisible()),
+                enabled: await this.#diagnosticRead('enabled', () => target.isEnabled()),
+                editable: await this.#diagnosticRead('editable', () => target.isEditable()).catch(() => false),
+                nativeSelect: await this.#diagnosticRead('native_select_count', () => target.and(frame.locator('select')).count()) === 1 } });
             } catch (error) { await handle.dispose(); throw error; }
           }
         }
@@ -422,14 +554,25 @@ export class ActionCandidateGroundingSessionV1 {
     this.#owner(); if (this.#busy) stop('BUSY');
     const mapping = this.#request(input);
     if (this.#captures.size >= MAX_RECORDS) stop('RESULT_LIMIT');
+    this.#queryDiagnosticStepId = mapping.goal.id;
+    if (this.#admission.spec.semanticMode === 'poc_v1')
+      this.#documentReadiness.probe('before_candidate_query', mapping.goal.id);
+    const queryStartedAtMs = performance.now();
     this.#busy = true;
     try { return await this.#exclusive(async () => {
-      const before = await this.#state();
+      const before = await this.#queryOperation('initial_state', () => this.#state());
+      this.#enumerationPredicateDiagnostic(mapping);
       let held: Held[] = [], reason: FailureReason | undefined;
       try {
-        held = await this.#enumerate(before, mapping.predicate);
-        const after = await this.#state();
-        if (after.stateDigest !== before.stateDigest) stop('STALE_STATE');
+        held = await this.#queryOperation('candidate_enumeration', () => this.#enumerate(before, mapping.predicate), result => result.length);
+        const filterAt = performance.now();
+        this.#recordQuery('candidate_filtering', 'success', filterAt, undefined, held.length);
+        const after = await this.#queryOperation('fresh_state', () => this.#state());
+        const comparisonAt = performance.now();
+        try {
+          if (after.stateDigest !== before.stateDigest) stop('STALE_STATE');
+          this.#recordQuery('freshness_comparison', 'success', comparisonAt, undefined, held.length);
+        } catch (error) { this.#recordQuery('freshness_comparison', 'failure', comparisonAt, error); throw error; }
       } catch (error) {
         reason = error instanceof ActionCandidateGroundingError && ['RESULT_LIMIT', 'STALE_STATE', 'UNPROVEN_FRAME', 'BROWSER_FAILURE'].includes(error.reason)
           ? error.reason as FailureReason : 'QUERY_UNEVALUABLE';
@@ -450,9 +593,12 @@ export class ActionCandidateGroundingSessionV1 {
       const record = parseActionCandidateObservationV1({ ...data, witnessDigest: hash(data) });
       this.#captures.set(record.observationId, { record, held });
       for (const listener of this.#listeners) listener(structuredClone(record));
+      this.#recordQuery('final_result', reason ? 'failure' : 'success', queryStartedAtMs,
+        reason ? new ActionCandidateGroundingError(reason) : undefined, reason ? undefined : held.length);
       return structuredClone(record);
     }, deadline);
-    } finally { this.#busy = false; }
+    } catch (error) { this.#recordQuery('final_result', 'failure', queryStartedAtMs, error); throw error; }
+    finally { this.#busy = false; this.#queryDiagnosticStepId = undefined; this.#lastBrowserFailure = undefined; }
   }
 
   async #current(capture: Capture): Promise<State> {
@@ -898,6 +1044,8 @@ export class ActionCandidateGroundingSessionV1 {
           invocation = { check, invokedAt };
           this.#executionChecks.set(executionId, structuredClone(check));
           const dispatchStarted = this.#clock();
+          if (genericClick && this.#admission.spec.semanticMode === 'poc_v1')
+            this.#documentReadiness.probe('before_click', check.goalId);
           try {
             if (check.operation === 'fill') await current.handle.fill(check.argument!.executableValue, { force: true, timeout: 3000 });
             else if (check.operation === 'select_option') await current.handle.selectOption({ value: check.argument!.executableValue }, { force: true, timeout: 3000 });
@@ -909,6 +1057,8 @@ export class ActionCandidateGroundingSessionV1 {
             return { status: 'stop', execution: ledger('failed', 'ACTION_FAILED_PARTIAL_OR_UNKNOWN', 'threw', check, invokedAt) };
           }
           const returnedAt = new Date(this.#clock()).toISOString();
+          if (genericClick && this.#admission.spec.semanticMode === 'poc_v1')
+            this.#documentReadiness.probe('after_click', check.goalId);
           invocation.returnedAt = returnedAt;
           const genericDelivery = genericClick ? { executionId, stepId: check.goalId, clicks: 1 as const,
             targetOwned: true as const, dispatched: true as const, returned: true as const,

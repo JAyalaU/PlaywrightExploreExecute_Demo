@@ -53,7 +53,19 @@ export const IsolatedHeadedExecutionProfileSchema = z.strictObject({
   browserIsolation: z.literal('docker'),
 });
 
+/** Windows owns a local Playwright Chromium process, without Docker isolation claims. */
+const { networkPolicyRef: _historicalNetworkPolicyRef, ...localProfileFields } = executionProfileFields;
+export const LocalWindowsExecutionProfileSchema = z.strictObject({
+  ...localProfileFields,
+  networkPolicyRef: z.never().optional(),
+  profileSchemaVersion: z.literal('5'),
+  presentationMode: z.enum(['headless', 'headed']),
+  browserIsolation: z.literal('local-windows'),
+  browserRuntime: z.literal('playwright-chromium-windows'),
+});
+
 export const ExecutionProfileSchema = z.union([
+  LocalWindowsExecutionProfileSchema,
   IsolatedHeadedExecutionProfileSchema,
   IsolatedExecutionProfileSchema,
   ExecutionProfileV2Schema,

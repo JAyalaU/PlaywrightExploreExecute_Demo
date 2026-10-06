@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ProtectedContextFactory, type ProfileCatalog, type ProfileRef, type EffectiveProfile,
+import { ProtectedContextFactory, parseTrustedBrowserBackend, type ProfileCatalog, type ProfileRef, type EffectiveProfile,
   type ProtectedBrowserSession, type ProtectedSessionOptions, type ExternalTargetGate } from '../profile/index.js';
 import { runDeferredActionProductionV1, type DeferredProductionModelsV1 } from '../interpretation/deferred-action-production.js';
 import { createOpenAIPocSemanticModels } from '../interpretation/deferred-action-poc-adapters.js';
@@ -12,6 +12,8 @@ import { toInterpretationRequest, type LocalWorkflowRequest, type TrustedLocalCo
 import { LocalWorkflowError } from './workflow.js';
 import { DeferredViewerLifecycle, DeferredViewerPreflightError,
   type DeferredViewerPhase } from '../observability/deferred-viewer-channel.js';
+import { DeferredBrowserDiagnosticCollector } from '../domain/deferred-browser-diagnostics.js';
+import { DeferredWorkflowStopStoreV1 } from '../evidence/deferred-workflow-store.js';
 
 /** Trusted offline-review gate is launch state. Neither the task nor wire request selects it. */
 export function deferredWorkflowOfflineReviewEnabled(): boolean {
@@ -21,6 +23,11 @@ export async function runDeferredLocalWorkflowV1(request: LocalWorkflowRequest, 
   catalog: ProfileCatalog, gate: ExternalTargetGate | undefined, dependencies: LocalWorkflowTrustedDependencies,
   options: { signal?: AbortSignal; deferredModels?: DeferredProductionModelsV1 }) {
   if (!deferredWorkflowOfflineReviewEnabled()) throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
+  const liveView = process.env.PLAYWRIGHT_DEMO_LIVE_VIEW === '1';
+  const viewerMode = parseTrustedBrowserBackend(process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND) === 'local-windows'
+    ? 'frame_stream' : 'rfb';
+  const browserDiagnostics = viewerMode === 'frame_stream' ? new DeferredBrowserDiagnosticCollector() : undefined;
+  const viewOnlyHeaded = liveView && viewerMode === 'rfb';
   let models: DeferredProductionModelsV1;
   try {
     if (!options.deferredModels && !dependencies.provider.apiKey()?.trim()) throw new Error('Credential unavailable');
@@ -30,10 +37,10 @@ export async function runDeferredLocalWorkflowV1(request: LocalWorkflowRequest, 
       verification: createOpenAIVerificationDecisionModel(dependencies.provider),nativeVerification:createOpenAINativeOptionVerificationModelV6(dependencies.provider) };
   } catch { throw new LocalWorkflowError('PROVIDER_CONFIGURATION_ERROR'); }
   const requestForModel = toInterpretationRequest(request, `local-${randomUUID()}`);
-  const viewOnlyHeaded = process.env.PLAYWRIGHT_DEMO_LIVE_VIEW === '1';
   let viewer: DeferredViewerLifecycle | undefined;
-  if (viewOnlyHeaded) {
-    try { viewer = await DeferredViewerLifecycle.connect(requestForModel.testSpecId); }
+  if (liveView) {
+    try { viewer = await DeferredViewerLifecycle.connect(requestForModel.testSpecId, viewerMode,
+      browserDiagnostics?.record); }
     catch { throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION'); }
   }
   let browserPhase: DeferredViewerPhase | undefined;
@@ -67,8 +74,14 @@ export async function runDeferredLocalWorkflowV1(request: LocalWorkflowRequest, 
     const outcome = await runDeferredActionProductionV1(new ManagedFactory(catalog, dependencies.authProvider, gate,
       { viewOnlyHeaded }), config.artifactRoot, requestForModel, models,
       { ...(options.signal ? { signal: options.signal } : {}),
-        ...(viewer ? { onBrowserPhase: (phase: DeferredViewerPhase) => { browserPhase = phase; } } : {}) });
+        ...(viewer ? { onBrowserPhase: (phase: DeferredViewerPhase) => { browserPhase = phase; } } : {}),
+        ...(browserDiagnostics ? { onBrowserDiagnostic: browserDiagnostics.record } : {}) });
     await cancellationCleanup; await close();
+    if (browserDiagnostics?.snapshot().length) {
+      try { await new DeferredWorkflowStopStoreV1(config.artifactRoot)
+        .writeBrowserDiagnostics(requestForModel.testSpecId, browserDiagnostics.snapshot()); }
+      catch { /* Private diagnostic persistence cannot alter the workflow result. */ }
+    }
     if (options.signal?.aborted) return { protocolVersion: '2' as const, kind: 'bridge_error' as const,
       code: 'CANCELLED' as const, cleanup: outcome.result.cleanup === 'unverified' ? 'unverified' as const : 'verified' as const };
     return envelopeForAgenticTerminalV2(outcome.result, outcome.reportAvailable);

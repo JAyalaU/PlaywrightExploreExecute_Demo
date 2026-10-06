@@ -11,6 +11,9 @@ import { readOwnedLabelSourcesFromLocator } from '../browser-action/label-associ
 import { nativeActivationReceipt } from '../browser-action/native-activation.js';
 import { executeVerificationAssertionV9 } from './verification-v9.js';
 import { DeferredViewerPreflightError } from '../observability/deferred-viewer-channel.js';
+import { navigationTiming, type DeferredNavigationTimingObserver } from '../domain/deferred-navigation-timing.js';
+import type { DeferredBrowserDiagnosticSink } from '../domain/deferred-browser-diagnostics.js';
+import { RunnerV9PreactionDiagnostics } from './deferred-v9-diagnostics.js';
 
 type Action=Extract<ResolvedTestSpecV9['executionSteps'][number],{type:'action_goal'}>;
 type Step=DeferredRunnerRecordV9['steps'][number];
@@ -57,13 +60,18 @@ const dispose=async(p:Proof)=>{await Promise.allSettled([...p.all.map(c=>c.handl
 class FreshRunner {
   #tail:Promise<unknown>=Promise.resolve();#epoch=0;#mutation=0;#navigation=0;#stateKey='';
   readonly sessionId=`runner-session-${randomUUID()}`;readonly pageId=`runner-page-${randomUUID()}`;
-  constructor(readonly session:ProtectedBrowserSession,readonly page:Page,readonly deadline:number){
+  constructor(readonly session:ProtectedBrowserSession,readonly page:Page,readonly deadline:number,
+    readonly diagnostics?:RunnerV9PreactionDiagnostics){
     page.on('framenavigated',()=>{this.#navigation++;});
     page.on('frameattached',()=>{this.#navigation++;});
     page.on('framedetached',()=>{this.#navigation++;});
   }
   bounded(closing=false){if(Date.now()>this.deadline)stop('BUDGET_EXHAUSTED');if(!closing&&this.session.isClosed||this.page.isClosed()||this.session.context.pages().length!==1||this.session.context.pages()[0]!==this.page)stop('ENVIRONMENT_FAILURE');}
-  async exclusive<T>(callback:()=>Promise<T>):Promise<T>{const prior=this.#tail;let release!:()=>void;this.#tail=new Promise<void>(r=>{release=r;});await prior;try{this.bounded();return await callback();}finally{release();}}
+  checkedBounded(stepId:string){if(this.diagnostics)this.diagnostics.sync('pre_action_ownership',stepId,()=>this.bounded());else this.bounded();}
+  richAfterUrl(stepId:string){return this.diagnostics?this.diagnostics.async('rich_after_url',stepId,()=>this.state(false,stepId)):this.state();}
+  async exclusive<T>(callback:()=>Promise<T>,entryStepId?:string):Promise<T>{const prior=this.#tail;let release!:()=>void;this.#tail=new Promise<void>(r=>{release=r;});await prior;try{
+    if(entryStepId&&this.diagnostics)this.diagnostics.sync('execution_entry_ownership',entryStepId,()=>this.bounded());else this.bounded();
+    return await callback();}finally{release();}}
   mutated(){this.#mutation++;}
   /** URL-only state for admitted PoC URL assertions; no document or control read. */
   urlState(closing=false):{state:DeferredRunStateV9;url:string}{
@@ -77,8 +85,16 @@ class FreshRunner {
     if(stateDigest!==this.#stateKey){this.#stateKey=stateDigest;this.#epoch++;}
     return{url,state:{sessionId:this.sessionId,pageId:this.pageId,stateDigest,stateEpoch:this.#epoch,mutationEpoch:mutation}};
   }
-  async state(closing=false):Promise<DeferredRunStateV9>{this.bounded(closing);await engines;const frames=this.page.frames();if(frames.length>8)stop('INCOMPLETE_EVIDENCE');const materials=[];
-    for(const f of frames){this.bounded(closing);const content=await f.content(),values=await f.locator('body').locator('runner_v9_state=').textContent({timeout:3000});
+  async state(closing=false,diagnosticStepId?:string):Promise<DeferredRunStateV9>{this.bounded(closing);await engines;
+    const frames=diagnosticStepId&&this.diagnostics?this.diagnostics.frames(diagnosticStepId):this.page.frames();
+    if(frames.length>8)stop('INCOMPLETE_EVIDENCE');const materials=[];
+    for(const f of frames){this.bounded(closing);
+      const content=diagnosticStepId&&this.diagnostics?await this.diagnostics.async('frame_content',diagnosticStepId,()=>f.content(),f,
+        {frameCount:frames.length,...(this.diagnostics.mainFrameId()?{mainFrameId:this.diagnostics.mainFrameId()}: {})}):await f.content();
+      const values=diagnosticStepId&&this.diagnostics?await this.diagnostics.async('runner_v9_state',diagnosticStepId,
+        ()=>f.locator('body').locator('runner_v9_state=').textContent({timeout:3000}),f,
+        {frameCount:frames.length,...(this.diagnostics.mainFrameId()?{mainFrameId:this.diagnostics.mainFrameId()}: {})}):
+        await f.locator('body').locator('runner_v9_state=').textContent({timeout:3000});
       if(content.length>262144||!values||values==='overflow'||values.length>262144)stop('INCOMPLETE_EVIDENCE');materials.push({content,values,url:f.url()});}
     if(frames.length!==this.page.frames().length||frames.some((f,i)=>f!==this.page.frames()[i]))stop('STALE_EVIDENCE');
     const stateDigest=hash({pageId:this.pageId,materials,mutation:this.#mutation});if(stateDigest!==this.#stateKey){this.#stateKey=stateDigest;this.#epoch++;}
@@ -121,10 +137,17 @@ class FreshRunner {
     }catch(e){await Promise.allSettled([...all.map(c=>c.handle),...labels,...options].map(h=>h.dispose()));throw e;}}
   async sameProof(a:Proof,b:Proof){if(a.digest!==b.digest||a.all.length!==b.all.length||a.labels.length!==b.labels.length||a.options.length!==b.options.length||a.target.frame!==b.target.frame||!await identical(a.target.handle,b.target.handle))stop('STALE_EVIDENCE');
     for(const [left,right] of [[a.all.map(c=>c.handle),b.all.map(c=>c.handle)],[a.labels,b.labels],[a.options,b.options]])for(let i=0;i<left!.length;i++)if(!await identical(left![i]!,right![i]!))stop('STALE_EVIDENCE');}
-  async execute(action:Action,before:DeferredRunStateV9,pocSemantic=false):Promise<Step>{return this.exclusive(async()=>{
+  async execute(action:Action,before:DeferredRunStateV9,pocSemantic=false,awaitTarget=false,
+    onFreshTargetReady?:()=>void):Promise<Step>{return this.exclusive(async()=>{
     let initial:Proof|undefined,renewed:Proof|undefined;let invocation:Step['invocation']='not_invoked',predicateDigest:string|undefined,effectDigest:string|undefined,reasonCode:DeferredRunnerStopV9|undefined,invokedAt:string|undefined,returnedAt:string|undefined;
     let after=before,effect:Step['effect'],activationId:string|undefined,afterStateStatus:Step['afterStateStatus']='observed',genericClick=false;
-    try{if(!pocSemantic&&!same(await this.state(),before))stop('STATE_CONTINUITY_MISMATCH');initial=await this.prove(action);
+    try{if(!pocSemantic&&!same(await this.state(),before))stop('STATE_CONTINUITY_MISMATCH');
+      const targetDeadline=Math.min(this.deadline,Date.now()+(this.session.effectiveProfile.profile.timeoutPolicy.waits.default??3000));
+      for(;;){try{initial=await this.prove(action);break;}catch(error){
+        if(!awaitTarget||!(error instanceof Stop)||error.reason!=='TARGET_MISMATCH'||Date.now()>=targetDeadline)throw error;
+        await new Promise(resolve=>setTimeout(resolve,Math.min(50,targetDeadline-Date.now())));
+      }}
+      onFreshTargetReady?.();
       // Preparation can scroll/mutate; renew the entire predicate and retain identity afterwards.
       await initial.target.handle.scrollIntoViewIfNeeded({timeout:3000});renewed=await this.prove(action);await this.sameProof(initial,renewed);
       if(!pocSemantic&&!same(await this.state(),before))stop('STALE_EVIDENCE');predicateDigest=renewed.digest;
@@ -163,23 +186,37 @@ class FreshRunner {
     return{stepId:action.id,traceRecordId:action.traceRecordId,originStepId:action.originStepId,type:'action_goal',status:reasonCode?'stopped':'succeeded',before,after,afterStateStatus,operation:action.operation,
       ...(action.executableArgument!==undefined?{argument:action.executableArgument}:{}),invocation,mutationMayHaveOccurred:invocation!=='not_invoked',...(predicateDigest?{predicateDigest}:{}),...(effectDigest&&effect?{effectDigest,effect}:{}),
       ...(reasonCode?{reasonCode}:{}),...(invokedAt?{invokedAt}:{}),...(returnedAt?{returnedAt}:{})};
-  });}
+  },action.id);}
 }
 
 /** One deterministic replay only. Trusted host owns any later two-run agreement policy. */
-export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,input:TrustedResolvedTestReadbackV9):Promise<TrustedDeferredRunV9>{
+export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,input:TrustedResolvedTestReadbackV9,
+  onNavigationTiming?:DeferredNavigationTimingObserver,phase:'replay_1'|'replay_2'='replay_1',
+  onBrowserDiagnostic?:DeferredBrowserDiagnosticSink):Promise<TrustedDeferredRunV9>{
   const executionRunId=`run-${randomUUID()}`,startedAt=new Date().toISOString(),deadline=Date.now()+120000;
   let artifact:ReturnType<typeof requireTrustedResolvedTestReadbackV9>|undefined,session:ProtectedBrowserSession|undefined,runtime:FreshRunner|undefined;
   const steps:Step[]=[];let startState:DeferredRunStateV9|undefined,finalState:DeferredRunStateV9|undefined,reason:DeferredRunnerStopV9|undefined,failedStepId:string|undefined,cleanup:'verified'|'unverified'='verified';
   try{try{artifact=requireTrustedResolvedTestReadbackV9(input);}catch{stop('UNAUTHENTICATED_INPUT');}
     const r=artifact.resolved,profile=factory.catalog.resolve(r.executionProfileRef);if(profile.fingerprint!==r.profileFingerprint)stop('PROFILE_MISMATCH');
     session=await factory.open(r.executionProfileRef,profile,{observationOwner:{kind:'run',id:executionRunId}});assertEquivalentEffectiveProfile(profile,session.effectiveProfile);
-    if(session.effectiveProfile.fingerprint!==r.profileFingerprint)stop('PROFILE_MISMATCH');const page=await session.context.newPage();runtime=new FreshRunner(session,page,deadline);
-    if(artifact.trace.source.startState.url!=='about:blank'){const response=await page.goto(artifact.trace.source.startState.url,{timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
-      if(response?.status()===403&&await response.text()==='Network policy denied request')stop('ENVIRONMENT_FAILURE');runtime.mutated();}
+    if(session.effectiveProfile.fingerprint!==r.profileFingerprint)stop('PROFILE_MISMATCH');const page=await session.context.newPage();
+    runtime=new FreshRunner(session,page,deadline,onBrowserDiagnostic?
+      new RunnerV9PreactionDiagnostics(session,page,executionRunId,phase,onBrowserDiagnostic):undefined);
+    const navigationOrigin=performance.now();
+    let adoptBootstrap=false;
+    if(artifact.trace.source.startState.url!=='about:blank'){
+      navigationTiming(onNavigationTiming,phase,'request_start',navigationOrigin);
+      const response=await page.goto(artifact.trace.source.startState.url,{waitUntil:'domcontentloaded',timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
+      navigationTiming(onNavigationTiming,phase,'domcontentloaded',navigationOrigin);
+      if(response?.status()===403&&await response.text()==='Network policy denied request')stop('ENVIRONMENT_FAILURE');runtime.mutated();
+      const first=r.executionSteps[0];adoptBootstrap=artifact.trace.source.semanticMode==='poc_v1'&&first?.type==='navigate'&&
+        first.url===new URL(first.url).href&&
+        new URL(artifact.trace.source.startState.url).href===new URL(first.url).href&&
+        !!response&&!response.request().redirectedFrom()&&response.url()===new URL(first.url).href&&
+        page.url()===response.url()&&session.context.pages().length===1&&session.context.pages()[0]===page;}
     startState=await runtime.state();let current=startState;
     for(const s of r.executionSteps){
-      failedStepId=s.id;runtime.bounded();
+      failedStepId=s.id;runtime.checkedBounded(s.id);
       const preceding=steps.at(-1);
       const pocUrl=artifact.trace.source.semanticMode==='poc_v1'&&s.type==='verification_goal'&&
         'kind'in s.assertion&&s.assertion.kind==='url';
@@ -191,16 +228,24 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
       else if(artifact.trace.source.semanticMode==='poc_v1'&&s.type==='action_goal'&&
         preceding?.type==='verification_goal'&&preceding.verification&&
         'kind'in preceding.verification.assertion&&preceding.verification.assertion.kind==='url'){
-        const next=await runtime.state();
+        const next=await runtime.richAfterUrl(s.id);
         if(!same(next,current)){stateRefresh={kind:'rich_after_url',from:current};current=next;}}
       // PoC actions prove their own unique, fresh target immediately before dispatch;
       // unrelated page content can change after the preceding observation.
       else if(!(artifact.trace.source.semanticMode==='poc_v1'&&s.type==='action_goal')&&
         !same(await runtime.state(),current))stop('STATE_CONTINUITY_MISMATCH');
       let entry:Step;
-      if(s.type==='action_goal')entry=await runtime.execute(s,current,artifact.trace.source.semanticMode==='poc_v1');
+      if(s.type==='action_goal'){
+        if(!steps.some(step=>step.type==='action_goal'))navigationTiming(onNavigationTiming,phase,'authored_action_start',navigationOrigin);
+        entry=await runtime.execute(s,current,artifact.trace.source.semanticMode==='poc_v1',
+          artifact.trace.source.semanticMode==='poc_v1'&&(preceding?.type==='navigate'||steps.length===0),
+          !steps.some(step=>step.type==='action_goal')?()=>navigationTiming(onNavigationTiming,phase,'fresh_target_ready',navigationOrigin):undefined);
+      }
       else{const base={stepId:s.id,traceRecordId:s.traceRecordId,originStepId:s.originStepId,type:s.type,before:current};
-        entry=await runtime.exclusive(async()=>{if(s.type==='navigate'){let invocation:Step['invocation']='not_invoked';try{runtime!.mutated();invocation='threw';const response=await page.goto(s.url,{timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
+        entry=await runtime.exclusive(async()=>{if(s.type==='navigate'){let invocation:Step['invocation']='not_invoked';try{runtime!.mutated();invocation='threw';
+              if(s===r.executionSteps[0]&&adoptBootstrap){invocation='returned';return{...base,status:'succeeded' as const,after:await runtime!.state(),afterStateStatus:'observed' as const,
+                invocation,mutationMayHaveOccurred:true,bootstrapAdopted:true as const};}
+              const response=await page.goto(s.url,{waitUntil:'domcontentloaded',timeout:Math.max(1,Math.min(profile.profile.timeoutPolicy.navigationMs,deadline-Date.now()))});
               if(response?.status()===403&&await response.text()==='Network policy denied request')stop('ENVIRONMENT_FAILURE');invocation='returned';if(page.url()!==new URL(s.url).href)stop('TARGET_MISMATCH');
               return{...base,status:'succeeded' as const,after:await runtime!.state(),afterStateStatus:'observed' as const,invocation,mutationMayHaveOccurred:true};
             }catch(e){let after=current,afterStateStatus:Step['afterStateStatus']='observed';try{after=await runtime!.state();}catch{afterStateStatus='unavailable';}

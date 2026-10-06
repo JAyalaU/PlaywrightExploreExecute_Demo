@@ -6,9 +6,10 @@ import type { HandoffOutcome } from '../interpretation/handoff.js';
 import type { InterpretationRequest } from '../interpretation/interpret.js';
 import type { OpenAIResponsesConfig } from '../interpretation/openai-responses.js';
 import {
-  ExecutionProfileSchema, NetworkPolicySchema, ProfileCatalog,
+  ExecutionProfileSchema, LocalWindowsExecutionProfileSchema, NetworkPolicySchema, ProfileCatalog,
   PublicTargetApprovalSchema,
   type AuthStateProvider, type ExternalTargetGate, type PresentationMode,
+  type TrustedBrowserBackend,
 } from '../profile/index.js';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
@@ -93,6 +94,42 @@ export function parseActivePocTrustedConfiguration(input: unknown): TrustedLocal
       timeoutPolicy: { ...profile.timeoutPolicy, navigationMs: ACTIVE_POC_NAVIGATION_MS },
     })),
   };
+}
+
+/** Derive the reviewed Windows runtime identity from trusted PoC configuration only. */
+export function selectActivePocBrowserProfile(config: TrustedLocalConfiguration,
+  backend: TrustedBrowserBackend): { config: TrustedLocalConfiguration;
+    reference: { id: string; version: string }; fingerprint: string } {
+  const preferred = config.publicTargetApproval?.executionProfileRef;
+  const source = preferred && config.profiles.some((profile) =>
+    profile.id === preferred.id && profile.version === preferred.version)
+    ? preferred : { id: config.profiles[0]!.id, version: config.profiles[0]!.version };
+  const catalog = new ProfileCatalog(config.profiles, config.networkPolicies);
+  const effective = catalog.resolve(source);
+  if (backend === 'docker-isolated') return { config, reference: source, fingerprint: effective.fingerprint };
+  const profile = effective.profile;
+  if (!('browserIsolation' in profile) || profile.browserIsolation !== 'docker')
+    throw new Error('Local Windows PoC requires a trusted Docker source profile');
+  const local = LocalWindowsExecutionProfileSchema.parse({
+    id: `local-windows-${effective.fingerprint.slice(0, 32)}`, version: '1',
+    profileSchemaVersion: '5', browserIsolation: 'local-windows',
+    browserRuntime: 'playwright-chromium-windows', presentationMode: 'headless',
+    browser: profile.browser, viewport: profile.viewport, locale: profile.locale,
+    timeoutPolicy: profile.timeoutPolicy,
+    ...(profile.timezoneId ? { timezoneId: profile.timezoneId } : {}),
+    ...(profile.colorScheme ? { colorScheme: profile.colorScheme } : {}),
+    ...(profile.deviceScaleFactor ? { deviceScaleFactor: profile.deviceScaleFactor } : {}),
+    ...(profile.isMobile !== undefined ? { isMobile: profile.isMobile } : {}),
+    ...(profile.hasTouch !== undefined ? { hasTouch: profile.hasTouch } : {}),
+    ...(profile.javaScriptEnabled !== undefined ? { javaScriptEnabled: profile.javaScriptEnabled } : {}),
+    ...(profile.reducedMotion ? { reducedMotion: profile.reducedMotion } : {}),
+    ...(profile.authStateRef ? { authStateRef: profile.authStateRef } : {}),
+  });
+  const selectedConfig = { ...config, profiles: [...config.profiles, local] };
+  const reference = { id: local.id, version: local.version };
+  return { config: selectedConfig, reference,
+    fingerprint: new ProfileCatalog(selectedConfig.profiles, selectedConfig.networkPolicies)
+      .resolve(reference).fingerprint };
 }
 
 /** Trusted dependencies are not serializable request fields or evidence. */

@@ -3,12 +3,20 @@ import net from 'node:net';
 import { z } from 'zod';
 import type { ProtectedBrowserSession } from '../profile/context.js';
 import { ViewerGateway } from './viewer-gateway.js';
+import { captureViewportJpeg, jpegDimensions, LIVE_IMAGE_MAX_FRAME_BYTES,
+  type LiveImageCaptureLifecycleEvent,
+  LIVE_IMAGE_MAX_HEIGHT, LIVE_IMAGE_MAX_WIDTH } from './live-images.js';
+import { diagnosticBrowserState, diagnosticElapsed, diagnosticExceptionName,
+  type DeferredBrowserDiagnosticSink, type DeferredBrowserDiagnosticV1 } from '../domain/deferred-browser-diagnostics.js';
 
 const PORT = 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT';
 const STREAM = 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_STREAM_ID';
 const CAPABILITY = 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_CAPABILITY';
 const MAX_BYTES = 2048;
 const MAX_NOTICES = 64;
+const MAX_FRAME_NOTICES = 4096;
+const FRAME_INTERVAL_MS = 750;
+const MAX_FRAME_LINE_BYTES = 180_000;
 const id = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
 const phases = ['exploration', 'compilation', 'replay_1', 'replay_2'] as const;
 export type DeferredViewerPhase = typeof phases[number];
@@ -23,6 +31,22 @@ export const DeferredViewerNoticeSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...base, kind: z.literal('unavailable') }),
 ]);
 export type DeferredViewerNotice = z.infer<typeof DeferredViewerNoticeSchema>;
+const frameBase = { deferredViewerVersion: z.literal('2'), viewerMode: z.literal('frame_stream'),
+  streamId: z.string().uuid(), sequence: z.number().int().min(1).max(MAX_FRAME_NOTICES),
+  phase: z.enum(phases), ownerId: id, testSpecId: id };
+/** Version 2 carries only bounded display pixels, never DOM or execution evidence. */
+export const DeferredFrameNoticeSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...frameBase, kind: z.literal('ready') }),
+  z.strictObject({ ...frameBase, kind: z.literal('transition') }),
+  z.strictObject({ ...frameBase, kind: z.literal('closed') }),
+  z.strictObject({ ...frameBase, kind: z.literal('unavailable') }),
+  z.strictObject({ ...frameBase, kind: z.literal('frame'), mimeType: z.literal('image/jpeg'),
+    width: z.number().int().min(1).max(LIVE_IMAGE_MAX_WIDTH),
+    height: z.number().int().min(1).max(LIVE_IMAGE_MAX_HEIGHT),
+    byteCount: z.number().int().min(1).max(LIVE_IMAGE_MAX_FRAME_BYTES),
+    imageBase64: z.string().max(Math.ceil(LIVE_IMAGE_MAX_FRAME_BYTES / 3) * 4) }),
+]);
+export type DeferredFrameNotice = z.infer<typeof DeferredFrameNoticeSchema>;
 
 /** Session launch reached a browser, but viewer preflight stopped it before any task action. */
 export class DeferredViewerPreflightError extends Error {
@@ -44,16 +68,27 @@ export class DeferredViewerLifecycle {
   #failed = false;
   #closed = false;
   #everReady = false;
+  readonly #mode: 'rfb' | 'frame_stream';
+  #frameTimer: ReturnType<typeof setTimeout> | undefined;
+  #frameGeneration = 0;
+  readonly #diagnostic: DeferredBrowserDiagnosticSink | undefined;
+  #captureOrdinal = 0;
+  #successfulFrames = 0;
+  #lastSuccessfulFrameAt: string | undefined;
+  #activeSession: ProtectedBrowserSession | undefined;
 
-  private constructor(socket: net.Socket, streamId: string, testSpecId: string) {
-    this.#socket = socket; this.#streamId = streamId; this.#testSpecId = testSpecId;
-    socket.on('error', () => this.#fail());
-    socket.on('close', () => this.#fail());
-    socket.on('data', () => this.#fail());
+  private constructor(socket: net.Socket, streamId: string, testSpecId: string, mode: 'rfb' | 'frame_stream',
+    diagnostic?: DeferredBrowserDiagnosticSink) {
+    this.#socket = socket; this.#streamId = streamId; this.#testSpecId = testSpecId; this.#mode = mode;
+    this.#diagnostic = diagnostic;
+    socket.on('error', () => this.#fail('CHANNEL_LOST'));
+    socket.on('close', () => this.#fail('CHANNEL_LOST'));
+    socket.on('data', () => this.#fail('DISPLAY_LOST'));
   }
 
   /** The three launch capabilities are consumed even on a rejected handshake. */
-  static async connect(testSpecId: string): Promise<DeferredViewerLifecycle> {
+  static async connect(testSpecId: string, mode: 'rfb' | 'frame_stream' = 'rfb',
+    diagnostic?: DeferredBrowserDiagnosticSink): Promise<DeferredViewerLifecycle> {
     id.parse(testSpecId);
     const portText = process.env[PORT], streamId = process.env[STREAM], capability = process.env[CAPABILITY];
     delete process.env[PORT]; delete process.env[STREAM]; delete process.env[CAPABILITY];
@@ -95,11 +130,133 @@ export class DeferredViewerLifecycle {
         }) + '\n'));
       });
     } catch (error) { socket.destroy(); throw error; }
-    return new DeferredViewerLifecycle(socket, streamId, testSpecId);
+    return new DeferredViewerLifecycle(socket, streamId, testSpecId, mode, diagnostic);
   }
 
-  #fail(): void {
-    this.#failed = true; this.#gateway?.close(); this.#gateway = undefined;
+  #record(session: ProtectedBrowserSession | undefined, operation: DeferredBrowserDiagnosticV1['operation'],
+    outcome: DeferredBrowserDiagnosticV1['outcome'], startedAtMs = performance.now(),
+    extra: Partial<DeferredBrowserDiagnosticV1> = {},
+    owner = this.#owner): void {
+    if (this.#mode !== 'frame_stream' || !owner || !this.#diagnostic) return;
+    const endedAtMs = performance.now();
+    try { this.#diagnostic({ diagnosticVersion: '1', source: 'viewer', operation,
+      phase: owner.phase, ownerId: owner.ownerId, startedAtMs, endedAtMs,
+      elapsedMs: diagnosticElapsed(startedAtMs, endedAtMs), outcome,
+      page: 'unknown', context: 'unknown', browser: 'unknown',
+      ...((session ?? this.#activeSession) ? diagnosticBrowserState((session ?? this.#activeSession)!) : {}), ...extra }); }
+    catch { /* Private diagnostics cannot affect viewing or QA. */ }
+  }
+
+  #fail(reason: 'CHANNEL_LOST' | 'DISPLAY_LOST' = 'DISPLAY_LOST'): void {
+    if (!this.#failed && !this.#closed) this.#record(undefined, 'channel_loss', 'failure', performance.now(), { internalReason: reason });
+    this.#failed = true; this.#gateway?.close(); this.#gateway = undefined; this.#stopFrames();
+  }
+
+  #stopFrames(): void {
+    this.#frameGeneration++;
+    if (this.#frameTimer) clearTimeout(this.#frameTimer);
+    this.#frameTimer = undefined;
+  }
+
+  #sendFrameNotice(kind: DeferredFrameNotice['kind'], owner: { phase: DeferredViewerPhase; ownerId: string },
+    image?: { bytes: Buffer; width: number; height: number }): boolean {
+    if (this.#failed || this.#closed || this.#sequence >= MAX_FRAME_NOTICES) { this.#fail(); return false; }
+    const parsed = DeferredFrameNoticeSchema.safeParse({ deferredViewerVersion: '2', viewerMode: 'frame_stream',
+      streamId: this.#streamId, sequence: ++this.#sequence, kind, phase: owner.phase,
+      ownerId: owner.ownerId, testSpecId: this.#testSpecId,
+      ...(kind === 'frame' && image ? { mimeType: 'image/jpeg', width: image.width, height: image.height,
+        byteCount: image.bytes.length, imageBase64: image.bytes.toString('base64') } : {}) });
+    if (!parsed.success) { this.#fail(); return false; }
+    const line = JSON.stringify(parsed.data) + '\n';
+    if (Buffer.byteLength(line) > MAX_FRAME_LINE_BYTES || this.#socket.writableLength > MAX_FRAME_LINE_BYTES) {
+      this.#fail('DISPLAY_LOST'); return false;
+    }
+    this.#socket.write(line);
+    return true;
+  }
+
+  #scheduleFrame(session: ProtectedBrowserSession, owner: { phase: DeferredViewerPhase; ownerId: string },
+    generation: number, delay = FRAME_INTERVAL_MS): void {
+    if (this.#failed || this.#closed || session.isClosed || generation !== this.#frameGeneration) return;
+    this.#frameTimer = setTimeout(() => {
+      this.#frameTimer = undefined;
+      void this.#captureFrame(session, owner, generation);
+    }, delay);
+    this.#frameTimer.unref?.();
+  }
+
+  async #captureFrame(session: ProtectedBrowserSession, owner: { phase: DeferredViewerPhase; ownerId: string },
+    generation: number): Promise<void> {
+    if (generation !== this.#frameGeneration || session.isClosed || this.#failed || this.#closed) return;
+    const startedAtMs = performance.now(), attemptOrdinal = ++this.#captureOrdinal;
+    const successfulFramesAtAttempt = this.#successfulFrames;
+    const onCaptureLifecycle = (event: LiveImageCaptureLifecycleEvent): void => {
+      const atMs = performance.now();
+      const details = { attemptOrdinal, successfulFrameCount: successfulFramesAtAttempt };
+      switch (event.kind) {
+        case 'timeout_fired':
+          this.#record(session, 'capture_timeout', 'failure', atMs,
+            { ...details, internalReason: 'CAPTURE_TIMEOUT' }, owner); break;
+        case 'detach_requested':
+          this.#record(session, 'capture_detach', 'started', atMs, details, owner); break;
+        case 'detach_completed':
+          this.#record(session, 'capture_detach', 'success', atMs, details, owner); break;
+        case 'detach_failed':
+          this.#record(session, 'capture_detach', 'failure', atMs,
+            { ...details, internalReason: 'CDP_DETACH_FAILED', exceptionName: diagnosticExceptionName(event.error) }, owner);
+          break;
+        case 'detach_wait_expired':
+          this.#record(session, 'capture_detach', 'failure', atMs,
+            { ...details, internalReason: 'CDP_DETACH_TIMEOUT' }, owner); break;
+        case 'capture_late_settled':
+          this.#record(session, 'capture_late_settle', event.outcome ?? 'failure', atMs,
+            { ...details, ...(event.error ? { exceptionName: diagnosticExceptionName(event.error) } : {}) }, owner);
+          break;
+        case 'late_result_discarded':
+          this.#record(session, 'capture_late_discard', 'success', atMs,
+            { ...details, internalReason: 'LATE_CAPTURE_DISCARDED' }, owner); break;
+      }
+    };
+    try {
+      const pages = session.context.pages().filter(page => !page.isClosed());
+      if (pages.length !== 1 || pages[0]!.url() === 'about:blank') {
+        this.#record(session, 'capture', 'skipped', startedAtMs, { attemptOrdinal,
+          successfulFrameCount: this.#successfulFrames, internalReason: pages.length !== 1 ? 'PAGE_COUNT' : 'NOT_READY',
+          ...(this.#lastSuccessfulFrameAt ? { lastSuccessfulFrameAt: this.#lastSuccessfulFrameAt } : {}) });
+        this.#scheduleFrame(session, owner, generation); return;
+      }
+      const bytes = await captureViewportJpeg(pages[0]!, onCaptureLifecycle);
+      if (generation !== this.#frameGeneration || session.isClosed || pages[0]!.isClosed()) return;
+      const dimensions = jpegDimensions(bytes);
+      if (!dimensions || dimensions.width > LIVE_IMAGE_MAX_WIDTH || dimensions.height > LIVE_IMAGE_MAX_HEIGHT ||
+          bytes.length > LIVE_IMAGE_MAX_FRAME_BYTES) throw new Error('Deferred frame invalid');
+      if (!this.#sendFrameNotice('frame', owner,
+        { bytes, width: dimensions.width, height: dimensions.height })) throw new Error('Deferred frame unavailable');
+      this.#successfulFrames++;
+      this.#lastSuccessfulFrameAt = new Date().toISOString();
+      this.#record(session, 'capture', 'success', startedAtMs, { attemptOrdinal,
+        successfulFrameCount: this.#successfulFrames, lastSuccessfulFrameAt: this.#lastSuccessfulFrameAt });
+      if (this.#successfulFrames === 1) this.#record(session, 'first_frame', 'success', startedAtMs,
+        { attemptOrdinal, successfulFrameCount: 1, lastSuccessfulFrameAt: this.#lastSuccessfulFrameAt });
+      this.#scheduleFrame(session, owner, generation);
+    } catch (error) {
+      if (generation !== this.#frameGeneration) return;
+      const name = diagnosticExceptionName(error);
+      const state = diagnosticBrowserState(session);
+      const internalReason = this.#failed ? 'CHANNEL_LOST' as const :
+        state.browser === 'disconnected' ? 'BROWSER_DISCONNECTED' as const :
+        state.context === 'closed' ? 'CONTEXT_CLOSED' as const :
+        state.page === 'closed' ? 'PAGE_CLOSED' as const :
+        name === 'TimeoutError' || name === 'LiveImageCaptureTimeout' ? 'CAPTURE_TIMEOUT' as const :
+        error instanceof Error && error.message === 'Deferred frame invalid' ? 'FRAME_INVALID' as const : 'CAPTURE_FAILED' as const;
+      this.#record(session, 'capture', 'failure', startedAtMs, { attemptOrdinal,
+        successfulFrameCount: this.#successfulFrames, ...(this.#lastSuccessfulFrameAt ? { lastSuccessfulFrameAt: this.#lastSuccessfulFrameAt } : {}),
+        exceptionName: name, internalReason });
+      if (generation === this.#frameGeneration && !this.#failed && !this.#closed) {
+        if (this.#sendFrameNotice('unavailable', owner)) this.#record(session, 'unavailable', 'success');
+        this.#stopFrames();
+      }
+    }
   }
 
   #send(kind: DeferredViewerNotice['kind'], owner: { phase: DeferredViewerPhase; ownerId: string },
@@ -125,10 +282,31 @@ export class DeferredViewerLifecycle {
       if (this.#everReady) { this.#owner = { phase, ownerId }; return; }
       throw new Error('Deferred viewer unavailable');
     }
-    if (this.#owner) this.#send('transition', this.#owner);
+    if (this.#owner) {
+      if (this.#mode === 'frame_stream') {
+        if (this.#sendFrameNotice('transition', this.#owner)) this.#record(undefined, 'transition', 'success');
+      }
+      else this.#send('transition', this.#owner);
+    }
+    this.#stopFrames();
     this.#gateway?.close(); this.#gateway = undefined;
     const owner = { phase, ownerId }; this.#owner = owner;
+    this.#activeSession = session;
+    this.#captureOrdinal = 0; this.#successfulFrames = 0; this.#lastSuccessfulFrameAt = undefined;
     if (this.#failed && this.#everReady) return;
+    if (this.#mode === 'frame_stream') {
+      if (!this.#sendFrameNotice('ready', owner)) {
+        if (this.#everReady) return;
+        throw new Error('Deferred viewer unavailable');
+      }
+      this.#everReady = true;
+      this.#record(session, 'ready', 'success');
+      this.#record(session, 'loop_start', 'started');
+      const generation = this.#frameGeneration;
+      this.#scheduleFrame(session, owner, generation, 100);
+      session.onClosing(() => this.closeSession(owner));
+      return;
+    }
     let gateway: ViewerGateway;
     try {
       gateway = await ViewerGateway.start(session, () => {
@@ -157,13 +335,19 @@ export class DeferredViewerLifecycle {
 
   closeSession(owner: { phase: DeferredViewerPhase; ownerId: string }): void {
     if (this.#owner?.phase !== owner.phase || this.#owner.ownerId !== owner.ownerId) return;
+    this.#stopFrames();
     this.#gateway?.close(); this.#gateway = undefined;
-    this.#send('closed', owner);
+    if (this.#mode === 'frame_stream') {
+      if (this.#sendFrameNotice('closed', owner)) this.#record(undefined, 'closed', 'success');
+    }
+    else this.#send('closed', owner);
   }
 
   close(): void {
     if (this.#closed) return;
+    this.#stopFrames();
     this.#gateway?.close(); this.#gateway = undefined;
     this.#closed = true; this.#socket.end();
+    this.#activeSession = undefined;
   }
 }

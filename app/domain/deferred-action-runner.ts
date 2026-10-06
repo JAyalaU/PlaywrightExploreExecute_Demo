@@ -28,6 +28,7 @@ export const DeferredRunnerRecordV9Schema=z.strictObject({runnerVersion:z.litera
   steps:z.array(z.strictObject({stepId:id,traceRecordId:id,originStepId:id,type:z.enum(['action_goal','navigate','verification_goal']),
     status:z.enum(['succeeded','assertion_passed','assertion_failed','stopped']),before:DeferredRunStateV9Schema,after:DeferredRunStateV9Schema,afterStateStatus:z.enum(['observed','unavailable']),
     stateRefresh:z.strictObject({kind:z.enum(['url_only','rich_after_url']),from:DeferredRunStateV9Schema}).optional(),
+    bootstrapAdopted:z.literal(true).optional(),
     predicateDigest:digest.optional(),operation:z.enum(['fill','select_option','click']).optional(),argument:z.string().max(1024).optional(),
     invocation:z.enum(['not_invoked','returned','threw']),mutationMayHaveOccurred:z.boolean(),effectDigest:digest.optional(),effect:DeferredEffectV9Schema.optional(),verification:DeferredVerificationFactsV9Schema.optional(),verificationProof:z.strictObject({proofVersion:z.literal('2'),proofId:id,sessionId:id,pageId:id,stateDigest:digest,stateEpoch:z.number().int().nonnegative(),mutationEpoch:z.number().int().nonnegative(),result:NativeOptionProofSchema,proofDigest:digest}).optional(),reasonCode:DeferredRunnerStopV9Schema.optional(),
     invokedAt:z.iso.datetime().optional(),returnedAt:z.iso.datetime().optional()})).max(100),
@@ -54,6 +55,7 @@ export function parseDeferredRunnerRecordV9(input:unknown):DeferredRunnerRecordV
           ['assertion_passed','assertion_failed'].includes(previous.status)&&
           previous.verification?.assertion.assertionVersion!=='2'&&previous.verification?.assertion.kind==='url'));
     if(refresh&&!validRefresh||!current||hash(current)!==hash(s.before)&&!resumed&&!validRefresh||s.before.sessionId!==r.provenance?.sessionId||s.after.sessionId!==s.before.sessionId||
+    s.bootstrapAdopted&&(r.provenance?.semanticMode!=='poc_v1'||r.steps[0]!==s||s.type!=='navigate'||s.status!=='succeeded'||s.invocation!=='returned')||
     s.after.pageId!==s.before.pageId||s.after.stateEpoch<s.before.stateEpoch||s.after.mutationEpoch<s.before.mutationEpoch||
     s.mutationMayHaveOccurred!==(s.invocation!=='not_invoked')||s.type==='action_goal'&&s.status==='succeeded'&&(!s.effectDigest||s.invocation!=='returned'||!s.predicateDigest)||
     s.status==='stopped'&&!s.reasonCode||s.status!=='stopped'&&s.afterStateStatus!=='observed'&&

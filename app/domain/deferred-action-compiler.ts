@@ -73,7 +73,7 @@ export const CompilerAttemptV4Schema = z.strictObject({ compilerVersion: z.liter
   executionStops: z.array(z.strictObject({traceRecordId:id,execution:ActionExecutionAttemptV1Schema})).max(100),
   freshVerifications: z.array(z.strictObject({ traceRecordId: id, observation: z.union([TrustedObservationResultV1Schema,NativeOptionObservationV2Schema]) })).max(100),
   verificationObservationDiagnostics: z.array(CompilerVerificationObservationDiagnosticV1Schema).max(100).optional(),
-  freshNavigations: z.array(z.strictObject({ traceRecordId:id,url:ApprovedAbsoluteUrlSchema,before:TraceStateV5Schema,after:TraceStateV5Schema,observedAt:z.iso.datetime() })).max(100),
+  freshNavigations: z.array(z.strictObject({ traceRecordId:id,url:ApprovedAbsoluteUrlSchema,before:TraceStateV5Schema,after:TraceStateV5Schema,observedAt:z.iso.datetime(),bootstrapAdopted:z.literal(true).optional() })).max(100),
   result: z.discriminatedUnion('status',[z.strictObject({ status: z.literal('accepted'), resolvedSpecId: id }),
     z.strictObject({ status: z.literal('rejected'), reasonCode: DeferredCompilerReasonV4Schema, failedTraceRecordId: id.optional() })]), attemptDigest: digest });
 export type CompilerAttemptV4 = z.infer<typeof CompilerAttemptV4Schema>;
@@ -144,6 +144,9 @@ export function parseCompilerAttemptV4(input: unknown, trace: SuccessfulExplorat
   }
   for(const fresh of a.freshNavigations){const original=trace.successfulPath.find(r=>r.recordId===fresh.traceRecordId);
     if(!original||original.type!=='navigate'||fresh.url!==original.url||fresh.before.sessionId!==a.freshSessionId||fresh.after.sessionId!==a.freshSessionId||
+      (fresh.bootstrapAdopted && (trace.source.semanticMode!=='poc_v1'||original!==trace.successfulPath[0]||
+        original.url!==new URL(original.url).href||
+        new URL(trace.source.startState.url).href!==new URL(original.url).href))||
       fresh.before.pageId!==fresh.after.pageId||fresh.after.stateEpoch<=fresh.before.stateEpoch||fresh.after.mutationEpoch<=fresh.before.mutationEpoch||
       Date.parse(fresh.observedAt)<Date.parse(a.startedAt)||Date.parse(fresh.observedAt)>Date.parse(a.finishedAt))throw new Error('INVALID_FRESH_NAVIGATION');}
   for(const stop of a.executionStops){const original=trace.successfulPath.find(r=>r.recordId===stop.traceRecordId),execution=parseActionExecutionAttemptV1(stop.execution);

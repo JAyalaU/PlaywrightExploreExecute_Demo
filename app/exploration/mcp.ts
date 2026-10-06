@@ -50,6 +50,17 @@ export class McpExplorationSession {
   #groundingRevision = 0;
   #activeCalls = 0;
   #groundingLocked = false;
+  #lastNavigation: { requested: string; final: string; redirected: boolean; page: object } | undefined;
+
+  /** A one-shot, runtime-owned receipt for an initial document request. */
+  consumeMatchingBootstrapNavigation(url: string): boolean {
+    const receipt = this.#lastNavigation;
+    this.#lastNavigation = undefined;
+    const pages = this.browserSession.context.pages();
+    return !!receipt && receipt.requested === new URL(url).href && !receipt.redirected &&
+      receipt.final === receipt.requested && pages.length === 1 && pages[0] === receipt.page &&
+      !pages[0]!.isClosed() && pages[0]!.url() === receipt.final;
+  }
 
   /** Additive private runtime coordination; old tool names and wire schemas are unchanged. */
   get groundingRevision(): number { return this.#groundingRevision; }
@@ -147,7 +158,22 @@ export class McpExplorationSession {
     catch { throw new McpToolError('browser_navigate', 'Invalid navigation URL'); }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
       throw new McpToolError('browser_navigate', 'Unsupported navigation URL scheme');
-    return this.#call('browser_navigate', { url });
+    this.#lastNavigation = undefined;
+    const responses: Array<{ final: string; redirected: boolean; page: object }> = [];
+    const onResponse = (response: import('@playwright/test').Response) => {
+      try {
+        const request = response.request();
+        if (request.isNavigationRequest() && request.frame() === request.frame().page().mainFrame())
+          responses.push({ final: response.url(), redirected: !!request.redirectedFrom(), page: request.frame().page() });
+      } catch { /* A response without an owned frame cannot certify adoption. */ }
+    };
+    this.browserSession.context.on('response', onResponse);
+    try {
+      const result = await this.#call('browser_navigate', { url });
+      const final = responses.at(-1);
+      if (final) this.#lastNavigation = { requested: parsed.href, ...final };
+      return result;
+    } finally { this.browserSession.context.off('response', onResponse); }
   }
   snapshot(): Promise<string> { return this.#call('browser_snapshot', {}); }
   find(text: string): Promise<string> { return this.#call('browser_find', { text }); }

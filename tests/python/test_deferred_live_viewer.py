@@ -1,6 +1,7 @@
 """Closed deferred live-view channel and local UI tests; no provider/browser."""
 
 import json
+import base64
 import socket
 import sys
 import time
@@ -31,7 +32,108 @@ def notice(buffer, sequence, kind, phase, owner, **change):
     return (json.dumps(value) + "\n").encode()
 
 
+def frame_notice(buffer, sequence, kind, phase, owner, **change):
+    value = {"deferredViewerVersion": "2", "viewerMode": "frame_stream",
+             "streamId": buffer.stream_id, "sequence": sequence, "kind": kind,
+             "phase": phase, "ownerId": owner, "testSpecId": "local-fixture"}
+    if kind == "frame":
+        image = b"\xff\xd8fixture\xff\xd9"
+        value.update({"mimeType": "image/jpeg", "width": 8, "height": 6,
+                      "byteCount": len(image), "imageBase64": base64.b64encode(image).decode()})
+    value.update(change)
+    return (json.dumps(value) + "\n").encode()
+
+
 class DeferredViewerTests(unittest.TestCase):
+    def test_frame_mode_renders_only_actual_image_and_clears_each_phase(self):
+        buffer = DeferredViewerBuffer()
+        buffer.add(frame_notice(buffer, 1, "ready", "exploration", "exploration-one"))
+        with patch("playwright_demo.ui_shell.st.subheader"), \
+             patch("playwright_demo.ui_shell.st.caption") as caption, \
+             patch("playwright_demo.ui_shell.st.html") as html, \
+             patch("playwright_demo.ui_shell.st.image") as image:
+            _render_deferred_viewer(buffer)
+        self.assertFalse(image.called)
+        self.assertNotIn("/rfb", html.call_args.args[0])
+        self.assertIn("Preparing image", " ".join(call.args[0] for call in caption.call_args_list))
+        buffer.add(frame_notice(buffer, 2, "frame", "exploration", "exploration-one"))
+        with patch("playwright_demo.ui_shell.st.subheader"), \
+             patch("playwright_demo.ui_shell.st.caption") as caption, \
+             patch("playwright_demo.ui_shell.st.html") as html, \
+             patch("playwright_demo.ui_shell.st.image") as image:
+            _render_deferred_viewer(buffer)
+        self.assertEqual(image.call_args.args[0], b"\xff\xd8fixture\xff\xd9")
+        self.assertNotIn("rfb.viewOnly", html.call_args.args[0])
+        self.assertNotIn("keyboard", " ".join(call.args[0] for call in caption.call_args_list))
+        buffer.add(frame_notice(buffer, 3, "closed", "exploration", "exploration-one"))
+        buffer.add(frame_notice(buffer, 4, "transition", "exploration", "exploration-one"))
+        self.assertEqual(buffer.snapshot(), ("transitioning", "exploration", None))
+        buffer.add(frame_notice(buffer, 5, "ready", "compilation", "compiler-one"))
+        with patch("playwright_demo.ui_shell.st.subheader"), \
+             patch("playwright_demo.ui_shell.st.caption"), \
+             patch("playwright_demo.ui_shell.st.html") as html, \
+             patch("playwright_demo.ui_shell.st.image") as image:
+            _render_deferred_viewer(buffer)
+        self.assertFalse(image.called)
+        self.assertNotIn("/rfb", html.call_args.args[0])
+        buffer.add(frame_notice(buffer, 6, "frame", "compilation", "compiler-one"))
+        self.assertEqual(buffer.snapshot()[2]["owner"]["id"], "compiler-one")
+
+    def test_stale_frame_and_invalid_frame_are_rejected_and_removed(self):
+        buffer = DeferredViewerBuffer()
+        buffer.add(frame_notice(buffer, 1, "ready", "exploration", "exploration-one"))
+        buffer.add(frame_notice(buffer, 2, "frame", "exploration", "exploration-one"))
+        buffer.add(frame_notice(buffer, 3, "closed", "exploration", "exploration-one"))
+        buffer.add(frame_notice(buffer, 4, "transition", "exploration", "exploration-one"))
+        buffer.add(frame_notice(buffer, 5, "ready", "compilation", "compiler-one"))
+        with self.assertRaises(InvalidViewerNotice):
+            buffer.add(frame_notice(buffer, 6, "frame", "exploration", "exploration-one"))
+        self.assertEqual(buffer.snapshot(), ("unavailable", "compilation", None))
+        for change in ({"byteCount": 200_000}, {"imageBase64": "not-base64"}, {"path": "/rfb"}):
+            other = DeferredViewerBuffer()
+            other.add(frame_notice(other, 1, "ready", "exploration", "exploration-one"))
+            with self.assertRaises(InvalidViewerNotice):
+                other.add(frame_notice(other, 2, "frame", "exploration", "exploration-one", **change))
+            self.assertEqual(other.snapshot()[2], None)
+
+    def test_image_render_failure_is_observational(self):
+        buffer = DeferredViewerBuffer()
+        buffer.add(frame_notice(buffer, 1, "ready", "exploration", "exploration-one"))
+        buffer.add(frame_notice(buffer, 2, "frame", "exploration", "exploration-one"))
+        result = {"terminal": {"status": "QA_ASSERTION_PASSED"}}
+        with patch("playwright_demo.ui_shell.st.subheader"), \
+             patch("playwright_demo.ui_shell.st.caption"), \
+             patch("playwright_demo.ui_shell.st.html"), \
+             patch("playwright_demo.ui_shell.st.image", side_effect=RuntimeError("UI failure")), \
+             patch("playwright_demo.ui_shell.st.warning") as warning:
+            _render_deferred_viewer(buffer)
+        self.assertEqual(buffer.snapshot()[0], "unavailable")
+        self.assertTrue(warning.called)
+        self.assertEqual(result, {"terminal": {"status": "QA_ASSERTION_PASSED"}})
+
+    def test_authenticated_channel_accepts_one_bounded_large_image(self):
+        buffer = DeferredViewerBuffer("frame_stream")
+        channel = DeferredViewerChannel(buffer)
+        channel.start()
+        image = b"\xff\xd8" + b"x" * 64_000 + b"\xff\xd9"
+        try:
+            with socket.create_connection(("127.0.0.1", channel.port), timeout=2) as peer:
+                peer.sendall((json.dumps({"deferredViewerVersion": "1", "kind": "hello",
+                                         "streamId": buffer.stream_id,
+                                         "capability": channel.capability}) + "\n").encode())
+                peer.settimeout(2)
+                self.assertEqual(json.loads(peer.makefile("rb").readline())["kind"], "ready")
+                peer.sendall(frame_notice(buffer, 1, "ready", "exploration", "exploration-one"))
+                peer.sendall(frame_notice(buffer, 2, "frame", "exploration", "exploration-one",
+                                          byteCount=len(image), imageBase64=base64.b64encode(image).decode()))
+                for _ in range(100):
+                    if buffer.snapshot()[2] and buffer.snapshot()[2]["frame"] is not None: break
+                    time.sleep(0.01)
+                self.assertEqual(buffer.snapshot()[2]["frame"], image)
+        finally:
+            channel.close()
+        self.assertEqual(buffer.snapshot()[2], None)
+
     def test_four_real_owner_phases_clear_old_handle_and_finish(self):
         buffer = DeferredViewerBuffer()
         buffer.mark_connecting()
@@ -179,6 +281,24 @@ class DeferredViewerTests(unittest.TestCase):
         operator_text = " ".join(captions)
         for secret in ("a" * 64, "15331", "exploration-one", "/rfb", "container"):
             self.assertNotIn(secret, operator_text)
+
+    def test_trusted_local_panel_uses_frame_mode_before_first_notice(self):
+        with patch.dict("os.environ", {"PLAYWRIGHT_DEMO_WORKFLOW_VERSION": "deferred-action-v1",
+                                    "PLAYWRIGHT_DEMO_LIVE_VIEW": "1",
+                                    "PLAYWRIGHT_DEMO_BROWSER_BACKEND": "local-windows"}):
+            run = UiRun(UiRequest("https://public.example.org/", "Check"), lambda _request: None)
+        buffer = _deferred_viewer_buffers[run]
+        self.assertEqual(buffer.mode, "frame_stream")
+        with patch("playwright_demo.ui_shell.st.subheader"), \
+             patch("playwright_demo.ui_shell.st.caption") as caption, \
+             patch("playwright_demo.ui_shell.st.html") as html, \
+             patch("playwright_demo.ui_shell.st.image") as image:
+            _render_live_viewer_fragment.__wrapped__(run)
+        self.assertFalse(image.called)
+        captions = " ".join(call.args[0] for call in caption.call_args_list)
+        self.assertIn("Waiting for the execution browser", captions)
+        self.assertNotIn("headed mode", captions)
+        self.assertNotIn("/rfb", html.call_args.args[0])
 
     def test_deferred_live_view_disabled_omits_runtime_note(self):
         with patch.dict("os.environ", {"PLAYWRIGHT_DEMO_WORKFLOW_VERSION": "deferred-action-v1",
