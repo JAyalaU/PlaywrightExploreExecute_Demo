@@ -1,5 +1,9 @@
 # Runtime investigation log
 
+## 2026-10-05 — Successful Windows-native performance profile
+
+- See [windows-native-performance-profile.md](windows-native-performance-profile.md). The retained exploration-start-to-replay-pair interval was 135.525 s; the true request-to-terminal duration and exact provider split were not persisted. Four root navigations were already bootstrap-adopted. The largest measured costs were public document readiness, including two approximately 30-second `/dropdown` DOMContentLoaded waits. Only 66 ms of sequential diagnostic-only probes was precisely identified as avoidable critical-path work; removing them is low priority before the demo.
+
 ## 2026-10-05 — Local viewer navigation-time capture recovery
 
 - The local-Windows viewer's first CDP JPEG attempt could time out during root navigation, detach correctly, then incorrectly end viewing while QA continued. Viewer-only main-document lifecycle tracking now skips unstable pages, and a bounded timeout or document replacement resumes at the 750 ms cadence after detach. Offline fixtures observe post-navigation frames, no late/stale pixels, terminal browser/context/channel failures, and unchanged five-step QA with view on/off. No public target or provider was contacted.
