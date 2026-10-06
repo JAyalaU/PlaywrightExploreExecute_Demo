@@ -1,6 +1,7 @@
 /** Authenticated, view-only lifecycle for the active deferred workflow. No page or QA data crosses this channel. */
 import net from 'node:net';
 import { z } from 'zod';
+import type { Page, Request } from '@playwright/test';
 import type { ProtectedBrowserSession } from '../profile/context.js';
 import { ViewerGateway } from './viewer-gateway.js';
 import { captureViewportJpeg, jpegDimensions, LIVE_IMAGE_MAX_FRAME_BYTES,
@@ -48,6 +49,58 @@ export const DeferredFrameNoticeSchema = z.discriminatedUnion('kind', [
 ]);
 export type DeferredFrameNotice = z.infer<typeof DeferredFrameNoticeSchema>;
 
+/** Passive viewer-only lifecycle signal. It never waits for or changes navigation. */
+class FrameDocumentState {
+  readonly #pages = new Map<Page, { pending: Request | undefined; generation: number; ready: boolean;
+    readyBeforePending: boolean; remove: (() => void)[] }>();
+  readonly #onPage: (page: Page) => void;
+  #contextClosed = false;
+  readonly #onContextClose = (): void => { this.#contextClosed = true; };
+  constructor(readonly session: ProtectedBrowserSession) {
+    this.#onPage = page => this.#watch(page);
+    session.context.on('page', this.#onPage);
+    session.context.on('close', this.#onContextClose);
+    session.context.pages().forEach(this.#onPage);
+  }
+  #watch(page: Page): void {
+    if (this.#pages.has(page)) return;
+    const state = { pending: undefined as Request | undefined, generation: 0,
+      ready: true, readyBeforePending: true, remove: [] as (() => void)[] };
+    this.#pages.set(page, state);
+    const onRequest = (request: Request): void => {
+      try { if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+        state.readyBeforePending = state.ready;
+        state.pending = request; state.ready = false; state.generation++;
+      } } catch { /* A detached request cannot supply a frame. */ }
+    };
+    const onFailed = (request: Request): void => {
+      if (state.pending === request) { state.pending = undefined; state.ready = state.readyBeforePending; }
+    };
+    const onNavigated = (frame: ReturnType<Page['mainFrame']>): void => {
+      if (frame === page.mainFrame()) {
+        state.pending = undefined; state.ready = false; state.generation++;
+      }
+    };
+    const onDcl = (): void => { if (!state.pending) state.ready = true; };
+    page.on('request', onRequest); state.remove.push(() => page.off('request', onRequest));
+    page.on('requestfailed', onFailed); state.remove.push(() => page.off('requestfailed', onFailed));
+    page.on('framenavigated', onNavigated); state.remove.push(() => page.off('framenavigated', onNavigated));
+    page.on('domcontentloaded', onDcl); state.remove.push(() => page.off('domcontentloaded', onDcl));
+  }
+  snapshot(page: Page): { generation: number; transitioning: boolean } {
+    const state = this.#pages.get(page);
+    return { generation: state?.generation ?? 0,
+      transitioning: !state || !!state.pending || !state.ready };
+  }
+  get contextClosed(): boolean { return this.#contextClosed; }
+  dispose(): void {
+    this.session.context.off('page', this.#onPage);
+    this.session.context.off('close', this.#onContextClose);
+    for (const state of this.#pages.values()) state.remove.forEach(remove => remove());
+    this.#pages.clear();
+  }
+}
+
 /** Session launch reached a browser, but viewer preflight stopped it before any task action. */
 export class DeferredViewerPreflightError extends Error {
   constructor(readonly cleanup: 'verified' | 'unverified') { super('Deferred viewer preflight unavailable'); }
@@ -68,6 +121,7 @@ export class DeferredViewerLifecycle {
   #failed = false;
   #closed = false;
   #everReady = false;
+  #frameUnavailable = false;
   readonly #mode: 'rfb' | 'frame_stream';
   #frameTimer: ReturnType<typeof setTimeout> | undefined;
   #frameGeneration = 0;
@@ -76,6 +130,7 @@ export class DeferredViewerLifecycle {
   #successfulFrames = 0;
   #lastSuccessfulFrameAt: string | undefined;
   #activeSession: ProtectedBrowserSession | undefined;
+  #documentState: FrameDocumentState | undefined;
 
   private constructor(socket: net.Socket, streamId: string, testSpecId: string, mode: 'rfb' | 'frame_stream',
     diagnostic?: DeferredBrowserDiagnosticSink) {
@@ -156,6 +211,7 @@ export class DeferredViewerLifecycle {
     this.#frameGeneration++;
     if (this.#frameTimer) clearTimeout(this.#frameTimer);
     this.#frameTimer = undefined;
+    this.#documentState?.dispose(); this.#documentState = undefined;
   }
 
   #sendFrameNotice(kind: DeferredFrameNotice['kind'], owner: { phase: DeferredViewerPhase; ownerId: string },
@@ -190,6 +246,8 @@ export class DeferredViewerLifecycle {
     if (generation !== this.#frameGeneration || session.isClosed || this.#failed || this.#closed) return;
     const startedAtMs = performance.now(), attemptOrdinal = ++this.#captureOrdinal;
     const successfulFramesAtAttempt = this.#successfulFrames;
+    let capturePage: Page | undefined;
+    let captureGeneration: number | undefined;
     const onCaptureLifecycle = (event: LiveImageCaptureLifecycleEvent): void => {
       const atMs = performance.now();
       const details = { attemptOrdinal, successfulFrameCount: successfulFramesAtAttempt };
@@ -218,15 +276,27 @@ export class DeferredViewerLifecycle {
       }
     };
     try {
+      if (session.context.browser()?.isConnected() === false) throw new Error('Browser disconnected');
+      if (this.#documentState?.contextClosed) throw new Error('Context closed');
       const pages = session.context.pages().filter(page => !page.isClosed());
-      if (pages.length !== 1 || pages[0]!.url() === 'about:blank') {
+      const before = pages.length === 1 ? this.#documentState?.snapshot(pages[0]!) : undefined;
+      if (pages.length !== 1 || pages[0]!.url() === 'about:blank' || before?.transitioning) {
         this.#record(session, 'capture', 'skipped', startedAtMs, { attemptOrdinal,
-          successfulFrameCount: this.#successfulFrames, internalReason: pages.length !== 1 ? 'PAGE_COUNT' : 'NOT_READY',
+          successfulFrameCount: this.#successfulFrames, internalReason: pages.length !== 1 ? 'PAGE_COUNT' :
+            before?.transitioning ? 'NAVIGATION_IN_PROGRESS' : 'NOT_READY',
           ...(this.#lastSuccessfulFrameAt ? { lastSuccessfulFrameAt: this.#lastSuccessfulFrameAt } : {}) });
         this.#scheduleFrame(session, owner, generation); return;
       }
+      capturePage = pages[0]!; captureGeneration = before?.generation;
       const bytes = await captureViewportJpeg(pages[0]!, onCaptureLifecycle);
       if (generation !== this.#frameGeneration || session.isClosed || pages[0]!.isClosed()) return;
+      const after = this.#documentState?.snapshot(pages[0]!);
+      if (after?.transitioning || after?.generation !== before?.generation ||
+          session.context.pages().length !== 1 || session.context.pages()[0] !== pages[0]) {
+        this.#record(session, 'capture', 'skipped', startedAtMs, { attemptOrdinal,
+          successfulFrameCount: this.#successfulFrames, internalReason: 'DOCUMENT_REPLACED' });
+        this.#scheduleFrame(session, owner, generation); return;
+      }
       const dimensions = jpegDimensions(bytes);
       if (!dimensions || dimensions.width > LIVE_IMAGE_MAX_WIDTH || dimensions.height > LIVE_IMAGE_MAX_HEIGHT ||
           bytes.length > LIVE_IMAGE_MAX_FRAME_BYTES) throw new Error('Deferred frame invalid');
@@ -245,15 +315,32 @@ export class DeferredViewerLifecycle {
       const state = diagnosticBrowserState(session);
       const internalReason = this.#failed ? 'CHANNEL_LOST' as const :
         state.browser === 'disconnected' ? 'BROWSER_DISCONNECTED' as const :
-        state.context === 'closed' ? 'CONTEXT_CLOSED' as const :
+        state.context === 'closed' || this.#documentState?.contextClosed ? 'CONTEXT_CLOSED' as const :
         state.page === 'closed' ? 'PAGE_CLOSED' as const :
         name === 'TimeoutError' || name === 'LiveImageCaptureTimeout' ? 'CAPTURE_TIMEOUT' as const :
         error instanceof Error && error.message === 'Deferred frame invalid' ? 'FRAME_INVALID' as const : 'CAPTURE_FAILED' as const;
       this.#record(session, 'capture', 'failure', startedAtMs, { attemptOrdinal,
         successfulFrameCount: this.#successfulFrames, ...(this.#lastSuccessfulFrameAt ? { lastSuccessfulFrameAt: this.#lastSuccessfulFrameAt } : {}),
         exceptionName: name, internalReason });
+      const transitioning = (() => {
+        try { const page = session.context.pages()[0]; return !!page &&
+          !!this.#documentState?.snapshot(page).transitioning; } catch { return false; }
+      })();
+      const replaced = (() => {
+        try { const page = session.context.pages()[0]; return !!capturePage &&
+          (page !== capturePage || this.#documentState?.snapshot(capturePage).generation !== captureGeneration); }
+        catch { return false; }
+      })();
+      const transient = internalReason === 'CAPTURE_TIMEOUT' ||
+        (internalReason === 'CAPTURE_FAILED' && (transitioning || replaced ||
+          /execution context was destroyed|cannot find context|context.*destroyed|navigation/i.test(
+            error instanceof Error ? error.message : '')));
+      if (transient && !this.#failed && !this.#closed && !session.isClosed) {
+        this.#scheduleFrame(session, owner, generation); return;
+      }
       if (generation === this.#frameGeneration && !this.#failed && !this.#closed) {
         if (this.#sendFrameNotice('unavailable', owner)) this.#record(session, 'unavailable', 'success');
+        this.#frameUnavailable = true;
         this.#stopFrames();
       }
     }
@@ -278,6 +365,7 @@ export class DeferredViewerLifecycle {
     id.parse(ownerId);
     const nextIndex = phases.indexOf(phase), previousIndex = this.#owner ? phases.indexOf(this.#owner.phase) : -1;
     if (nextIndex !== previousIndex + 1 || this.#closed) throw new Error('Deferred viewer phase order invalid');
+    if (this.#frameUnavailable) { this.#owner = { phase, ownerId }; return; }
     if (this.#failed) {
       if (this.#everReady) { this.#owner = { phase, ownerId }; return; }
       throw new Error('Deferred viewer unavailable');
@@ -292,6 +380,7 @@ export class DeferredViewerLifecycle {
     this.#gateway?.close(); this.#gateway = undefined;
     const owner = { phase, ownerId }; this.#owner = owner;
     this.#activeSession = session;
+    if (this.#mode === 'frame_stream') this.#documentState = new FrameDocumentState(session);
     this.#captureOrdinal = 0; this.#successfulFrames = 0; this.#lastSuccessfulFrameAt = undefined;
     if (this.#failed && this.#everReady) return;
     if (this.#mode === 'frame_stream') {
@@ -337,6 +426,7 @@ export class DeferredViewerLifecycle {
     if (this.#owner?.phase !== owner.phase || this.#owner.ownerId !== owner.ownerId) return;
     this.#stopFrames();
     this.#gateway?.close(); this.#gateway = undefined;
+    if (this.#frameUnavailable) return;
     if (this.#mode === 'frame_stream') {
       if (this.#sendFrameNotice('closed', owner)) this.#record(undefined, 'closed', 'success');
     }

@@ -44,7 +44,7 @@ type Case = 'normal' | 'duplicate_links' | 'wrong_url' | 'duplicate_selects' | '
   'runner_state_read_timeout' | 'delayed_destination_dcl';
 
 async function fixture(mode: Case, isolated = false, localWindows = false, failFrameCapture = false,
-  slowCandidateRead = false) {
+  slowCandidateRead = false, transientFrameTimeouts = 0) {
   const artifactRoot = await mkdtemp(path.join(tmpdir(), 'deferred-poc-closure-'));
   const config = {
     profiles: [{ id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 },
@@ -167,6 +167,17 @@ async function fixture(mode: Case, isolated = false, localWindows = false, failF
     });
     if (failFrameCapture && ordinal === 1)
       browser.context.newCDPSession = async () => { throw new Error('Fixture: observational frame capture unavailable'); };
+    if (transientFrameTimeouts && ordinal === 1) {
+      const originalNewCDPSession = browser.context.newCDPSession.bind(browser.context);
+      let attempts = 0;
+      browser.context.newCDPSession = async page => {
+        if (++attempts > transientFrameTimeouts) return originalNewCDPSession(page);
+        return { send: async (method: string) => method === 'Page.getLayoutMetrics' ? {
+          cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 },
+        } : new Promise<never>(() => undefined), detach: async () => undefined } as
+          Awaited<ReturnType<typeof browser.context.newCDPSession>>;
+      };
+    }
     if (slowCandidateRead && ordinal === 1)
       browser.context.on('page', page => page.on('framenavigated', frame => {
         if (frame !== page.mainFrame() || frame.url() !== dropdownUrl) return;
@@ -512,6 +523,14 @@ test('local-windows live frames follow all four owners without changing five-ste
       expect(JSON.stringify(result)).not.toContain('frame_stream');
       const diagnostics = await new DeferredWorkflowStopStoreV1(f.artifactRoot)
         .readBrowserDiagnostics(result.testSpecId);
+      for (const phase of phases) {
+        const ready = diagnostics.find(item => item.source === 'viewer' && item.phase === phase &&
+          item.operation === 'ready');
+        const closed = diagnostics.find(item => item.source === 'viewer' && item.phase === phase &&
+          item.operation === 'closed');
+        if (ready && closed && closed.endedAtMs - ready.startedAtMs >= 5_000)
+          expect(notices.some(notice => notice.kind === 'frame' && notice.phase === phase)).toBe(true);
+      }
       const captures = diagnostics.filter(item => item.source === 'viewer' && item.phase === 'exploration' &&
         item.operation === 'capture' && item.outcome === 'success');
       const selectRead = diagnostics.find(item => item.source === 'grounding' && item.stepId === 's4' &&
@@ -547,7 +566,7 @@ test('local-windows live frames follow all four owners without changing five-ste
   }
 });
 
-test('local-windows frame capture loss leaves the five-step QA result authoritative', async () => {
+for (const failure of ['permanent', 'transient'] as const) test(`local-windows ${failure} frame capture loss leaves five-step QA authoritative`, async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   test.setTimeout(180_000);
   const streamId = randomUUID(), capability = randomBytes(32).toString('hex');
@@ -576,7 +595,8 @@ test('local-windows frame capture loss leaves the five-step QA result authoritat
   const oldEnv = envKeys.map(key => process.env[key]);
   process.env[envKeys[0]] = '1'; process.env[envKeys[1]] = String(address.port);
   process.env[envKeys[2]] = streamId; process.env[envKeys[3]] = capability;
-  const f = await fixture('normal', false, true, true);
+  const f = await fixture('normal', false, true, failure === 'permanent',
+    failure === 'transient', failure === 'transient' ? 2 : 0);
   try {
     await withoutDocker(async () => {
       const response = await f.run();
@@ -585,13 +605,17 @@ test('local-windows frame capture loss leaves the five-step QA result authoritat
       expect(response.context.result.cleanup).toBe('verified');
       expect(f.openedSessions).toHaveLength(4);
       expect(f.openedSessions.every(session => session.context.browser()?.isConnected() === false)).toBe(true);
-      expect(notices.some(notice => notice.kind === 'unavailable' && notice.phase === 'exploration')).toBe(true);
+      expect(notices.some(notice => notice.kind === 'unavailable' && notice.phase === 'exploration'))
+        .toBe(failure === 'permanent');
       const diagnostics = await new DeferredWorkflowStopStoreV1(f.artifactRoot)
         .readBrowserDiagnostics(response.context.result.testSpecId);
-      expect(diagnostics).toEqual(expect.arrayContaining([
+      if (failure === 'permanent') expect(diagnostics).toEqual(expect.arrayContaining([
         expect.objectContaining({ source: 'viewer', phase: 'exploration', operation: 'capture', outcome: 'failure' }),
         expect.objectContaining({ source: 'viewer', phase: 'exploration', operation: 'unavailable', outcome: 'success' }),
       ]));
+      else expect(diagnostics.filter(item => item.source === 'viewer' && item.phase === 'exploration' &&
+        (item.operation === 'capture_timeout' || item.operation === 'capture' && item.outcome === 'skipped')).length)
+        .toBeGreaterThanOrEqual(2);
       expect(JSON.stringify(response.context.result)).not.toContain('diagnostics');
     });
   } finally {

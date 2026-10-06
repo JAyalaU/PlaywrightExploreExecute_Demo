@@ -1,5 +1,9 @@
 # Runtime investigation log
 
+## 2026-10-05 — Local viewer navigation-time capture recovery
+
+- The local-Windows viewer's first CDP JPEG attempt could time out during root navigation, detach correctly, then incorrectly end viewing while QA continued. Viewer-only main-document lifecycle tracking now skips unstable pages, and a bounded timeout or document replacement resumes at the 750 ms cadence after detach. Offline fixtures observe post-navigation frames, no late/stale pixels, terminal browser/context/channel failures, and unchanged five-step QA with view on/off. No public target or provider was contacted.
+
 ## 2026-10-05 — Destination readiness experiment
 
 - See [destination-readiness-experiment.md](destination-readiness-experiment.md). Six view-off local-Windows sessions reached `/dropdown` with HTTP 200; one immediate same-document sample had zero selects, but all six had one native select by DOMContentLoaded. No document replacement. Classification: `SELECT_RELIABLY_APPEARS_BY_DOMCONTENTLOADED`.

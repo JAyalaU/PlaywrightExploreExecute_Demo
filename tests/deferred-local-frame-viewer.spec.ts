@@ -82,7 +82,11 @@ test('local frame stream uses owned pages, clears phase ownership and never open
     const factory = new ProtectedContextFactory(new ProfileCatalog([profile], []));
     const first = await factory.open(ref); sessions.push(first);
     await lifecycle.open(first, 'exploration', 'exploration-one');
+    await until(() => diagnostics.snapshot().some(event => event.operation === 'capture' &&
+      event.outcome === 'skipped' && event.internalReason === 'PAGE_COUNT'));
     const firstPage = await first.context.newPage();
+    await until(() => diagnostics.snapshot().some(event => event.operation === 'capture' &&
+      event.outcome === 'skipped' && event.internalReason === 'NOT_READY'));
     await firstPage.goto('data:text/html,<title>exploration</title><h1>exploration</h1>');
     await until(() => wire.notices.some(notice => notice.kind === 'frame'));
     const firstFrame = wire.notices.find(notice => notice.kind === 'frame');
@@ -90,6 +94,19 @@ test('local frame stream uses owned pages, clears phase ownership and never open
     if (firstFrame?.kind !== 'frame') throw new Error('Missing frame');
     expect(Buffer.from(firstFrame.imageBase64, 'base64').length).toBe(firstFrame.byteCount);
     expect(firstFrame.byteCount).toBeLessThanOrEqual(128 * 1024);
+    let releaseNavigation!: () => void;
+    const navigationBlocked = new Promise<void>(resolve => { releaseNavigation = resolve; });
+    await firstPage.route('https://fixture.invalid/next', async route => {
+      await navigationBlocked;
+      await route.fulfill({ status: 200, contentType: 'text/html', body: '<main>Next document</main>' });
+    });
+    const navigation = firstPage.goto('https://fixture.invalid/next');
+    await until(() => diagnostics.snapshot().some(event => event.operation === 'capture' &&
+      event.outcome === 'skipped' && event.internalReason === 'NAVIGATION_IN_PROGRESS'));
+    const priorFrames = wire.notices.filter(notice => notice.kind === 'frame').length;
+    releaseNavigation(); await navigation;
+    await until(() => wire.notices.filter(notice => notice.kind === 'frame').length > priorFrames);
+    expect(wire.notices.some(notice => notice.kind === 'unavailable')).toBe(false);
     await first.close();
     const second = await factory.open(ref); sessions.push(second);
     await lifecycle.open(second, 'compilation', 'compiler-one');
@@ -161,7 +178,7 @@ test('capture failure marks only the local viewer unavailable while its browser 
   }
 });
 
-test('timed-out local frame detaches its CDP session, discards late pixels, and leaves ARIA reads usable', async () => {
+test('timed-out local frame detaches, discards late pixels, and recovers on the next cadence', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
   const originalDocker = IsolatedBrowser.open;
@@ -181,14 +198,26 @@ test('timed-out local frame detaches its CDP session, discards late pixels, and 
     const page = await session.context.newPage();
     await page.goto('data:text/html,<main><button>Ready</button></main>');
     const activeSession = session;
+    const originalNewCDPSession = activeSession.context.newCDPSession.bind(activeSession.context);
     activeSession.context.newCDPSession = async () => {
       sessionsCreated++;
+      if (sessionsCreated > 1) return originalNewCDPSession(page);
       return { send: async (method: string) => method === 'Page.getLayoutMetrics' ? {
         cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 },
       } : screenshot, detach: async () => { detachCalls++; } } as
         Awaited<ReturnType<typeof activeSession.context.newCDPSession>>;
     };
-    await until(() => wire.notices.some(notice => notice.kind === 'unavailable'));
+    await until(() => sessionsCreated === 1);
+    let releaseNavigation!: () => void;
+    const navigationBlocked = new Promise<void>(resolve => { releaseNavigation = resolve; });
+    await page.route('https://fixture.invalid/destination', async route => {
+      await navigationBlocked;
+      await route.fulfill({ status: 200, contentType: 'text/html', body: '<main>Destination</main>' });
+    });
+    const navigation = page.goto('https://fixture.invalid/destination');
+    await until(() => diagnostics.snapshot().some(event => event.operation === 'capture_timeout'));
+    await until(() => diagnostics.snapshot().some(event => event.operation === 'capture' &&
+      event.internalReason === 'CAPTURE_TIMEOUT'));
     expect(sessionsCreated).toBe(1);
     expect(detachCalls).toBe(1);
     expect(wire.notices.some(notice => notice.kind === 'frame')).toBe(false);
@@ -196,25 +225,28 @@ test('timed-out local frame detaches its CDP session, discards late pixels, and 
     const timeout = events.find(event => event.operation === 'capture_timeout');
     const request = events.find(event => event.operation === 'capture_detach' && event.outcome === 'started');
     const complete = events.find(event => event.operation === 'capture_detach' && event.outcome === 'success');
-    const unavailable = events.find(event => event.operation === 'unavailable');
     expect(timeout).toMatchObject({ internalReason: 'CAPTURE_TIMEOUT', ownerId: 'exploration-one' });
     expect(request?.startedAtMs).toBeGreaterThanOrEqual(timeout!.startedAtMs);
     expect(complete?.startedAtMs).toBeGreaterThanOrEqual(request!.startedAtMs);
-    expect(unavailable?.startedAtMs).toBeGreaterThanOrEqual(complete!.startedAtMs);
+    expect(events.some(event => event.operation === 'unavailable')).toBe(false);
     expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ operation: 'capture',
       outcome: 'failure', internalReason: 'CAPTURE_TIMEOUT', page: 'open', browser: 'connected' })]));
-    expect(await page.locator('body').ariaSnapshot({ mode: 'ai', timeout: 3000 })).toContain('Ready');
     resolveScreenshot({ data: Buffer.from('ffd8ffd9', 'hex').toString('base64') });
     await until(() => diagnostics.snapshot().some(event => event.operation === 'capture_late_discard'));
+    expect(wire.notices.some(notice => notice.kind === 'frame')).toBe(false);
+    releaseNavigation();
+    await navigation;
+    await until(() => wire.notices.some(notice => notice.kind === 'frame'));
+    expect(await page.locator('body').ariaSnapshot({ mode: 'ai', timeout: 3000 })).toContain('Destination');
     const late = diagnostics.snapshot();
     expect(late).toEqual(expect.arrayContaining([
       expect.objectContaining({ operation: 'capture_late_settle', outcome: 'success', ownerId: 'exploration-one' }),
       expect.objectContaining({ operation: 'capture_late_discard', internalReason: 'LATE_CAPTURE_DISCARDED' }),
     ]));
-    expect(wire.notices.some(notice => notice.kind === 'frame')).toBe(false);
+    expect(wire.notices.some(notice => notice.kind === 'unavailable')).toBe(false);
     lifecycle.close();
     await new Promise(resolve => setTimeout(resolve, 850));
-    expect(sessionsCreated).toBe(1);
+    expect(sessionsCreated).toBeGreaterThan(1);
     expect(JSON.stringify(late)).not.toContain('imageBase64');
     expect(JSON.stringify(late)).not.toContain('<button>');
   } finally {
@@ -245,6 +277,108 @@ test('private diagnostics distinguish channel loss from screenshot failure', asy
     expect(session.context.browser()?.isConnected()).toBe(true);
   } finally {
     lifecycle?.close(); await session?.close();
+    keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
+  }
+});
+
+test('document replacement during capture skips stale pixels and later captures the new page', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const old = keys.map(key => process.env[key]);
+  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
+  const wire = await channelFixture(), diagnostics = new DeferredBrowserDiagnosticCollector();
+  let lifecycle: DeferredViewerLifecycle | undefined;
+  let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
+  try {
+    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
+    session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+    await lifecycle.open(session, 'exploration', 'exploration-one');
+    const page = await session.context.newPage();
+    await page.goto('data:text/html,<main>First document</main>');
+    const activeSession = session;
+    const original = activeSession.context.newCDPSession.bind(activeSession.context);
+    let first = true, rejectCapture!: (error: Error) => void;
+    const pending = new Promise<never>((_resolve, reject) => { rejectCapture = reject; });
+    activeSession.context.newCDPSession = async () => {
+      if (!first) return original(page);
+      first = false;
+      return { send: async (method: string) => method === 'Page.getLayoutMetrics' ? {
+        cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 },
+      } : pending, detach: async () => undefined } as
+        Awaited<ReturnType<typeof activeSession.context.newCDPSession>>;
+    };
+    await until(() => !first);
+    await page.goto('data:text/html,<main>Replacement document</main>');
+    rejectCapture(new Error('Execution context was destroyed during navigation'));
+    await until(() => diagnostics.snapshot().some(event => event.operation === 'capture' &&
+      event.outcome === 'failure'));
+    expect(wire.notices.some(notice => notice.kind === 'unavailable')).toBe(false);
+    await until(() => wire.notices.some(notice => notice.kind === 'frame'));
+    expect(await page.locator('body').ariaSnapshot({ mode: 'ai' })).toContain('Replacement document');
+    expect(wire.notices.filter(notice => notice.kind === 'frame')).toHaveLength(1);
+  } finally {
+    lifecycle?.close(); await session?.close(); await wire.close();
+    keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
+  }
+});
+
+for (const ending of ['browser', 'context'] as const) {
+  test(`${ending} closure remains a terminal local viewer failure`, async () => {
+    test.skip(process.platform !== 'win32', 'Windows process boundary');
+    const old = keys.map(key => process.env[key]);
+    process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
+    const wire = await channelFixture(), diagnostics = new DeferredBrowserDiagnosticCollector();
+    let lifecycle: DeferredViewerLifecycle | undefined;
+    let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
+    try {
+      lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
+      session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+      await lifecycle.open(session, 'exploration', 'exploration-one');
+      await session.context.newPage();
+      if (ending === 'browser') await session.context.browser()!.close();
+      else await session.context.close();
+      await until(() => wire.notices.some(notice => notice.kind === 'unavailable'));
+      expect(diagnostics.snapshot().some(event => event.operation === 'capture' &&
+        event.internalReason === (ending === 'browser' ? 'BROWSER_DISCONNECTED' : 'CONTEXT_CLOSED'))).toBe(true);
+    } finally {
+      lifecycle?.close(); await session?.close(); await wire.close();
+      keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
+    }
+  });
+}
+
+test('owner transition discards a late prior-owner frame', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const old = keys.map(key => process.env[key]);
+  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
+  const wire = await channelFixture(), diagnostics = new DeferredBrowserDiagnosticCollector();
+  let lifecycle: DeferredViewerLifecycle | undefined;
+  const sessions: Awaited<ReturnType<ProtectedContextFactory['open']>>[] = [];
+  try {
+    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
+    const factory = new ProtectedContextFactory(new ProfileCatalog([profile], []));
+    const first = await factory.open(ref); sessions.push(first);
+    await lifecycle.open(first, 'exploration', 'exploration-one');
+    const page = await first.context.newPage();
+    await page.goto('data:text/html,<main>First</main>');
+    let resolveOld!: (value: { data: string }) => void, entered = false;
+    const oldCapture = new Promise<{ data: string }>(resolve => { resolveOld = resolve; });
+    first.context.newCDPSession = async () => ({ send: async (method: string) => {
+      if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: {
+        pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 } };
+      entered = true; return oldCapture;
+    }, detach: async () => undefined }) as Awaited<ReturnType<typeof first.context.newCDPSession>>;
+    await until(() => entered);
+    await first.close();
+    const second = await factory.open(ref); sessions.push(second);
+    await lifecycle.open(second, 'compilation', 'compiler-one');
+    const secondPage = await second.context.newPage();
+    await secondPage.goto('data:text/html,<main>Second</main>');
+    resolveOld({ data: Buffer.from('ffd8ffc0000b0800010001011100ffd9', 'hex').toString('base64') });
+    await until(() => wire.notices.some(notice => notice.kind === 'frame' && notice.phase === 'compilation'));
+    expect(wire.notices.some(notice => notice.kind === 'frame' && notice.phase === 'exploration')).toBe(false);
+    expect(wire.notices.some(notice => notice.kind === 'unavailable')).toBe(false);
+  } finally {
+    lifecycle?.close(); await Promise.allSettled(sessions.map(session => session.close())); await wire.close();
     keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
   }
 });

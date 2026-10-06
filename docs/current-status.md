@@ -1,5 +1,11 @@
 # Current status
 
+## Local-Windows viewer navigation recovery (2026-10-05)
+
+The deferred local-Windows frame viewer now passively tracks each owned page's main-document request, commit, and DOMContentLoaded. Missing or `about:blank` pages, active navigation, and a committed document awaiting DOMContentLoaded skip capture at the existing 750 ms cadence. A bounded CDP JPEG timeout detaches as before, consumes late completion, and schedules the next normal opportunity; document replacement or execution-context loss during capture is likewise transient. A frame is published only when the same owned page and document generation remain stable. Browser disconnect, unexpected context close, channel loss, invalid frame, and stable capture failure remain terminal viewer conditions. Phase transition still clears the old owner and prevents late prior-owner frames. Viewer state does not enter execution or QA classification.
+
+Offline Windows fixtures cover post-navigation pixels, timeout recovery and detach, stale-frame discard, owner transition, terminal failures, and local five-step view-on/view-off closure with two agreeing replays and verified cleanup. The view-on closure requires frames in phases lasting at least five seconds; short phases are not required to emit a frame. No provider or public-site call was made for this change.
+
 ## Deferred PoC committed-document readiness (2026-10-05)
 
 For active `poc_v1`, the protected browser session now tracks main-frame document commits and DOMContentLoaded by document generation. Exploration and fresh compiler v4 wait before DOM-dependent protected state or candidate reads; runner v9 waits before `rich_after_url` state and fresh locator proof. A URL-only verification can still run immediately after a click. No observed commit adds no wait, and an already reached DOMContentLoaded adds no wait. A pending generation uses the existing trusted navigation ceiling; timeout, close, or document replacement remains a non-QA browser/environment stop. Reads reject if the generation changes after the wait. The wait adds no page readiness probe, global load boundary, retry, or sleep.
@@ -14,7 +20,7 @@ Separate existing fixture failure: `npx.cmd playwright test tests/deferred-actio
 
 ## Windows-native deferred live view (2026-10-05)
 
-The `local-windows` deferred production path now publishes bounded JPEG frames from the actual active Playwright page through the authenticated private deferred viewer channel. Streamlit keeps only the current phase's latest frame, clears it on owner transition or close, and offers no input channel. A capture/display failure removes the view while authoritative QA continues. The existing Docker backend retains its RFB/noVNC viewer and remains the supported default. Offline local five-step fixtures prove the same QA pass with viewing off and on, four distinct viewer owners, verified browser cleanup, and zero Docker launches; actual Streamlit pixels on the intended work laptop still need manual validation.
+The `local-windows` deferred production path now publishes bounded JPEG frames from the actual active Playwright page through the authenticated private deferred viewer channel. Streamlit keeps only the current phase's latest frame, clears it on owner transition or close, and offers no input channel. Transient capture inability during navigation resumes at the normal cadence; terminal capture/display failure removes the view while authoritative QA continues. The existing Docker backend retains its RFB/noVNC viewer and remains the supported default. Offline local five-step fixtures prove the same QA pass with viewing off and on, four distinct viewer owners, verified browser cleanup, and zero Docker launches; actual Streamlit pixels on the intended work laptop still need manual validation.
 
 ## Windows-native deferred production (2026-10-05)
 
