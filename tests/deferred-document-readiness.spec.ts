@@ -4,6 +4,8 @@ import { chromium, expect, test } from '@playwright/test';
 import { ProtectedBrowserSession, ProfileCatalog } from '../app/profile/index.js';
 import { DeferredBrowserDiagnosticCollector } from '../app/domain/deferred-browser-diagnostics.js';
 import { DeferredDocumentReadinessTracker } from '../app/exploration/deferred-document-readiness.js';
+import { CommittedDocumentReadiness } from
+  '../app/browser-action/committed-document-readiness.js';
 
 type Handler = (request: http.IncomingMessage, response: http.ServerResponse) => void;
 async function fixture(handler: Handler) {
@@ -96,6 +98,106 @@ test('URL can commit while document is loading before DOMContentLoaded; diagnost
   } finally { releaseScript?.(); await f.close(); }
 });
 
+test('committed DCL wait skips an uncommitted page and an already-ready generation', async () => {
+  const f = await fixture((_request, response) => { response.setHeader('content-type', 'text/html');
+    response.end('<select></select>'); });
+  const readiness = new CommittedDocumentReadiness(f.session);
+  try {
+    const noCommit = await readiness.wait(f.page, 5000);
+    expect(noCommit).toMatchObject({ waitRequired: false, domContentLoadedReached: false });
+    await f.page.goto(`${f.base}/dropdown`, { waitUntil: 'domcontentloaded' });
+    const reached = await readiness.wait(f.page, 5000);
+    expect(reached).toMatchObject({ waitRequired: false, domContentLoadedReached: true });
+    expect(reached.generationId).toMatch(/^document-/);
+  } finally { readiness.dispose(); await f.close(); }
+});
+
+test('committed DCL wait holds one generation until a blocking script finishes', async () => {
+  let releaseScript: (() => void) | undefined;
+  const f = await fixture((request, response) => {
+    if (request.url === '/slow.js') { releaseScript = () => response.end('window.ready = true'); return; }
+    response.setHeader('content-type', 'text/html');
+    response.end('<script src="/slow.js"></script><select></select>');
+  });
+  const readiness = new CommittedDocumentReadiness(f.session);
+  try {
+    await f.page.goto(`${f.base}/dropdown`, { waitUntil: 'commit' });
+    const pending = readiness.wait(f.page, 5000);
+    let settled = false; void pending.then(() => { settled = true; }, () => { settled = true; });
+    await expect.poll(() => !!releaseScript).toBe(true);
+    expect(settled).toBe(false);
+    releaseScript?.();
+    expect(await pending).toMatchObject({ waitRequired: true, domContentLoadedReached: true });
+    expect(await f.page.locator('select').count()).toBe(1);
+  } finally { releaseScript?.(); readiness.dispose(); await f.close(); }
+});
+
+test('committed DCL wait stops on timeout and same-page document replacement', async () => {
+  const slow = new Set<http.ServerResponse>();
+  const f = await fixture((request, response) => {
+    if (request.url === '/slow.js') { slow.add(response); return; }
+    response.setHeader('content-type', 'text/html');
+    response.end(request.url === '/ready' ? '<select></select>' : '<script src="/slow.js"></script><select></select>');
+  });
+  const readiness = new CommittedDocumentReadiness(f.session);
+  try {
+    await f.page.goto(`${f.base}/loading`, { waitUntil: 'commit' });
+    await expect(readiness.wait(f.page, 30)).rejects.toMatchObject({ reason: 'TIMEOUT' });
+    const pending = readiness.wait(f.page, 5000);
+    const rejection = expect(pending).rejects.toMatchObject({ reason: 'DOCUMENT_REPLACED' });
+    await f.page.goto(`${f.base}/ready`, { waitUntil: 'domcontentloaded' });
+    await rejection;
+    const observed = await readiness.wait(f.page, 5000);
+    expect(observed).toMatchObject({
+      waitRequired: false, domContentLoadedReached: true });
+    readiness.assertCurrentGeneration(f.page, observed);
+    await f.page.goto(`${f.base}/ready`, { waitUntil: 'domcontentloaded' });
+    expect(() => readiness.assertCurrentGeneration(f.page, observed)).toThrow(
+      expect.objectContaining({ reason: 'DOCUMENT_REPLACED' }));
+  } finally {
+    for (const response of slow) if (!response.writableEnded && !response.destroyed) response.end('');
+    readiness.dispose(); await f.close();
+  }
+});
+
+test('committed DCL wait stops if its owned page closes', async () => {
+  const f = await fixture((_request, response) => { response.setHeader('content-type', 'text/html');
+    response.end('<script src="/slow.js"></script><select></select>'); });
+  const readiness = new CommittedDocumentReadiness(f.session);
+  try {
+    await f.page.goto(`${f.base}/loading`, { waitUntil: 'commit' });
+    const pending = readiness.wait(f.page, 5000);
+    const rejection = expect(pending).rejects.toMatchObject({ reason: 'PAGE_CLOSED' });
+    await f.page.close();
+    await rejection;
+    await expect(readiness.waitForCurrentPage(5, () => { throw new Error('diagnostic sink failed'); }))
+      .rejects.toMatchObject({ reason: 'PAGE_NOT_OWNED' });
+  } finally { readiness.dispose(); await f.close(); }
+});
+
+for (const closing of ['context', 'browser'] as const)
+  test(`committed DCL wait stops when its ${closing} closes`, async () => {
+    const slow = new Set<http.ServerResponse>();
+    const f = await fixture((request, response) => {
+      if (request.url === '/slow.js') { slow.add(response); return; }
+      response.setHeader('content-type', 'text/html');
+      response.end('<script src="/slow.js"></script><select></select>');
+    });
+    const readiness = new CommittedDocumentReadiness(f.session);
+    try {
+      await f.page.goto(`${f.base}/loading`, { waitUntil: 'commit' });
+      const pending = readiness.wait(f.page, 5000);
+      const rejection = expect(pending).rejects.toMatchObject({ reason: closing === 'context' ?
+        'CONTEXT_CLOSED' : 'PAGE_CLOSED' });
+      if (closing === 'context') await f.session.close();
+      else await f.session.context.browser()?.close();
+      await rejection;
+    } finally {
+      for (const response of slow) if (!response.writableEnded && !response.destroyed) response.end('');
+      readiness.dispose(); await f.close();
+    }
+  });
+
 test('DOMContentLoaded may precede control insertion without changing enumeration policy', async () => {
   const f = await fixture((_request, response) => { response.setHeader('content-type', 'text/html');
     response.end('<script>window.insertControl=()=>document.body.appendChild(document.createElement("select"))</script>'); });
@@ -120,10 +222,12 @@ for (const code of [200, 404, 503]) test(`${code} main response is classified wi
     const read = await f.boundary('before_candidate_query');
     expect(read.mainResponseStatusClass).toBe(code === 200 ? '2xx' : code === 404 ? '4xx' : '5xx');
     expect(read.navigationCommitted).toBe(true);
+    expect(read.domContentLoadedObserved).toBe(true);
     expect(f.diagnostics.snapshot().some(event => event.operation === 'main_document_response' &&
       event.documentGenerationId === read.documentGenerationId &&
       event.mainResponseStatusClass === read.mainResponseStatusClass)).toBe(true);
     expect(await f.page.locator('select').count()).toBe(0);
+    expect(await f.page.getByRole('combobox').count()).toBe(0);
     expect(JSON.stringify(f.diagnostics.snapshot())).not.toContain('Private page');
   } finally { await f.close(); }
 });

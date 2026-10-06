@@ -9,6 +9,8 @@ import { ProfileCatalog, ProtectedContextFactory, parseTrustedBrowserBackend } f
 import { IsolatedBrowser } from '../app/profile/isolated-browser.js';
 import { parseTrustedLocalConfiguration, selectActivePocBrowserProfile } from '../app/local/contracts.js';
 import { McpExplorationSession } from '../app/exploration/mcp.js';
+import { DeferredDocumentReadinessTracker } from '../app/exploration/deferred-document-readiness.js';
+import { CommittedDocumentReadiness } from '../app/browser-action/committed-document-readiness.js';
 import { runAgenticSubprocessAdapterV2 } from '../app/subprocess/agentic-entry.js';
 import { SuccessfulTraceV5Store } from '../app/evidence/trace-store-v5.js';
 import { DeferredCompilerV4Store } from '../app/evidence/deferred-compiler-store-v4.js';
@@ -39,7 +41,7 @@ type Case = 'normal' | 'duplicate_links' | 'wrong_url' | 'duplicate_selects' | '
   'runner_unrelated_drift' | 'runner_missing_select' | 'runner_duplicate_selects' |
   'runner_missing_option' | 'runner_changed_option' | 'runner_frame_drift' |
   'different_initial' | 'redirect_initial' | 'delayed_load' | 'delayed_target' | 'missing_target' |
-  'runner_state_read_timeout';
+  'runner_state_read_timeout' | 'delayed_destination_dcl';
 
 async function fixture(mode: Case, isolated = false, localWindows = false, failFrameCapture = false,
   slowCandidateRead = false) {
@@ -106,12 +108,63 @@ async function fixture(mode: Case, isolated = false, localWindows = false, failF
   const originalOpen = ProtectedContextFactory.prototype.open;
   const routed: string[] = [], denied: string[] = [], openedContexts: object[] = [],
     openedSessions: Awaited<ReturnType<typeof originalOpen>>[] = [], rootRequests: number[] = [];
+  type DestinationSample = { url: string; readyState: string; selectCount: number;
+    comboboxCount: number; generation: number; dclObserved: boolean };
+  const scriptReleases = new Map<number, () => void>(), releaseRequested = new Set<number>();
+  const destinationDcl = new Set<number>(), destinationGenerations = new Map<number, number>();
+  const dclSamples = new Map<number, Promise<DestinationSample>>();
+  const waitedAtDestination = new Set<number>();
+  let clickReturnSample: Promise<DestinationSample> | undefined;
+  const releaseScript = (ordinal: number): void => {
+    const release = scriptReleases.get(ordinal);
+    if (release) { scriptReleases.delete(ordinal); release(); }
+    else releaseRequested.add(ordinal);
+  };
+  const sample = async (ordinal: number): Promise<DestinationSample> => {
+    const page = openedSessions[ordinal - 1]!.context.pages()[0]!;
+    const state = await page.evaluate(() => ({ readyState: document.readyState,
+      selectCount: document.querySelectorAll('select').length }));
+    return { url: page.url(), ...state, comboboxCount: await page.getByRole('combobox').count(),
+      generation: destinationGenerations.get(ordinal) ?? 0, dclObserved: destinationDcl.has(ordinal) };
+  };
+  const originalProbe = DeferredDocumentReadinessTracker.prototype.probe;
+  const originalWait = CommittedDocumentReadiness.prototype.wait;
+  if (mode === 'delayed_destination_dcl') {
+    DeferredDocumentReadinessTracker.prototype.probe = function (...args) {
+      originalProbe.apply(this, args);
+      if (args[0] === 'after_click' && !clickReturnSample) {
+        clickReturnSample = sample(1).finally(() => releaseScript(1));
+      }
+    };
+    CommittedDocumentReadiness.prototype.wait = async function (...args) {
+      const ordinal = openedSessions.findIndex(session => session === this.session) + 1;
+      const pending = originalWait.apply(this, args);
+      if (ordinal > 1 && args[0].url() === dropdownUrl) {
+        queueMicrotask(() => releaseScript(ordinal));
+      }
+      const result = await pending;
+      if (ordinal > 1 && args[0].url() === dropdownUrl && result.waitRequired)
+        waitedAtDestination.add(ordinal);
+      return result;
+    };
+  }
   let runnerDrifts = 0;
   ProtectedContextFactory.prototype.open = async function (...args) {
     const browser = await originalOpen.apply(this, args);
     openedSessions.push(browser);
     const ordinal = openedContexts.push(browser.context);
     rootRequests.push(0);
+    if (mode === 'delayed_destination_dcl') browser.context.on('page', page => {
+      page.on('framenavigated', frame => {
+        if (frame === page.mainFrame()) destinationGenerations.set(ordinal,
+          (destinationGenerations.get(ordinal) ?? 0) + 1);
+      });
+      page.on('domcontentloaded', () => {
+        if (page.url() !== dropdownUrl) return;
+        destinationDcl.add(ordinal);
+        dclSamples.set(ordinal, sample(ordinal));
+      });
+    });
     if (failFrameCapture && ordinal === 1)
       browser.context.newCDPSession = async () => { throw new Error('Fixture: observational frame capture unavailable'); };
     if (slowCandidateRead && ordinal === 1)
@@ -195,6 +248,10 @@ async function fixture(mode: Case, isolated = false, localWindows = false, failF
       } else if (url === `${rootUrl}slow-resource`) {
         await new Promise(resolve=>setTimeout(resolve,1500));
         await route.fulfill({ status:200,contentType:'image/png',body:Buffer.from('iVBORw0KGgo=', 'base64') }).catch(()=>{});
+      } else if (url === `${rootUrl}blocking-script`) {
+        if (!releaseRequested.delete(ordinal))
+          await new Promise<void>(resolve => scriptReleases.set(ordinal, resolve));
+        await route.fulfill({ status:200,contentType:'text/javascript',body:'' }).catch(()=>{});
       } else if (url === dropdownUrl || url === wrongUrl) {
         const runner = ordinal >= 3;
         const options = mode === 'missing_option' || runner && mode === 'runner_missing_option' ?
@@ -203,7 +260,8 @@ async function fixture(mode: Case, isolated = false, localWindows = false, failF
         await route.fulfill({ status: 200, contentType: 'text/html',
           body: runner && mode === 'runner_missing_select' ? '<main></main>' :
             runner && mode === 'runner_frame_drift' ? `<iframe title="Other" srcdoc='${options}'></iframe>` :
-            mode === 'duplicate_selects' || runner && mode === 'runner_duplicate_selects' ? options + options : options });
+            mode === 'duplicate_selects' || runner && mode === 'runner_duplicate_selects' ? options + options :
+            mode === 'delayed_destination_dcl' ? '<script src="/blocking-script"></script>' + options : options });
       } else { denied.push(url); await route.abort('blockedbyclient'); }
     });
     return browser;
@@ -215,10 +273,14 @@ async function fixture(mode: Case, isolated = false, localWindows = false, failF
   return {
     artifactRoot, config, request, providerFormats, routed, denied, openedContexts, openedSessions, rootRequests,
     runnerDrifts: () => runnerDrifts,
+    delayedDestination: () => ({ clickReturnSample, dclSamples, waitedAtDestination }),
     run: () => runAgenticSubprocessAdapterV2(Readable.from([JSON.stringify({ protocolVersion: '2', request })]),
       async () => config, { provider: { apiKey: () => 'MOCK_ONLY', fetchImpl } },
       { workflowVersion: 'deferred-action-v1' }),
     close: async () => {
+      for (const ordinal of scriptReleases.keys()) releaseScript(ordinal);
+      DeferredDocumentReadinessTracker.prototype.probe = originalProbe;
+      CommittedDocumentReadiness.prototype.wait = originalWait;
       ProtectedContextFactory.prototype.open = originalOpen;
       if (oldGate === undefined) delete process.env[gate]; else process.env[gate] = oldGate;
       if (oldBackend === undefined) delete process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND;
@@ -351,6 +413,35 @@ test('local-windows trusted selection completes five-step production QA with fou
         expect(owner.some(event => event.operation === 'runner_v9_state' && event.outcome === 'success')).toBe(true);
         expect(owner.some(event => event.operation === 'execution_entry_ownership' && event.outcome === 'success')).toBe(true);
       }
+    });
+  } finally { await f.close(); }
+});
+
+test('local-windows five-step closure survives a delayed destination DOMContentLoaded without live view', async () => {
+  test.skip(process.platform !== 'win32', 'Windows process boundary');
+  const f = await fixture('delayed_destination_dcl', false, true);
+  try {
+    await withoutDocker(async () => {
+      const response = await f.run();
+      if (response.kind === 'bridge_error') throw new Error(`Bridge error: ${response.code}`);
+      expect(response.context.result.terminal.status, JSON.stringify(response)).toBe('QA_ASSERTION_PASSED');
+      expect(response.context.result.cleanup).toBe('verified');
+      expect(response.context.result.executionRunIds).toHaveLength(2);
+      expect(f.denied).toEqual([]);
+      const delayed = f.delayedDestination();
+      expect(delayed.clickReturnSample).toBeDefined();
+      const immediate = await delayed.clickReturnSample!;
+      expect(immediate).toMatchObject({ url: dropdownUrl, readyState: 'loading',
+        selectCount: 0, comboboxCount: 0, dclObserved: false });
+      expect(immediate.generation).toBeGreaterThan(0);
+      expect(delayed.dclSamples.size).toBe(4);
+      for (const [ordinal, pending] of delayed.dclSamples) {
+        const afterDcl = await pending;
+        expect(afterDcl, `owner ${ordinal}`).toMatchObject({ url: dropdownUrl,
+          selectCount: 1, comboboxCount: 1, dclObserved: true });
+        if (ordinal === 1) expect(afterDcl.generation).toBe(immediate.generation);
+      }
+      expect([...delayed.waitedAtDestination].sort()).toEqual([2, 3, 4]);
     });
   } finally { await f.close(); }
 });

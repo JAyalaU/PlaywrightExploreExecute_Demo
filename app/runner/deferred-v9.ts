@@ -14,6 +14,8 @@ import { DeferredViewerPreflightError } from '../observability/deferred-viewer-c
 import { navigationTiming, type DeferredNavigationTimingObserver } from '../domain/deferred-navigation-timing.js';
 import type { DeferredBrowserDiagnosticSink } from '../domain/deferred-browser-diagnostics.js';
 import { RunnerV9PreactionDiagnostics } from './deferred-v9-diagnostics.js';
+import { CommittedDocumentReadiness, CommittedDocumentReadinessError,
+  type CommittedDocumentWaitObservation } from '../browser-action/committed-document-readiness.js';
 
 type Action=Extract<ResolvedTestSpecV9['executionSteps'][number],{type:'action_goal'}>;
 type Step=DeferredRunnerRecordV9['steps'][number];
@@ -59,9 +61,11 @@ const dispose=async(p:Proof)=>{await Promise.allSettled([...p.all.map(c=>c.handl
 /** Owns a fresh private protected context. No discovery, retry, refs or model/MCP dependency. */
 class FreshRunner {
   #tail:Promise<unknown>=Promise.resolve();#epoch=0;#mutation=0;#navigation=0;#stateKey='';
+  readonly #readiness: CommittedDocumentReadiness;
   readonly sessionId=`runner-session-${randomUUID()}`;readonly pageId=`runner-page-${randomUUID()}`;
   constructor(readonly session:ProtectedBrowserSession,readonly page:Page,readonly deadline:number,
-    readonly diagnostics?:RunnerV9PreactionDiagnostics){
+    readonly pocSemantic:boolean,readonly diagnostics?:RunnerV9PreactionDiagnostics){
+    this.#readiness=new CommittedDocumentReadiness(session);
     page.on('framenavigated',()=>{this.#navigation++;});
     page.on('frameattached',()=>{this.#navigation++;});
     page.on('framedetached',()=>{this.#navigation++;});
@@ -69,6 +73,29 @@ class FreshRunner {
   bounded(closing=false){if(Date.now()>this.deadline)stop('BUDGET_EXHAUSTED');if(!closing&&this.session.isClosed||this.page.isClosed()||this.session.context.pages().length!==1||this.session.context.pages()[0]!==this.page)stop('ENVIRONMENT_FAILURE');}
   checkedBounded(stepId:string){if(this.diagnostics)this.diagnostics.sync('pre_action_ownership',stepId,()=>this.bounded());else this.bounded();}
   richAfterUrl(stepId:string){return this.diagnostics?this.diagnostics.async('rich_after_url',stepId,()=>this.state(false,stepId)):this.state();}
+  async #awaitCommittedDocument(stepId?:string):Promise<CommittedDocumentWaitObservation|undefined>{
+    if(!this.pocSemantic)return undefined;
+    const emit=(attempt:CommittedDocumentWaitObservation)=>{
+      const sink=this.diagnostics?.sink;if(!sink)return;
+      const internalReason=attempt.safeStop==='TIMEOUT'?'OBSERVATION_TIMEOUT':attempt.safeStop;
+      try{sink({diagnosticVersion:'1',source:'runner',operation:'committed_document_wait',
+        phase:this.diagnostics!.phase,ownerId:this.diagnostics!.ownerId,...(stepId?{stepId}:{}),
+        startedAtMs:attempt.startedAtMs,endedAtMs:attempt.endedAtMs,elapsedMs:attempt.elapsedMs,
+        outcome:attempt.safeStop?'failure':'success',page:'unknown',context:'unknown',browser:'unknown',
+        readinessWaitRequired:attempt.waitRequired,domContentLoadedObserved:attempt.domContentLoadedReached,
+        ...(attempt.generationId?{documentGenerationId:attempt.generationId}:{}),
+        ...(internalReason?{internalReason}:{})});}
+      catch{/* Private diagnostics cannot change replay. */}
+    };
+    try{return await this.#readiness.wait(this.page,Math.max(1,Math.min(
+      this.session.effectiveProfile.profile.timeoutPolicy.navigationMs,this.deadline-Date.now())),emit);}
+    catch(error){if(error instanceof CommittedDocumentReadinessError)stop('ENVIRONMENT_FAILURE');throw error;}
+  }
+  #assertCommittedDocument(observed:CommittedDocumentWaitObservation|undefined):void{
+    if(!observed)return;
+    try{this.#readiness.assertCurrentGeneration(this.page,observed);}
+    catch(error){if(error instanceof CommittedDocumentReadinessError)stop('ENVIRONMENT_FAILURE');throw error;}
+  }
   async exclusive<T>(callback:()=>Promise<T>,entryStepId?:string):Promise<T>{const prior=this.#tail;let release!:()=>void;this.#tail=new Promise<void>(r=>{release=r;});await prior;try{
     if(entryStepId&&this.diagnostics)this.diagnostics.sync('execution_entry_ownership',entryStepId,()=>this.bounded());else this.bounded();
     return await callback();}finally{release();}}
@@ -85,7 +112,8 @@ class FreshRunner {
     if(stateDigest!==this.#stateKey){this.#stateKey=stateDigest;this.#epoch++;}
     return{url,state:{sessionId:this.sessionId,pageId:this.pageId,stateDigest,stateEpoch:this.#epoch,mutationEpoch:mutation}};
   }
-  async state(closing=false,diagnosticStepId?:string):Promise<DeferredRunStateV9>{this.bounded(closing);await engines;
+  async state(closing=false,diagnosticStepId?:string):Promise<DeferredRunStateV9>{this.bounded(closing);
+    const observed=closing?undefined:await this.#awaitCommittedDocument(diagnosticStepId);await engines;
     const frames=diagnosticStepId&&this.diagnostics?this.diagnostics.frames(diagnosticStepId):this.page.frames();
     if(frames.length>8)stop('INCOMPLETE_EVIDENCE');const materials=[];
     for(const f of frames){this.bounded(closing);
@@ -96,6 +124,7 @@ class FreshRunner {
         {frameCount:frames.length,...(this.diagnostics.mainFrameId()?{mainFrameId:this.diagnostics.mainFrameId()}: {})}):
         await f.locator('body').locator('runner_v9_state=').textContent({timeout:3000});
       if(content.length>262144||!values||values==='overflow'||values.length>262144)stop('INCOMPLETE_EVIDENCE');materials.push({content,values,url:f.url()});}
+    this.#assertCommittedDocument(observed);
     if(frames.length!==this.page.frames().length||frames.some((f,i)=>f!==this.page.frames()[i]))stop('STALE_EVIDENCE');
     const stateDigest=hash({pageId:this.pageId,materials,mutation:this.#mutation});if(stateDigest!==this.#stateKey){this.#stateKey=stateDigest;this.#epoch++;}
     return{sessionId:this.sessionId,pageId:this.pageId,stateDigest,stateEpoch:this.#epoch,mutationEpoch:this.#mutation};}
@@ -111,7 +140,8 @@ class FreshRunner {
         if(!selected)stop('FRAME_MISMATCH');anchors.unshift(selected);child=parent;
       }finally{await element.dispose();}}
     return{kind:'nested',anchors};}
-  async prove(action:Action,post=false):Promise<Proof>{this.bounded();const all:Candidate[]=[],labels:ElementHandle[]=[],options:ElementHandle[]=[];
+  async prove(action:Action,post=false):Promise<Proof>{this.bounded();const observed=await this.#awaitCommittedDocument(action.id);
+    const all:Candidate[]=[],labels:ElementHandle[]=[],options:ElementHandle[]=[];
     try{const frames=this.page.frames();if(frames.length>action.guard.frameLimit)stop('INCOMPLETE_EVIDENCE');
       for(const frame of frames)for(const role of action.guard.predicate.roles){let locator=frame.getByRole(role,{includeHidden:true,...(action.guard.predicate.names.length?{name:action.guard.predicate.names[0]!,exact:true}:{})});
         for(const name of action.guard.predicate.names.slice(1))locator=locator.and(frame.getByRole(role,{name,exact:true,includeHidden:true}));
@@ -133,8 +163,10 @@ class FreshRunner {
         if(target.role!==action.guard.nativeControl)stop('UNSUPPORTED_CAPABILITY');
       }else{if(facts.tag!=='input'||!['checkbox','radio'].includes(facts.inputType)||facts.inputType!==action.guard.nativeControl||!post&&facts.inputType==='radio'&&facts.checked)stop('UNSUPPORTED_CAPABILITY');}
       const digest=hash({guard:action.guard,operation:action.operation,authoredArgument:action.authoredArgument,executableArgument:action.executableArgument,
-        roles:eligible.map(c=>c.role),frame:await this.framePath(target.frame),facts});return{target,all,labels,options,facts,digest};
-    }catch(e){await Promise.allSettled([...all.map(c=>c.handle),...labels,...options].map(h=>h.dispose()));throw e;}}
+        roles:eligible.map(c=>c.role),frame:await this.framePath(target.frame),facts});
+      this.#assertCommittedDocument(observed);return{target,all,labels,options,facts,digest};
+    }catch(e){await Promise.allSettled([...all.map(c=>c.handle),...labels,...options].map(h=>h.dispose()));
+      this.#assertCommittedDocument(observed);throw e;}}
   async sameProof(a:Proof,b:Proof){if(a.digest!==b.digest||a.all.length!==b.all.length||a.labels.length!==b.labels.length||a.options.length!==b.options.length||a.target.frame!==b.target.frame||!await identical(a.target.handle,b.target.handle))stop('STALE_EVIDENCE');
     for(const [left,right] of [[a.all.map(c=>c.handle),b.all.map(c=>c.handle)],[a.labels,b.labels],[a.options,b.options]])for(let i=0;i<left!.length;i++)if(!await identical(left![i]!,right![i]!))stop('STALE_EVIDENCE');}
   async execute(action:Action,before:DeferredRunStateV9,pocSemantic=false,awaitTarget=false,
@@ -200,7 +232,7 @@ export async function runDeferredResolvedTestV9(factory:ProtectedContextFactory,
     const r=artifact.resolved,profile=factory.catalog.resolve(r.executionProfileRef);if(profile.fingerprint!==r.profileFingerprint)stop('PROFILE_MISMATCH');
     session=await factory.open(r.executionProfileRef,profile,{observationOwner:{kind:'run',id:executionRunId}});assertEquivalentEffectiveProfile(profile,session.effectiveProfile);
     if(session.effectiveProfile.fingerprint!==r.profileFingerprint)stop('PROFILE_MISMATCH');const page=await session.context.newPage();
-    runtime=new FreshRunner(session,page,deadline,onBrowserDiagnostic?
+    runtime=new FreshRunner(session,page,deadline,artifact.trace.source.semanticMode==='poc_v1',onBrowserDiagnostic?
       new RunnerV9PreactionDiagnostics(session,page,executionRunId,phase,onBrowserDiagnostic):undefined);
     const navigationOrigin=performance.now();
     let adoptBootstrap=false;

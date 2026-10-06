@@ -188,14 +188,15 @@ for (const failure of ['initial_state', 'candidate_enumeration', 'fresh_state',
       const outcome = await run(f, 'choose');
       expect(outcome.status).toBe('stop');
       const events = f.diagnostics.snapshot().filter(event => event.stepId === 'choose');
-      const expected = failure === 'closed_page' || failure === 'disconnected_browser' ? 'initial_state' : failure;
+      const expected = failure === 'closed_page' || failure === 'disconnected_browser' ?
+        'committed_document_wait' : failure;
       expect(events.some(event => event.operation === expected && event.outcome === 'failure')).toBe(true);
       if (failure === 'candidate_enumeration')
         expect(events.find(event => event.operation === expected)).toMatchObject({ browserOperation: 'locator_count' });
       if (failure === 'fresh_state' || failure === 'initial_state')
         expect(events.find(event => event.operation === expected)).toMatchObject({ browserOperation: 'frame_content' });
-      if (failure === 'closed_page') expect(events.find(event => event.operation === expected)?.page).toBe('absent');
-      if (failure === 'disconnected_browser') expect(events.find(event => event.operation === expected)?.browser).toBe('disconnected');
+      if (failure === 'closed_page') expect(events.find(event => event.operation === expected)?.internalReason).toBe('PAGE_NOT_OWNED');
+      if (failure === 'disconnected_browser') expect(events.find(event => event.operation === expected)?.internalReason).toBe('BROWSER_DISCONNECTED');
       expect(JSON.stringify(events)).not.toContain('secret');
       expect(JSON.stringify(events)).not.toContain('<select>');
     } finally { frame.content = originalContent; proto.count = originalCount; await f.close(); }

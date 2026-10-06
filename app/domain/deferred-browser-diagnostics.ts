@@ -10,7 +10,7 @@ const reason = z.enum(['NONE', 'NOT_READY', 'PAGE_COUNT', 'PAGE_CLOSED', 'CONTEX
   'CAPTURE_TIMEOUT', 'CAPTURE_FAILED', 'FRAME_INVALID', 'CHANNEL_LOST', 'DISPLAY_LOST', 'RESULT_LIMIT',
   'CDP_DETACH_FAILED', 'CDP_DETACH_TIMEOUT', 'LATE_CAPTURE_DISCARDED',
   'STALE_STATE', 'UNPROVEN_FRAME', 'BROWSER_FAILURE', 'QUERY_UNEVALUABLE', 'OBSERVATION_TIMEOUT',
-  'FRAME_DETACHED', 'NAVIGATION_IN_PROGRESS', 'OTHER']);
+  'FRAME_DETACHED', 'NAVIGATION_IN_PROGRESS', 'DOCUMENT_REPLACED', 'PAGE_NOT_OWNED', 'OTHER']);
 const exception = z.enum(['Error', 'TimeoutError', 'LiveImageCaptureTimeout', 'TargetClosedError',
   'ActionCandidateGroundingError', 'OtherError']);
 const role = z.enum(['button', 'link', 'checkbox', 'radio', 'menuitem', 'tab', 'option', 'switch',
@@ -20,17 +20,18 @@ export const ProtectedAriaFailureCategorySchema = z.enum(['TARGET_CLOSED', 'PAGE
   'PLAYWRIGHT_TIMEOUT', 'PROTOCOL_ERROR', 'ARIA_SNAPSHOT_API_FAILURE', 'UNKNOWN_PLAYWRIGHT_ERROR']);
 export type ProtectedAriaFailureCategory = z.infer<typeof ProtectedAriaFailureCategorySchema>;
 export const DeferredBrowserDiagnosticV1Schema = z.strictObject({
-  diagnosticVersion: z.literal('1'), source: z.enum(['viewer', 'grounding', 'runner']),
+  diagnosticVersion: z.literal('1'), source: z.enum(['viewer', 'grounding', 'compiler', 'runner']),
   operation: z.enum(['loop_start', 'capture', 'ready', 'first_frame', 'unavailable', 'closed', 'transition',
     'channel_loss', 'capture_timeout', 'capture_detach', 'capture_late_settle', 'capture_late_discard',
     'initial_state', 'candidate_enumeration', 'enumeration_predicate', 'role_pre_name',
     'role_post_name', 'native_select_inventory', 'candidate_filtering', 'fresh_state',
     'freshness_comparison', 'final_result', 'pre_action_ownership', 'rich_after_url',
     'frame_enumeration', 'frame_content', 'runner_v9_state', 'execution_entry_ownership',
-    'document_readiness', 'main_document_response', 'main_document_navigation']),
+    'document_readiness', 'main_document_response', 'main_document_navigation', 'committed_document_wait']),
   readinessBoundary: z.enum(['bootstrap_start', 'bootstrap_complete', 'before_click', 'after_click',
     'url_observation', 'before_candidate_query']).optional(),
   documentGenerationId: id.optional(), documentReadyState: z.enum(['loading', 'interactive', 'complete', 'unknown']).optional(),
+  readinessWaitRequired: z.boolean().optional(),
   domContentLoadedObserved: z.boolean().optional(), loadObserved: z.boolean().optional(),
   mainResponseObserved: z.boolean().optional(), mainResponseStatusClass: z.enum(['2xx', '3xx', '4xx', '5xx', 'other', 'unknown']).optional(),
   redirectCount: z.number().int().min(0).max(32).optional(), navigationCommitted: z.boolean().optional(),

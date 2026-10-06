@@ -32,6 +32,8 @@ import { diagnosticBrowserState, diagnosticBrowserUrl, diagnosticElapsed, diagno
   type DeferredBrowserDiagnosticSink, type DeferredBrowserDiagnosticV1 } from '../domain/deferred-browser-diagnostics.js';
 import { readProtectedAriaState } from './protected-aria-state.js';
 import { DeferredDocumentReadinessTracker } from './deferred-document-readiness.js';
+import { CommittedDocumentReadiness, CommittedDocumentReadinessError,
+  type CommittedDocumentWaitObservation } from '../browser-action/committed-document-readiness.js';
 
 const roles: Record<'activate' | 'enter_text' | 'choose', ActionCandidateRoleV1[]> = {
   activate: ['button', 'link', 'checkbox', 'radio', 'menuitem', 'tab', 'option', 'switch', 'treeitem'],
@@ -119,6 +121,7 @@ export class ActionCandidateGroundingSessionV1 {
   #deadline = Number.POSITIVE_INFINITY;
   readonly #diagnostic: DeferredBrowserDiagnosticSink | undefined;
   readonly #documentReadiness: DeferredDocumentReadinessTracker;
+  readonly #committedReadiness: CommittedDocumentReadiness;
   readonly #readinessIdentity: ((object: object, prefix: string) => string) | undefined;
   #queryDiagnosticStepId: string | undefined;
   #lastBrowserFailure: { browserOperation: NonNullable<DeferredBrowserDiagnosticV1['browserOperation']>;
@@ -142,6 +145,7 @@ export class ActionCandidateGroundingSessionV1 {
       !/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(attemptId)) stop('INVALID_REQUEST');
     this.#session = session; this.#admission = admission; this.#attempt = attemptId; this.#clock = clock;
     this.#diagnostic = diagnostic;
+    this.#committedReadiness = new CommittedDocumentReadiness(session.browserSession);
     this.#readinessIdentity = bootstrapReadiness?.identity;
     this.#documentReadiness = bootstrapReadiness?.tracker ?? new DeferredDocumentReadinessTracker(
       session.browserSession, attemptId, admission.spec.semanticMode === 'poc_v1' ? diagnostic : undefined,
@@ -163,10 +167,12 @@ export class ActionCandidateGroundingSessionV1 {
     });
   }
   /** Fresh compiler authority is authenticated historical provenance, never recreated WP1/M7 origin. */
-  static forFreshCompiler(session: McpExplorationSession, readback: TrustedSuccessfulTraceReadbackV5, attemptId: string) {
+  static forFreshCompiler(session: McpExplorationSession, readback: TrustedSuccessfulTraceReadbackV5,
+    attemptId: string) {
     const { trace } = requireTrustedSuccessfulTraceReadbackV5(readback);
     const historicalSource = { spec: trace.source, record: trace.semanticAdmission } as unknown as TrustedSemanticAdmissionV2;
-    const runtime = new ActionCandidateGroundingSessionV1(session, historicalSource, attemptId, Date.now, readback);
+    const runtime = new ActionCandidateGroundingSessionV1(session, historicalSource, attemptId,
+      Date.now, readback);
     const mappings = new Map<string, TrustedGroundingMappingV1>();
     for (const record of trace.successfulPath) {
       if (record.type !== 'action_goal') continue;
@@ -200,7 +206,42 @@ export class ActionCandidateGroundingSessionV1 {
       ActionCandidateGroundingSessionV1.#owners.get(this.#session) !== this) stop('STALE_STATE');
     if (Date.now() > this.#deadline) stop('QUERY_UNEVALUABLE');
   }
+  async #awaitCommittedDocument(stepId?: string): Promise<CommittedDocumentWaitObservation | undefined> {
+    if (this.#admission.spec.semanticMode !== 'poc_v1') return undefined;
+    const emit = (attempt: CommittedDocumentWaitObservation): void => {
+      if (!this.#diagnostic) return;
+      const internalReason = attempt.safeStop === 'TIMEOUT' ? 'OBSERVATION_TIMEOUT' :
+        attempt.safeStop === 'PAGE_NOT_OWNED' ? 'PAGE_NOT_OWNED' : attempt.safeStop;
+      try { this.#diagnostic({ diagnosticVersion: '1',
+        source: this.#compilerHandoff ? 'compiler' : 'grounding',
+        operation: 'committed_document_wait',
+        phase: this.#compilerHandoff ? 'compilation' : 'exploration',
+        ownerId: this.#attempt, ...(stepId ? { stepId } : {}),
+        startedAtMs: attempt.startedAtMs, endedAtMs: attempt.endedAtMs,
+        elapsedMs: attempt.elapsedMs, outcome: attempt.safeStop ? 'failure' : 'success',
+        page: 'unknown', context: 'unknown', browser: 'unknown',
+        readinessWaitRequired: attempt.waitRequired,
+        domContentLoadedObserved: attempt.domContentLoadedReached,
+        ...(attempt.generationId ? { documentGenerationId: attempt.generationId } : {}),
+        ...(internalReason ? { internalReason } : {}) }); }
+      catch { /* Readiness diagnostics cannot change browser execution. */ }
+    };
+    try { return await this.#committedReadiness.waitForCurrentPage(
+      this.#session.browserSession.effectiveProfile.profile.timeoutPolicy.navigationMs, emit); }
+    catch (error) {
+      if (!(error instanceof CommittedDocumentReadinessError)) throw error;
+      const cause = error.reason === 'TIMEOUT' ? 'OBSERVATION_TIMEOUT' :
+        error.reason === 'PAGE_CLOSED' ? 'PAGE_CLOSED' :
+        error.reason === 'CONTEXT_CLOSED' ? 'CONTEXT_CLOSED' :
+        error.reason === 'DOCUMENT_REPLACED' ? 'NAVIGATION_IN_PROGRESS' : 'BROWSER_FAILURE';
+      throw new ActionCandidateGroundingError('BROWSER_FAILURE', cause);
+    }
+  }
   async #exclusive<T>(consume: () => Promise<T>, deadline = Number.POSITIVE_INFINITY): Promise<T> {
+    // The protected candidate operation keeps its existing 15s local budget.
+    // A committed document's DCL wait uses the separate trusted navigation
+    // ceiling and must finish before that candidate budget begins.
+    await this.#awaitCommittedDocument(this.#queryDiagnosticStepId);
     this.#deadline = Math.min(Date.now() + 15_000, deadline);
     try { return await this.#session.withExclusiveGrounding(consume); }
     catch (error) {
@@ -313,7 +354,8 @@ export class ActionCandidateGroundingSessionV1 {
   }
 
   async #state(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
-    try { return await this.#captureState(aroundObservation); }
+    const observed = await this.#awaitCommittedDocument(this.#queryDiagnosticStepId);
+    try { return await this.#captureState(aroundObservation, observed); }
     catch (error) {
       if (error instanceof ActionCandidateGroundingError) throw error;
       const message=error instanceof Error?error.message:'';
@@ -415,7 +457,8 @@ export class ActionCandidateGroundingSessionV1 {
         exceptionName: diagnosticExceptionName(error), internalReason: 'OTHER' });
     }
   }
-  async #captureState(aroundObservation?: (read: () => Promise<void>) => Promise<void>): Promise<State> {
+  async #captureState(aroundObservation?: (read: () => Promise<void>) => Promise<void>,
+    observed?: CommittedDocumentWaitObservation): Promise<State> {
     this.#owner();
     const navigation = this.#navigationEpoch, mutation = this.#mutationEpoch, revision = this.#session.groundingRevision;
     const pages = this.#session.browserSession.context.pages();
@@ -440,6 +483,15 @@ export class ActionCandidateGroundingSessionV1 {
     if (aroundObservation) await aroundObservation(readFrames);
     else await readFrames();
     this.#owner();
+    if (observed) {
+      try { this.#committedReadiness.assertCurrentGeneration(page, observed); }
+      catch (error) {
+        if (error instanceof CommittedDocumentReadinessError)
+          throw new ActionCandidateGroundingError('BROWSER_FAILURE',
+            error.reason === 'DOCUMENT_REPLACED' ? 'NAVIGATION_IN_PROGRESS' : 'BROWSER_FAILURE');
+        throw error;
+      }
+    }
     const afterFrames = page.frames();
     if (navigation !== this.#navigationEpoch || mutation !== this.#mutationEpoch || revision !== this.#session.groundingRevision || page.isClosed() ||
       frames.length !== afterFrames.length || frames.some((frame, i) => frame !== afterFrames[i]) ||
