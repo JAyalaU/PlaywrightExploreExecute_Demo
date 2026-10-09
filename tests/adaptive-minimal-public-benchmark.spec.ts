@@ -3,7 +3,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { AdaptiveBrowser } from '../app/adaptive/browser.js';
 import { runMinimalAdaptiveAgent } from '../app/adaptive-minimal/controller.js';
 import { OpenAIMinimalModel } from '../app/adaptive-minimal/model.js';
-import type { Attempt, MinimalModel, MinimalResult, MinimalTask } from '../app/adaptive-minimal/types.js';
+import type { Attempt, MinimalModel, MinimalResult, MinimalTask,
+  Receipt } from '../app/adaptive-minimal/types.js';
 import { startAdaptiveFixture } from './support/adaptive-fixture.js';
 
 // Only public starting URLs and authored instructions are scenario data.
@@ -26,7 +27,39 @@ const scenarios = [
     instruction: 'In Example 1, find Frank Bach. Confirm his email is fbach@yahoo.com and his amount due is $51.00.' },
   { url: 'https://the-internet.herokuapp.com/broken_images',
     instruction: 'Inspect the three images. Determine how many are broken and how many render correctly.' },
+  { url: 'https://the-internet.herokuapp.com/login',
+    instruction: 'Enter username tomsmith and password SuperSecretPassword!, click Login, and confirm that authentication succeeds.' },
+  { url: 'https://the-internet.herokuapp.com/dropdown',
+    instruction: 'Select Option 2 and confirm that Option 2 is selected.' },
+  { url: 'https://the-internet.herokuapp.com/inputs',
+    instruction: 'Enter 42 into the number input and confirm that the field value is 42.' },
+  { url: 'https://the-internet.herokuapp.com/key_presses',
+    instruction: 'Focus the input, press Escape, and confirm that the page reports You entered: ESCAPE.' },
+  { url: 'https://the-internet.herokuapp.com/hovers',
+    instruction: 'Hover over the second avatar and confirm that the revealed username is user2.' },
+  { url: 'https://the-internet.herokuapp.com/javascript_alerts',
+    instruction: 'Click Click for JS Alert, accept the alert, and confirm that the result says You successfully clicked an alert.' },
+  { url: 'https://the-internet.herokuapp.com/javascript_alerts',
+    instruction: 'Click Click for JS Confirm, dismiss the dialog, and confirm that the result says You clicked: Cancel.' },
+  { url: 'https://the-internet.herokuapp.com/javascript_alerts',
+    instruction: 'Click Click for JS Prompt, enter Adaptive QA into the prompt, accept it, and confirm that the result says You entered: Adaptive QA.' },
+  { url: 'https://the-internet.herokuapp.com/windows',
+    instruction: 'Click Click Here, switch to the newly opened window, and confirm that it displays New Window.' },
+  { url: 'https://the-internet.herokuapp.com/horizontal_slider',
+    instruction: 'Set the slider to 3.5 and confirm that the displayed value is 3.5.' },
 ] as const;
+
+function actionOperation(action: Receipt['action']): string {
+  return action.kind === 'act' ? action.operation : action.kind;
+}
+function actionTargetKind(action: Receipt['action']): string {
+  return action.kind === 'navigate' ? 'url' : action.kind === 'select_page' ? 'page' :
+    action.target?.kind ?? 'focused_page';
+}
+function redactPassword(text: string, instruction: string): string {
+  return [...instruction.matchAll(/\bpassword\s+([^\s,;]+)/gi)]
+    .reduce((safe, match) => safe.replaceAll(match[1]!, '[redacted]'), text);
+}
 
 function summary(attempt: Attempt | undefined) {
   if (!attempt) return null;
@@ -35,10 +68,13 @@ function summary(attempt: Attempt | undefined) {
       freshBrowserContext: attempt.resetProof.freshBrowserContext,
       applicationStateVerified: attempt.resetProof.applicationStateVerified,
       initialNavigationVerified: attempt.resetProof.initialNavigationVerified ?? false },
-    actions: attempt.receipts.map(item => ({ operation: item.action.kind === 'navigate'
-      ? 'navigate' : item.action.operation,
-      targetKind: item.action.kind === 'navigate' ? 'url' : item.action.target.kind,
+    actions: attempt.receipts.map(item => ({ operation: actionOperation(item.action),
+      targetKind: actionTargetKind(item.action),
+      ...(item.action.kind === 'act' && item.action.operation === 'set_range'
+        ? { requestedRangeValue: item.action.value } : {}),
       delivery: item.delivery, observedChange: !!item.observedChange,
+      ...(item.dialog ? { dialog: item.dialog } : {}),
+      ...(item.popup ? { popupOpened: true } : {}),
       ...(item.error ? { errorCategory: item.diagnostic?.ariaSnapshotTimedOut
         ? 'aria_snapshot_timeout' : item.error.includes('TARGET_NOT_GROUNDED')
           ? 'target_not_grounded' : 'other' } : {}),
@@ -53,29 +89,42 @@ function summary(attempt: Attempt | undefined) {
       } } : {}) })),
     observations: attempt.observations.map(item => ({
       urlChangedFromStart: item.url !== attempt.observations[0]?.url,
+      pageChangedFromStart: item.pageId !== attempt.observations[0]?.pageId,
       controls: item.dom.elements.length, accessibilityChars: item.accessibility.summary.length,
       screenshot: !!item.screenshot })),
     screenshotsUsed: attempt.observations.filter(item => !!item.screenshot).length };
 }
 
-function privateActionEvidence(result: MinimalResult) {
+function privateActionEvidence(result: MinimalResult, instruction: string) {
   const boundedUrl = (url: string | undefined) => url?.slice(0, 4096);
+  const safe = (value: string | undefined) => value === undefined ? undefined
+    : redactPassword(value, instruction);
   const actions = (attempt: Attempt | undefined) => attempt?.receipts.map(item => ({
-    id: item.id, operation: item.action.kind === 'navigate' ? 'navigate' : item.action.operation,
-    targetKind: item.action.kind === 'navigate' ? 'url' : item.action.target.kind,
-    ...(item.action.kind === 'navigate' ? { navigationDestination: item.action.url } : {}),
-    beforeUrl: boundedUrl(attempt.observations.find(observation =>
-      observation.observationId === item.beforeId)?.url),
-    afterUrl: boundedUrl(attempt.observations.find(observation =>
-      observation.observationId === item.afterId)?.url),
-    delivery: item.delivery, observationError: item.error?.slice(0, 500),
+    id: item.id, operation: actionOperation(item.action),
+    targetKind: actionTargetKind(item.action),
+    ...(item.action.kind === 'navigate' ? { navigationDestination: safe(item.action.url) } : {}),
+    ...(item.action.kind === 'select_page' ? { selectedPageId: item.action.pageId } : {}),
+    ...(item.action.kind === 'act' && item.action.operation === 'set_range'
+      ? { requestedRangeValue: item.action.value } : {}),
+    beforePageId: attempt.observations.find(observation =>
+      observation.observationId === item.beforeId)?.pageId,
+    afterPageId: attempt.observations.find(observation =>
+      observation.observationId === item.afterId)?.pageId,
+    beforeUrl: safe(boundedUrl(attempt.observations.find(observation =>
+      observation.observationId === item.beforeId)?.url)),
+    afterUrl: safe(boundedUrl(attempt.observations.find(observation =>
+      observation.observationId === item.afterId)?.url)),
+    delivery: item.delivery, ...(item.dialog ? { dialog: item.dialog } : {}),
+    ...(item.popup ? { popup: { pageId: item.popup.pageId,
+      url: safe(boundedUrl(item.popup.url)) } } : {}),
+    observationError: safe(item.error?.slice(0, 500)),
     postAction: item.diagnostic ? { ...item.diagnostic,
-      currentUrl: boundedUrl(item.diagnostic.currentUrl) } : undefined,
+      currentUrl: safe(boundedUrl(item.diagnostic.currentUrl)) } : undefined,
   })) ?? [];
   return { discovery: actions(result.discovery), clean: actions(result.clean),
-    discoveryStopDetail: result.discovery.stopDetail?.slice(0, 500),
-    cleanStopDetail: result.clean?.stopDetail?.slice(0, 500),
-    evaluatorExplanation: result.explanation.slice(0, 1200) };
+    discoveryStopDetail: safe(result.discovery.stopDetail?.slice(0, 500)),
+    cleanStopDetail: safe(result.clean?.stopDetail?.slice(0, 500)),
+    evaluatorExplanation: safe(result.explanation.slice(0, 1200)) };
 }
 
 async function saveAttachment(testInfo: TestInfo, name: string, body: Buffer, contentType: string) {
@@ -165,7 +214,8 @@ for (const [index, scenario] of scenarios.entries()) {
     const started = Date.now();
     const limits = { modelTurnsPerAttempt: task.maxModelTurns, actionsPerAttempt: task.maxActions,
       screenshotsPerAttempt: task.maxScreenshots, totalMs: task.maxElapsedMs,
-      operations: ['click', 'check', 'uncheck', 'navigate'],
+      operations: ['click', 'check', 'uncheck', 'fill', 'select_option',
+        'press', 'hover', 'navigate', 'select_page', 'set_range'],
       applicationReset: 'unverified; fresh context and exact start navigation only' };
     let finalScreenshotArtifact: string | undefined;
     const browserEvents: { phase: string; kind: string; url: string;
@@ -216,14 +266,17 @@ for (const [index, scenario] of scenarios.entries()) {
       try {
         const name = `minimal-public-${index + 1}-browser-diagnostic.json`;
         await saveAttachment(testInfo, name, Buffer.from(JSON.stringify({
-          actions: privateActionEvidence(result), browserEvents,
+          actions: privateActionEvidence(result, scenario.instruction),
+          browserEvents: browserEvents.map(event => ({ ...event,
+            url: redactPassword(event.url, scenario.instruction),
+            ...(event.failure ? { failure: redactPassword(event.failure, scenario.instruction) } : {}) })),
           finalScreenshotObservationId: result.clean?.observations.at(-1)?.screenshot
             ? result.clean.observations.at(-1)?.observationId : undefined,
         })), 'application/json');
         diagnosticArtifact = name;
       } catch { /* Artifact storage is diagnostic and does not change the verdict. */ }
       console.log(`ADAPTIVE_MINIMAL_PUBLIC_${index + 1}=${JSON.stringify({
-        url: scenario.url, instruction: scenario.instruction,
+        url: scenario.url, instruction: redactPassword(scenario.instruction, scenario.instruction),
         discovery: summary(result.discovery), clean: summary(result.clean),
         verdict: result.outcome,
         evidenceIds: result.evidenceIds,
@@ -232,7 +285,8 @@ for (const [index, scenario] of scenarios.entries()) {
         runtimeMs: Date.now() - started, limits })}`);
     } catch {
       console.log(`ADAPTIVE_MINIMAL_PUBLIC_${index + 1}=${JSON.stringify({
-        url: scenario.url, instruction: scenario.instruction, discovery: null, clean: null,
+        url: scenario.url, instruction: redactPassword(scenario.instruction, scenario.instruction),
+        discovery: null, clean: null,
         verdict: 'INCONCLUSIVE', evidenceIds: [], runtimeMs: Date.now() - started,
         limits, failureCode: 'BENCHMARK_RUNTIME_ERROR' })}`);
     }

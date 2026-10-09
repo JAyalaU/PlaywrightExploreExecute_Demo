@@ -8,10 +8,14 @@ import { ProtectedContextFactory } from '../profile/local-context.js';
 import type { NativeEffectiveProfile, NativeProfileRef } from '../profile/native-profile.js';
 
 const controls = 'a,button,input,select,textarea,[role="button"],[role="checkbox"]';
+const fillableInputTypes = new Set(['text', 'password', 'number', 'email', 'search', 'tel', 'url']);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 type Element = ObservationV1['dom']['elements'][number];
 type Fact = { domIndex: number; role: string; name: string; checked?: boolean; enabled: boolean;
-  value?: string; bounds?: NonNullable<Element['bounds']>; visual?: NonNullable<Element['visual']> };
+  value?: string; valuePresent?: boolean; inputType?: string;
+  range?: NonNullable<Element['range']>;
+  options?: NonNullable<Element['options']>; optionsComplete?: boolean;
+  bounds?: NonNullable<Element['bounds']>; visual?: NonNullable<Element['visual']> };
 type VisualAnchor = Extract<LearnedProcedureV1['steps'][number]['targetStrategies'][number]['target'],
   { kind: 'visual_anchor' }>;
 export function observedViewportRegion(bounds: NonNullable<Element['bounds']>,
@@ -29,7 +33,7 @@ function containsPoint(bounds: NonNullable<Element['bounds']>, x: number, y: num
 
 /** The only page owner for an adaptive run. References are scoped to each observation. */
 export class AdaptiveBrowser implements ObservationBroker {
-  readonly sessionId = `s${randomUUID().replaceAll('-', '')}`;
+  readonly sessionId: string;
   readonly pageId = `p${randomUUID().replaceAll('-', '')}`;
   #last?: ObservationV1;
   #lastFacts: Fact[] = [];
@@ -38,12 +42,17 @@ export class AdaptiveBrowser implements ObservationBroker {
   #allowedOrigins = new Set<string>();
   #navigationEpoch = 0;
   #lastObservationEpoch = -1;
-  constructor(readonly page: Page, readonly closeSession: () => Promise<void>) {
+  constructor(readonly page: Page, readonly closeSession: () => Promise<void>,
+    sessionId = `s${randomUUID().replaceAll('-', '')}`) {
+    this.sessionId = sessionId;
     page.on('framenavigated', frame => { if (frame === page.mainFrame()) this.#navigationEpoch++; });
   }
 
+  allowOrigins(origins: readonly string[]): void {
+    this.#allowedOrigins = new Set(origins.map(value => new URL(value).origin));
+  }
   async observeInitial(task: TaskEnvelopeV1): Promise<ObservationV1> {
-    this.#allowedOrigins = new Set(task.operatorConstraints.allowedOrigins.map(value => new URL(value).origin));
+    this.allowOrigins(task.operatorConstraints.allowedOrigins);
     await this.page.goto(task.startUrl);
     return this.observeCurrent();
   }
@@ -64,13 +73,30 @@ export class AdaptiveBrowser implements ObservationBroker {
     }
     throw new Error('OBSERVATION_UNAVAILABLE');
   }
+  private async accessibilitySummary(): Promise<string> {
+    const sensitiveValues = () => this.page.locator('input').evaluateAll(nodes => nodes
+      .filter(node => {
+        const input = node as HTMLInputElement;
+        return ['password', 'hidden'].includes(input.type) ||
+          /password|one-time-code|cc-/.test(input.autocomplete);
+      }).map(node => (node as HTMLInputElement).value).filter(Boolean));
+    const before = await sensitiveValues();
+    let snapshot = await this.page.locator('body').ariaSnapshot();
+    const after = await sensitiveValues();
+    for (const value of new Set([...before, ...after])) {
+      snapshot = snapshot.replaceAll(value, '[redacted]');
+      const escaped = JSON.stringify(value).slice(1, -1);
+      if (escaped !== value) snapshot = snapshot.replaceAll(escaped, '[redacted]');
+    }
+    return snapshot.slice(0, 16_384);
+  }
   private async readObservation(): Promise<ObservationV1> {
     this.#screenshot = undefined;
     const epoch = this.#navigationEpoch;
     const url = this.page.url();
     if (!this.#allowedOrigins.has(new URL(url).origin)) throw new Error('NAVIGATION_DENIED');
     const facts = await this.readFacts();
-    const snapshot = (await this.page.locator('body').ariaSnapshot()).slice(0, 16_384);
+    const snapshot = await this.accessibilitySummary();
     const title = await this.page.title();
     if (this.#navigationEpoch !== epoch || this.page.url() !== url)
       throw new Error('OBSERVATION_DOCUMENT_CHANGED');
@@ -81,6 +107,11 @@ export class AdaptiveBrowser implements ObservationBroker {
       ...(fact.name ? { name: fact.name } : {}),
       ...(fact.checked === undefined ? {} : { checked: fact.checked }),
       enabled: fact.enabled, ...(fact.value === undefined ? {} : { value: fact.value }),
+      ...(fact.valuePresent === undefined ? {} : { valuePresent: fact.valuePresent }),
+      ...(fact.inputType === undefined ? {} : { inputType: fact.inputType }),
+      ...(fact.range === undefined ? {} : { range: fact.range }),
+      ...(fact.options === undefined ? {} : { options: fact.options,
+        optionsComplete: fact.optionsComplete }),
       ...(fact.bounds ? { bounds: fact.bounds } : {}),
       ...(fact.visual ? { visual: fact.visual } : {}) }));
     const observation = ObservationV1Schema.parse({ version: '1', observationId,
@@ -178,12 +209,21 @@ export class AdaptiveBrowser implements ObservationBroker {
           /password|one-time-code|cc-/.test(input.autocomplete));
       const capturesValue = !sensitive && (el.tagName === 'SELECT' || el.tagName === 'TEXTAREA' ||
         el.tagName === 'INPUT' && !['checkbox', 'radio', 'file'].includes(input.type));
+      const numberOr = (raw: string, fallback: number) => {
+        const number = Number(raw);
+        return raw && Number.isFinite(number) ? number : fallback;
+      };
+      const positiveOr = (raw: string, fallback: number) => {
+        const number = numberOr(raw, fallback);
+        return number > 0 ? number : fallback;
+      };
       const role = el.getAttribute('role') || (el.tagName === 'A' ? 'link' :
         el.tagName === 'INPUT' && input.type === 'checkbox' ? 'checkbox' :
         el.tagName === 'BUTTON' ? 'button' : el.tagName.toLowerCase());
       const labels = 'labels' in input && input.labels ? Array.from(input.labels).map(item => item.textContent || '').join(' ') : '';
       const name = (el.getAttribute('aria-label') || labels || el.textContent?.slice(0, 2_048) ||
-        el.getAttribute('title') || '').trim().slice(0, 1024);
+        el.getAttribute('placeholder') || el.getAttribute('title') ||
+        el.getAttribute('name') || '').trim().slice(0, 1024);
       const rect = el.getBoundingClientRect();
       const svg = el.querySelector('svg');
       const image = el.querySelector('img');
@@ -201,6 +241,17 @@ export class AdaptiveBrowser implements ObservationBroker {
       return { domIndex, visible: !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden',
         role, name, ...(input.type === 'checkbox' ? { checked: input.checked } : {}),
         ...(capturesValue ? { value: input.value.slice(0, 1024) } : {}),
+        ...(sensitive && el.tagName === 'INPUT' ? { valuePresent: input.value.length > 0 } : {}),
+        ...(el.tagName === 'INPUT' ? { inputType: input.type.slice(0, 100) } : {}),
+        ...(el.tagName === 'INPUT' && input.type === 'range' ? { range: {
+          min: numberOr(input.min, 0), max: numberOr(input.max, 100),
+          step: input.step === 'any' ? 'any' as const : positiveOr(input.step, 1),
+          value: numberOr(input.value, 0) } } : {}),
+        ...(el instanceof HTMLSelectElement ? {
+          options: Array.from(el.options).slice(0, 100).map(option => ({
+            label: option.label.slice(0, 1024), value: option.value.slice(0, 1024),
+            selected: option.selected, disabled: option.disabled })),
+          optionsComplete: el.options.length <= 100 } : {}),
         enabled: !('disabled' in input && input.disabled) && el.getAttribute('aria-disabled') !== 'true',
         bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
         visualKind, visualSource, context };
@@ -226,7 +277,7 @@ export class AdaptiveBrowser implements ObservationBroker {
           Date.now() - Date.parse(observation.screenshot.observedAt) > 45_000))
       throw new Error('STALE_LIVE_PAGE');
     const facts = await this.readFacts();
-    const snapshot = (await this.page.locator('body').ariaSnapshot()).slice(0, 16_384);
+    const snapshot = await this.accessibilitySummary();
     if (this.#navigationEpoch !== epoch || this.page.url() !== observation.url ||
         hash(JSON.stringify({ epoch, url: this.page.url(), facts, snapshot })).slice(0, 32) !==
           observation.documentRevision) throw new Error('STALE_LIVE_PAGE');
@@ -277,9 +328,13 @@ export class AdaptiveBrowser implements ObservationBroker {
     }
     const { index, fact } = this.resolve(proposal.target, observation);
     if (!fact.enabled) throw new Error('TARGET_DISABLED');
-    const unnamedCheckboxStateAction = proposal.target.kind === 'element_ref' && !fact.name &&
-      fact.role === 'checkbox' && (proposal.operation === 'check' || proposal.operation === 'uncheck');
-    if (proposal.target.kind === 'element_ref' && !fact.name && !unnamedCheckboxStateAction) {
+    const editable = fact.role === 'textarea' || !!fact.inputType &&
+      fillableInputTypes.has(fact.inputType);
+    const unnamedNativeAction = proposal.target.kind === 'element_ref' && !fact.name &&
+      (fact.role === 'checkbox' && (proposal.operation === 'check' || proposal.operation === 'uncheck') ||
+        editable && (proposal.operation === 'fill' || proposal.operation === 'press') ||
+        !!fact.options && (proposal.operation === 'select' || proposal.operation === 'press'));
+    if (proposal.target.kind === 'element_ref' && !fact.name && !unnamedNativeAction) {
       const box = fact.bounds;
       const candidates = this.#lastFacts.filter(item => !item.name && item.enabled && item.visual &&
         ['button', 'link', 'checkbox', 'radio', 'switch'].includes(item.role) && item.bounds &&
@@ -292,7 +347,7 @@ export class AdaptiveBrowser implements ObservationBroker {
         throw new Error('VISUAL_REF_NOT_GROUNDED');
       await this.assertScreenshotPixels(observation);
     } else if (proposal.target.kind === 'element_ref' && observation.screenshot &&
-        !unnamedCheckboxStateAction) {
+        !unnamedNativeAction) {
       await this.assertScreenshotPixels(observation);
     }
     const locator = this.page.locator(controls).nth(index);
@@ -301,8 +356,61 @@ export class AdaptiveBrowser implements ObservationBroker {
       case 'click': await locator.click(); break;
       case 'check': await locator.check(); break;
       case 'uncheck': await locator.uncheck(); break;
+      case 'fill':
+        if (!editable) throw new Error('FILL_TARGET_UNSUPPORTED');
+        await locator.fill(proposal.value); break;
+      case 'select':
+        if (!fact.options || !fact.optionsComplete ||
+            fact.options.filter(option => option.value === proposal.value && !option.disabled).length !== 1)
+          throw new Error('SELECT_TARGET_UNSUPPORTED');
+        await locator.selectOption({ value: proposal.value }); break;
+      case 'press':
+        if (!['Escape', 'Enter', 'Tab', 'ArrowDown', 'ArrowUp',
+          'ArrowLeft', 'ArrowRight', 'Space'].includes(proposal.key))
+          throw new Error('KEY_NOT_ALLOWED');
+        await locator.press(proposal.key); break;
       default: throw new Error('UNSUPPORTED_DISPATCH_OPERATION');
     }
+  }
+  async hover(target: TargetHypothesisV1, observation: ObservationV1): Promise<void> {
+    await this.assertCurrent(observation);
+    if (target.kind === 'visual_coordinate') {
+      if (!observation.screenshot || target.screenshotRef !== observation.screenshot.ref ||
+          target.coordinateFrameId !== observation.coordinateFrameId ||
+          target.viewport.width !== observation.viewport.width ||
+          target.viewport.height !== observation.viewport.height ||
+          target.x < 0 || target.y < 0 || target.x >= observation.viewport.width ||
+          target.y >= observation.viewport.height)
+        throw new Error('VISUAL_DISPATCH_DENIED');
+      await this.assertScreenshotPixels(observation);
+      await this.page.mouse.move(target.x, target.y);
+      return;
+    }
+    const { index, fact } = this.resolve(target, observation);
+    if (!fact.enabled) throw new Error('TARGET_DISABLED');
+    const locator = this.page.locator(controls).nth(index);
+    if (!await locator.isVisible()) throw new Error('TARGET_NOT_VISIBLE');
+    await locator.hover();
+  }
+  async setRange(target: TargetHypothesisV1, observation: ObservationV1,
+    value: number): Promise<void> {
+    await this.assertCurrent(observation);
+    if (target.kind === 'visual_coordinate') throw new Error('RANGE_TARGET_NOT_GROUNDED');
+    const { index, fact } = this.resolve(target, observation);
+    if (!fact.enabled || fact.inputType !== 'range' || !fact.range)
+      throw new Error('RANGE_TARGET_UNSUPPORTED');
+    const { min, max, step } = fact.range;
+    if (step === 'any' || step <= 0 || max < min || value < min || value > max)
+      throw new Error('RANGE_VALUE_UNREACHABLE');
+    const steps = (value - min) / step;
+    if (!Number.isFinite(steps) || Math.abs(steps - Math.round(steps)) > 1e-6 ||
+        steps > 100) throw new Error('RANGE_VALUE_UNREACHABLE');
+    const locator = this.page.locator(controls).nth(index);
+    if (!await locator.isVisible()) throw new Error('TARGET_NOT_VISIBLE');
+    await locator.press('Home');
+    for (let index = 0; index < Math.round(steps); index++) await locator.press('ArrowRight');
+    if (Math.abs(Number(await locator.inputValue()) - value) > 1e-6)
+      throw new Error('RANGE_VALUE_NOT_REACHED');
   }
   async close(): Promise<void> { await this.closeSession(); }
 }

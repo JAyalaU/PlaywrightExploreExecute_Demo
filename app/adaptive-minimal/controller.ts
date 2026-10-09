@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AdaptiveBrowser } from '../adaptive/browser.js';
 import { ChoiceSchema, VerdictSchema, type Attempt, type MinimalModel, type MinimalResult,
-  type MinimalTask, type Receipt, type ResetProof } from './types.js';
+  type MinimalTask, type Receipt, type ResetProof, type BrowserAction } from './types.js';
 import { MinimalBrowserTools } from './browser-tools.js';
 
 export interface MinimalRunOptions {
@@ -17,14 +17,29 @@ export interface MinimalRunOptions {
 function workflowFrom(attempt: Attempt): string {
   const steps = attempt.receipts.filter(item => item.delivery === 'returned' && item.observedChange)
     .slice(0, 12).map((item, index) =>
-      `${index + 1}. ${item.action.kind === 'navigate' ? 'navigate' : item.action.operation} ` +
-      `${item.targetDescription}; observed ${item.observedChange}`);
+      `${index + 1}. ${item.action.kind === 'navigate' ? 'navigate' :
+        item.action.kind === 'press' ? 'press' :
+          item.action.kind === 'select_page' ? 'select_page' : item.action.operation} ` +
+      `${item.action.kind === 'select_page' ? 'newly opened page' : item.targetDescription}${item.dialog ?
+        `; dialog ${item.dialog.kind} ${item.dialog.response}` : ''}; observed ${item.observedChange}`);
   return steps.length ? steps.join('\n') : 'No interaction with an observed effect was demonstrated.';
 }
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message.slice(0, 300) : 'Unknown tool error';
 }
+function actionErrorText(error: unknown, action: BrowserAction): string {
+  const message = error instanceof Error ? error.message : 'Unknown tool error';
+  const value = action.kind === 'act' && action.operation === 'fill' ? action.value :
+    action.kind === 'act' && action.operation === 'click' && action.dialog?.kind === 'prompt'
+      ? action.dialog.text : undefined;
+  if (!value)
+    return message.slice(0, 300);
+  const escaped = JSON.stringify(value).slice(1, -1);
+  return message.replaceAll(value, '[redacted]')
+    .replaceAll(escaped, '[redacted]').slice(0, 300);
+}
 function observationChange(before: Attempt['observations'][number], after: Attempt['observations'][number]): string | undefined {
+  if (before.pageId !== after.pageId) return `Selected page ${after.url}`;
   if (before.url !== after.url) return `URL ${before.url} -> ${after.url}`;
   if (before.documentRevision !== after.documentRevision) return 'Page controls or accessibility changed';
   return undefined;
@@ -62,7 +77,7 @@ async function runAttempt(options: MinimalRunOptions, phase: 'discovery' | 'clea
       const screenshotDataUrl = tools.image(observation);
       const choice = ChoiceSchema.parse(await options.model.choose({
         instruction: options.task.instruction, phase, ...(workflow ? { workflow } : {}),
-        observation, ...(screenshotDataUrl ? { screenshotDataUrl } : {}),
+        observation, pages: tools.pages(), ...(screenshotDataUrl ? { screenshotDataUrl } : {}),
         recentReceipts: attempt.receipts.slice(-6),
         remaining: { modelTurns: options.task.maxModelTurns - turn,
           actions: options.task.maxActions - attempt.receipts.length,
@@ -86,26 +101,35 @@ async function runAttempt(options: MinimalRunOptions, phase: 'discovery' | 'clea
         continue;
       }
       const before = observation;
-      const receipt: Receipt = { id: `r${randomUUID().replaceAll('-', '')}`, action: choice,
+      const receipt: Receipt = { id: `r${randomUUID().replaceAll('-', '')}`,
+        action: choice.kind === 'act' && choice.operation === 'fill'
+          ? { kind: 'act', operation: 'fill', observationId: choice.observationId,
+            target: choice.target, valueRedacted: true } :
+          choice.kind === 'act' && choice.operation === 'click' && choice.dialog?.kind === 'prompt'
+            ? { ...choice, dialog: { kind: 'prompt', response: choice.dialog.response } } : choice,
         targetDescription: tools.describe(choice, before), beforeId: before.observationId,
         delivery: 'failed' };
       const navigationMarker = tools.navigationMarker();
       try {
-        await tools.execute(choice, before);
+        const result = await tools.execute(choice, before);
+        if (result.dialog) receipt.dialog = result.dialog;
+        if (result.popup) receipt.popup = result.popup;
         receipt.delivery = 'returned';
-      } catch (error) { receipt.error = errorText(error); }
+      } catch (error) { receipt.error = actionErrorText(error, choice); }
       try {
         observation = await tools.observe();
         attempt.observations.push(observation);
         receipt.afterId = observation.observationId;
         const change = observationChange(before, observation);
-        if (change) receipt.observedChange = change;
+        if (change || receipt.popup) receipt.observedChange = change ??
+          `Opened page ${receipt.popup!.url}`;
       } catch (error) {
-        receipt.error = [receipt.error, `Observation: ${errorText(error)}`].filter(Boolean).join('; ');
+        receipt.error = [receipt.error, `Observation: ${actionErrorText(error, choice)}`]
+          .filter(Boolean).join('; ');
         try { receipt.diagnostic = await tools.failureDiagnostic(navigationMarker, error); }
         catch { /* The observation failure remains the authoritative stop. */ }
         attempt.receipts.push(receipt);
-        throw error;
+        throw new Error(actionErrorText(error, choice));
       }
       attempt.receipts.push(receipt);
       unchanged = receipt.delivery === 'returned' && receipt.observedChange ? 0 : unchanged + 1;
