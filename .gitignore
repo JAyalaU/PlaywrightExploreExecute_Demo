@@ -1,45 +1,30 @@
-# Python-generated files
+# Dependencies and generated builds
+node_modules/
+dist/
+build/
+wheels/
+*.egg-info/
+*.tsbuildinfo
+.venv/
+
+# Python and local tool caches
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+.uv-cache*/
+.cache/
+.pytest_cache/
 
-# Virtual environments
-.venv
-
-# Production Node/TypeScript toolchain
-node_modules/
-test-results/
-playwright-report/
-*.tsbuildinfo
-
-# Local production job artifacts
-jobs/
-
-# Local Playwright MCP diagnostics and page snapshots
-.playwright-mcp/
-
-# Local configuration and secrets
+# Local configuration and credentials
 .env
 .env.*
 !.env.example
 
-.uv-cache-p3e/
-
-# Local secrets
-.env
-.env.*
-!.env.example
-
-# Test/runtime artifacts
+# Test, browser, and runtime output
 test-results*/
-debug.log
-jobs/
+playwright-report/
+coverage/
+screenshots/
 artifacts/
-artifacts/live-debug/
-
-# Python
-__pycache__/
-*.pyc
+jobs/
+.playwright-mcp/
+*.log
