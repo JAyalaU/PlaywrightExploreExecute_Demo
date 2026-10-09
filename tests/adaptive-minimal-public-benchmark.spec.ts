@@ -1,11 +1,19 @@
 import { expect, test, type Browser, type Page, type TestInfo } from '@playwright/test';
 import { readFile, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { AdaptiveBrowser } from '../app/adaptive/browser.js';
 import { runMinimalAdaptiveAgent } from '../app/adaptive-minimal/controller.js';
 import { OpenAIMinimalModel } from '../app/adaptive-minimal/model.js';
 import type { Attempt, MinimalModel, MinimalResult, MinimalTask,
   Receipt } from '../app/adaptive-minimal/types.js';
 import { startAdaptiveFixture } from './support/adaptive-fixture.js';
+
+const slowMoSetting = process.env.ADAPTIVE_MINIMAL_SLOW_MO_MS ?? '0';
+if (!/^\d+$/.test(slowMoSetting) || !Number.isSafeInteger(Number(slowMoSetting)))
+  throw new Error('ADAPTIVE_MINIMAL_SLOW_MO_MS must be a non-negative integer');
+test.use({ headless: process.env.ADAPTIVE_MINIMAL_HEADED !== '1',
+  launchOptions: { slowMo: Number(slowMoSetting) } });
 
 // Only public starting URLs and authored instructions are scenario data.
 const scenarios = [
@@ -200,6 +208,78 @@ test('offline public benchmark opens separate contexts without trusted configura
     } finally { await fixture.close(); }
   });
 
+test('offline minimal browser presentation smoke covers action, popup, and cleanup',
+  async ({ browser }) => {
+    test.skip(process.env.ADAPTIVE_MINIMAL_BROWSER_SELFTEST !== '1',
+      'Requires explicit offline browser check');
+    const server = createServer((request, response) => {
+      response.setHeader('Content-Type', 'text/html; charset=utf-8');
+      response.end(request.url === '/child' ? '<h1>Child page</h1>' :
+        '<button onclick="this.textContent=\'Clicked\'">Increment</button>' +
+        '<a href="/child" target="_blank">Open child</a>');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const contextsBefore = browser.contexts().length;
+    const openedContexts = new Set<ReturnType<Page['context']>>();
+    const progressEvents: string[] = [];
+    const model: MinimalModel = {
+      async choose(input) {
+        const observationId = input.observation.observationId;
+        if (!input.recentReceipts.length) return { kind: 'act', operation: 'click', observationId,
+          target: { kind: 'role_name', role: 'button', name: 'Increment' } };
+        if (input.recentReceipts.length === 1) return { kind: 'act', operation: 'click',
+          observationId, target: { kind: 'role_name', role: 'link', name: 'Open child' },
+          popup: 'expect' };
+        const popup = input.recentReceipts.find(receipt => receipt.popup)?.popup;
+        if (popup && input.recentReceipts.length === 2) return { kind: 'select_page',
+          observationId, pageId: popup.pageId };
+        return { kind: 'done', reason: 'Child page observed' };
+      },
+      async evaluate(input) {
+        const clicked = input.receipts.find(receipt => receipt.delivery === 'returned' &&
+          receipt.observedChange);
+        return { outcome: 'PASS', explanation: 'Local popup action completed',
+          evidenceIds: [input.finalObservation.observationId, ...(clicked ? [clicked.id] : [])] };
+      },
+    };
+    try {
+      const result = await runMinimalAdaptiveAgent({
+        task: { instruction: 'Click Increment, open the child, and select it',
+          startUrl: `${baseUrl}/`, allowedOrigins: [baseUrl], resetRef: 'fresh_navigation',
+          maxModelTurns: 5, maxActions: 3, maxScreenshots: 1, maxElapsedMs: 30_000 },
+        model,
+        onProgress: event => progressEvents.push('verdict' in event ? event.verdict :
+          `${event.phase}_${event.status}`),
+        openBrowser: async () => {
+          const adapter = await openBenchmarkBrowser(browser);
+          openedContexts.add(adapter.page.context());
+          return adapter;
+        },
+        reset: async () => ({ kind: 'fresh_navigation', freshBrowserContext: true,
+          applicationStateVerified: false, resetRef: 'fresh_navigation' }),
+      });
+      expect(result.outcome, result.explanation).toBe('PASS');
+      expect(progressEvents).toEqual(['discovery_started', 'discovery_completed',
+        'clean_started', 'clean_completed', 'PASS']);
+      expect(openedContexts.size).toBe(2);
+      expect(result.discovery.observations[0]?.sessionId)
+        .not.toBe(result.clean?.observations[0]?.sessionId);
+      if (!result.clean) throw new Error('CLEAN_ATTEMPT_MISSING');
+      for (const attempt of [result.discovery, result.clean]) {
+        expect(attempt.receipts.map(receipt => receipt.action.kind))
+          .toEqual(['act', 'act', 'select_page']);
+        expect(attempt.receipts[1]?.popup?.url).toBe(`${baseUrl}/child`);
+        expect(attempt.observations.at(-1)?.url).toBe(`${baseUrl}/child`);
+      }
+      expect([...openedContexts].every(context => context.pages().length === 0)).toBe(true);
+      expect(browser.contexts()).toHaveLength(contextsBefore);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error =>
+        error ? reject(error) : resolve()));
+    }
+  });
+
 test.describe.configure({ retries: 0 });
 for (const [index, scenario] of scenarios.entries()) {
   test(`opt-in public minimal benchmark ${index + 1}`, async ({ browser }, testInfo) => {
@@ -224,6 +304,9 @@ for (const [index, scenario] of scenarios.entries()) {
     try {
       const result = await runMinimalAdaptiveAgent({ task,
         model: new OpenAIMinimalModel(process.env.OPENAI_API_KEY!, process.env.ADAPTIVE_LIVE_MODEL!),
+        onProgress: event => console.log('ADAPTIVE_MINIMAL ' + ('verdict' in event
+          ? `Final evaluator verdict: ${event.verdict}`
+          : `${event.phase === 'clean' ? 'Clean attempt' : 'Discovery'} ${event.status}`)),
         openBrowser: () => openBenchmarkBrowser(browser, page => {
           const phase = browserCount++ === 0 ? 'discovery' : 'clean';
           const record = (kind: string, url: string, status?: number, failure?: string) => {
@@ -284,6 +367,7 @@ for (const [index, scenario] of scenarios.entries()) {
         ...(finalScreenshotArtifact ? { finalScreenshotArtifact } : {}),
         runtimeMs: Date.now() - started, limits })}`);
     } catch {
+      console.log('ADAPTIVE_MINIMAL Final evaluator verdict: INCONCLUSIVE');
       console.log(`ADAPTIVE_MINIMAL_PUBLIC_${index + 1}=${JSON.stringify({
         url: scenario.url, instruction: redactPassword(scenario.instruction, scenario.instruction),
         discovery: null, clean: null,

@@ -12,6 +12,14 @@ export interface MinimalRunOptions {
   reset: (task: MinimalTask) => Promise<ResetProof>;
   /** Optional private benchmark artifact handoff; diagnostic failure never changes QA. */
   onCleanFinalScreenshot?: (image: { observationId: string; dataUrl: string }) => Promise<void>;
+  /** Presentation-only progress; failures must not affect the agent or verdict. */
+  onProgress?: (event: { phase: 'discovery' | 'clean'; status: 'started' | 'completed' } |
+    { verdict: MinimalResult['outcome'] }) => void;
+}
+
+function progress(options: MinimalRunOptions, event: Parameters<NonNullable<MinimalRunOptions['onProgress']>>[0]): void {
+  try { options.onProgress?.(event); }
+  catch { /* Operator feedback cannot change execution. */ }
 }
 
 function workflowFrom(attempt: Attempt): string {
@@ -52,6 +60,7 @@ async function runAttempt(options: MinimalRunOptions, phase: 'discovery' | 'clea
   const screenshotsForEvaluation: { observationId: string; dataUrl: string }[] = [];
   const attempt: Attempt = { resetProof: { freshBrowserContext: false, applicationStateVerified: false },
     observations: [], receipts: [], stopReason: 'error' };
+  progress(options, { phase, status: 'started' });
   try {
     browser = await options.openBrowser();
     attempt.resetProof = await options.reset(options.task);
@@ -156,6 +165,7 @@ async function runAttempt(options: MinimalRunOptions, phase: 'discovery' | 'clea
   } finally {
     try { await browser?.close(); }
     catch (error) { attempt.stopReason = 'error'; attempt.stopDetail = `Cleanup: ${errorText(error)}`; }
+    progress(options, { phase, status: 'completed' });
   }
   return { attempt, screenshots: screenshotsForEvaluation };
 }
@@ -170,11 +180,15 @@ export async function runMinimalAdaptiveAgent(options: MinimalRunOptions): Promi
       !Number.isInteger(task.maxScreenshots) || task.maxScreenshots < 0 || task.maxElapsedMs < 1)
     throw new Error('MINIMAL_TASK_INVALID');
   const deadline = Date.now() + task.maxElapsedMs;
+  const finish = (result: MinimalResult): MinimalResult => {
+    progress(options, { verdict: result.outcome });
+    return result;
+  };
   const discovery = (await runAttempt(options, 'discovery', undefined, deadline)).attempt;
   const workflow = workflowFrom(discovery);
   if (discovery.stopReason === 'error' || Date.now() >= deadline)
-    return { outcome: 'INCONCLUSIVE', explanation: discovery.stopDetail ?? 'Discovery could not continue',
-      evidenceIds: [], workflow, discovery };
+    return finish({ outcome: 'INCONCLUSIVE', explanation: discovery.stopDetail ?? 'Discovery could not continue',
+      evidenceIds: [], workflow, discovery });
   const cleanRun = await runAttempt(options, 'clean', workflow, deadline);
   const clean = cleanRun.attempt;
   const finalObservation = clean.observations.at(-1);
@@ -185,11 +199,11 @@ export async function runMinimalAdaptiveAgent(options: MinimalRunOptions): Promi
     catch { /* Diagnostic artifact failure does not change execution or evaluation. */ }
   }
   if (discovery.observations[0]?.sessionId === clean.observations[0]?.sessionId)
-    return { outcome: 'INCONCLUSIVE', explanation: 'Clean browser session was not fresh',
-      evidenceIds: [], workflow, discovery, clean };
+    return finish({ outcome: 'INCONCLUSIVE', explanation: 'Clean browser session was not fresh',
+      evidenceIds: [], workflow, discovery, clean });
   if (!finalObservation || clean.stopReason === 'error' || Date.now() >= deadline)
-    return { outcome: 'INCONCLUSIVE', explanation: clean.stopDetail ?? 'Clean attempt could not continue',
-      evidenceIds: [], workflow, discovery, clean };
+    return finish({ outcome: 'INCONCLUSIVE', explanation: clean.stopDetail ?? 'Clean attempt could not continue',
+      evidenceIds: [], workflow, discovery, clean });
   try {
     const verdict = VerdictSchema.parse(await options.model.evaluate({ instruction: task.instruction,
       observations: clean.observations, receipts: clean.receipts, finalObservation,
@@ -203,9 +217,9 @@ export async function runMinimalAdaptiveAgent(options: MinimalRunOptions): Promi
     if (verdict.outcome === 'PASS' && clean.receipts.length > 0 &&
         !clean.receipts.some(item => item.delivery === 'returned' && item.observedChange &&
           verdict.evidenceIds.includes(item.id))) throw new Error('PASS_ACTION_EVIDENCE_MISSING');
-    return { ...verdict, workflow, discovery, clean };
+    return finish({ ...verdict, workflow, discovery, clean });
   } catch (error) {
-    return { outcome: 'INCONCLUSIVE', explanation: `Evaluation unavailable: ${errorText(error)}`,
-      evidenceIds: [], workflow, discovery, clean };
+    return finish({ outcome: 'INCONCLUSIVE', explanation: `Evaluation unavailable: ${errorText(error)}`,
+      evidenceIds: [], workflow, discovery, clean });
   }
 }
