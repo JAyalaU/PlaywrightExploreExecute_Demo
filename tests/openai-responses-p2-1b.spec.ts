@@ -1,15 +1,11 @@
 import { expect, test } from '@playwright/test';
 import {
   createOpenAIResponsesClient,
-  INTERPRETATION_RESPONSE_FORMAT,
-  STEP_DECISION_RESPONSE_FORMAT,
   type OpenAIResponseRequest,
 } from '../app/interpretation/index.js';
 import type { OpenAIResponseDiagnostic } from '../app/interpretation/openai-responses.js';
-import { AGENTIC_INTERPRETATION_RESPONSE_FORMAT } from '../app/interpretation/openai-wire.js';
-import { AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT } from '../app/interpretation/verification-wire.js';
-import { POC_FIDELITY_RESPONSE_FORMAT, POC_PRIMARY_RESPONSE_FORMAT } from '../app/interpretation/deferred-action-poc-wire.js';
-import { createOpenAIPocSemanticModels } from '../app/interpretation/deferred-action-poc-adapters.js';
+import { SEMANTIC_INTENT_FIDELITY_V3_FORMAT, SEMANTIC_INTENT_PRIMARY_V3_FORMAT } from '../app/interpretation/semantic-intent-v3-wire.js';
+import { createOpenAISemanticIntentModelsV3 } from '../app/interpretation/semantic-intent-v3-adapters.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
@@ -21,7 +17,7 @@ const completed = (text = wireOutput): Response => new Response(JSON.stringify({
     content: [{ type: 'output_text', text }] }],
 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 
-function request(format: OpenAIResponseRequest['format'] = INTERPRETATION_RESPONSE_FORMAT,
+function request(format: OpenAIResponseRequest['format'] = SEMANTIC_INTENT_PRIMARY_V3_FORMAT,
   signal = new AbortController().signal): OpenAIResponseRequest {
   return { systemInstruction: 'Follow the closed response schema.', input: 'Select Save.', format, signal };
 }
@@ -41,7 +37,7 @@ test('P2-1B sends one stateless strict Responses call with external credentials 
       expect(body).toEqual({
         model: 'gpt-5.6-terra', reasoning: { effort: 'medium' },
         instructions: 'Follow the closed response schema.', input: 'Select Save.',
-        text: { format: INTERPRETATION_RESPONSE_FORMAT }, store: false,
+        text: { format: SEMANTIC_INTENT_PRIMARY_V3_FORMAT }, store: false,
         tools: [], tool_choice: 'none', max_output_tokens: 16_384, truncation: 'disabled',
       });
       expect(JSON.stringify(body)).not.toContain(secret);
@@ -49,7 +45,7 @@ test('P2-1B sends one stateless strict Responses call with external credentials 
     }) as typeof fetch,
   });
   const signal = new AbortController().signal;
-  expect(await client.complete(request(INTERPRETATION_RESPONSE_FORMAT, signal))).toEqual({ kind: 'completed', output: wireOutput });
+  expect(await client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT, signal))).toMatchObject({ kind: 'completed', output: wireOutput });
   expect(callCount).toBe(1);
 });
 
@@ -61,18 +57,17 @@ test('P2-1B allows configured model, effort and output cap without changing sche
       expect(body.model).toBe('gpt-5.6-sol');
       expect(body.reasoning).toEqual({ effort: 'high' });
       expect(body.max_output_tokens).toBe(2_048);
-      expect(body.text).toEqual({ format: STEP_DECISION_RESPONSE_FORMAT });
+      expect(body.text).toEqual({ format: SEMANTIC_INTENT_FIDELITY_V3_FORMAT });
       expect(body.tools).toEqual([]);
       expect(body.tool_choice).toBe('none');
       return completed(JSON.stringify({ response: { kind: 'find', text: 'Save' } }));
     }) as typeof fetch,
   });
-  expect((await client.complete(request(STEP_DECISION_RESPONSE_FORMAT))).kind).toBe('completed');
+  expect((await client.complete(request(SEMANTIC_INTENT_FIDELITY_V3_FORMAT))).kind).toBe('completed');
 });
 
-test('goal-directed interpretation and verification use only their reviewed structured formats', async () => {
-  const formats = [AGENTIC_INTERPRETATION_RESPONSE_FORMAT,
-    AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT] as const;
+test('retained interpretation and verification use only their reviewed structured formats', async () => {
+  const formats = [SEMANTIC_INTENT_PRIMARY_V3_FORMAT, SEMANTIC_INTENT_FIDELITY_V3_FORMAT] as const;
   const seen: unknown[] = [];
   const client = createOpenAIResponsesClient({ apiKey: () => 'test-secret',
     fetchImpl: (async (_url, init) => {
@@ -83,18 +78,18 @@ test('goal-directed interpretation and verification use only their reviewed stru
       return completed();
     }) as typeof fetch });
   for (const format of formats) {
-    expect(await client.complete(request(format))).toEqual({ kind: 'completed', output: wireOutput });
+    expect(await client.complete(request(format))).toMatchObject({ kind: 'completed', output: wireOutput });
   }
   expect(seen).toEqual(formats);
 });
 
-test('goal-directed interpretation failures retain their interpretation diagnostic stage', async () => {
+test('retained interpretation failures retain their interpretation diagnostic stage', async () => {
   const events: OpenAIResponseDiagnostic[] = [];
   const client = createOpenAIResponsesClient({ apiKey: () => 'test-secret',
     diagnostic: (event) => events.push(event),
     fetchImpl: (async () => new Response('', { status: 429 })) as typeof fetch });
-  expect(await client.complete(request(AGENTIC_INTERPRETATION_RESPONSE_FORMAT)))
-    .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR' });
+  expect(await client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT)))
+    .toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR' });
   expect(events).toHaveLength(1);
   expect(events[0]).toMatchObject({ stage: 'interpretation', code: 'PROVIDER_ERROR',
     source: 'http_status', httpStatus: 429 });
@@ -110,13 +105,13 @@ test('P2-1B propagates cancellation and resolves a hung transport as a stable ti
       return new Promise<Response>(() => undefined);
     }) as typeof fetch,
   });
-  const pending = client.complete(request(INTERPRETATION_RESPONSE_FORMAT, controller.signal));
+  const pending = client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT, controller.signal));
   await Promise.resolve();
   expect(observedSignal).toBe(controller.signal);
   controller.abort();
-  expect(await pending).toEqual({ kind: 'failure', code: 'PROVIDER_TIMEOUT' });
-  expect(await client.complete(request(INTERPRETATION_RESPONSE_FORMAT, controller.signal)))
-    .toEqual({ kind: 'failure', code: 'PROVIDER_TIMEOUT' });
+  expect(await pending).toMatchObject({ kind: 'failure', code: 'PROVIDER_TIMEOUT' });
+  expect(await client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT, controller.signal)))
+    .toMatchObject({ kind: 'failure', code: 'PROVIDER_TIMEOUT' });
 });
 
 test('P2-1B returns sanitized failures for refusal, incomplete, missing, tool, malformed, and HTTP responses', async () => {
@@ -132,7 +127,7 @@ test('P2-1B returns sanitized failures for refusal, incomplete, missing, tool, m
     let calls = 0;
     const client = createOpenAIResponsesClient({ apiKey: () => 'secret',
       fetchImpl: (async () => { calls++; return response; }) as typeof fetch });
-    expect(await client.complete(request())).toEqual({ kind: 'failure', code });
+    expect(await client.complete(request())).toMatchObject({ kind: 'failure', code });
     expect(calls).toBe(1);
   }
 });
@@ -141,23 +136,23 @@ test('P2-1B bounds input, output text, and response bytes before application use
   let calls = 0;
   const client = createOpenAIResponsesClient({ apiKey: () => 'secret', maxOutputChars: 40,
     fetchImpl: (async () => { calls++; return completed(JSON.stringify({ response: { kind: 'find', text: 'x'.repeat(50) } })); }) as typeof fetch });
-  expect(await client.complete(request())).toEqual({ kind: 'failure', code: 'PROVIDER_RESPONSE_TOO_LARGE' });
+  expect(await client.complete(request())).toMatchObject({ kind: 'failure', code: 'PROVIDER_RESPONSE_TOO_LARGE' });
   expect(await client.complete({ ...request(), input: 'x'.repeat(32_769) }))
-    .toEqual({ kind: 'failure', code: 'PROVIDER_INPUT_INVALID' });
+    .toMatchObject({ kind: 'failure', code: 'PROVIDER_INPUT_INVALID' });
   expect(calls).toBe(1);
   const oversized = createOpenAIResponsesClient({ apiKey: () => 'secret',
     fetchImpl: (async () => new Response('x'.repeat(262_145), { status: 200 })) as typeof fetch });
-  expect(await oversized.complete(request())).toEqual({ kind: 'failure', code: 'PROVIDER_RESPONSE_TOO_LARGE' });
+  expect(await oversized.complete(request())).toMatchObject({ kind: 'failure', code: 'PROVIDER_RESPONSE_TOO_LARGE' });
 });
 
 test('P2-1B does not transmit without a credential or accepted format', async () => {
   let calls = 0;
   const client = createOpenAIResponsesClient({ apiKey: () => undefined,
     fetchImpl: (async () => { calls++; return completed(); }) as typeof fetch });
-  expect(await client.complete(request())).toEqual({ kind: 'failure', code: 'PROVIDER_CONFIGURATION_ERROR' });
+  expect(await client.complete(request())).toMatchObject({ kind: 'failure', code: 'PROVIDER_CONFIGURATION_ERROR' });
   expect(calls).toBe(0);
   expect(await client.complete({ ...request(), format: { type: 'json_schema', name: 'unapproved' } as never }))
-    .toEqual({ kind: 'failure', code: 'PROVIDER_INPUT_INVALID' });
+    .toMatchObject({ kind: 'failure', code: 'PROVIDER_INPUT_INVALID' });
   expect(() => createOpenAIResponsesClient({ apiKey: () => 'secret', reasoningEffort: 'unsupported' as never })).toThrow();
 });
 
@@ -167,7 +162,7 @@ test('opt-in provider diagnostics distinguish HTTP rejection without exposing re
   const client = createOpenAIResponsesClient({ apiKey: () => secret, diagnostic: (event) => events.push(event),
     fetchImpl: (async () => new Response(`private body ${secret}`, { status: 401,
       headers: { 'x-request-id': 'req_1234567890abcdef', 'x-private': secret } })) as typeof fetch });
-  expect(await client.complete(request())).toEqual({ kind: 'failure', code: 'PROVIDER_ERROR' });
+  expect(await client.complete(request())).toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR' });
   expect(events).toHaveLength(1);
   expect(events[0]).toMatchObject({ kind: 'provider_failure', stage: 'interpretation',
     code: 'PROVIDER_ERROR', source: 'http_status', httpStatus: 401 });
@@ -181,9 +176,9 @@ test('provider diagnostics classify a transport exception with a closed code and
   const client = createOpenAIResponsesClient({ apiKey: () => 'secret',
     diagnostic: (event) => events.push(event),
     fetchImpl: (async () => { throw new TypeError('private endpoint text', { cause: { code: 'EACCES' } }); }) as typeof fetch });
-  expect(await client.complete(request(STEP_DECISION_RESPONSE_FORMAT)))
-    .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR' });
-  expect(events[0]).toMatchObject({ stage: 'step_decision', code: 'PROVIDER_ERROR',
+  expect(await client.complete(request(SEMANTIC_INTENT_FIDELITY_V3_FORMAT)))
+    .toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR' });
+  expect(events[0]).toMatchObject({ stage: 'interpretation', code: 'PROVIDER_ERROR',
     source: 'transport_exception', transportCode: 'EACCES' });
   expect(JSON.stringify(events)).not.toContain('private endpoint text');
 
@@ -191,7 +186,7 @@ test('provider diagnostics classify a transport exception with a closed code and
     diagnostic: () => { throw new Error('logging failed'); },
     fetchImpl: (async () => new Response('private body', { status: 429,
       headers: { 'x-request-id': 'private header with spaces' } })) as typeof fetch });
-  expect(await ignored.complete(request())).toEqual({ kind: 'failure', code: 'PROVIDER_ERROR' });
+  expect(await ignored.complete(request())).toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR' });
 });
 
 test('provider diagnostics do not emit on a successful structured response', async () => {
@@ -241,11 +236,11 @@ test('live provider HTTP errors record only bounded known envelope fields with b
   const model = `debug-${randomUUID()}`;
   const secret = 'test-api-key-never-persist';
   const cases = [
-    { status: 400, format: POC_PRIMARY_RESPONSE_FORMAT, error: { type: 'invalid_request_error', code: 'invalid_schema',
+    { status: 400, format: SEMANTIC_INTENT_PRIMARY_V3_FORMAT, error: { type: 'invalid_request_error', code: 'invalid_schema',
       param: 'text.format', message: 'Invalid JSON schema' } },
-    { status: 401, format: POC_FIDELITY_RESPONSE_FORMAT, error: { type: 'authentication_error', code: 'invalid_api_key',
+    { status: 401, format: SEMANTIC_INTENT_FIDELITY_V3_FORMAT, error: { type: 'authentication_error', code: 'invalid_api_key',
       param: null, message: `Authorization: Bearer ${secret}` } },
-    { status: 429, format: POC_FIDELITY_RESPONSE_FORMAT, error: { type: 'rate_limit_error', code: 'rate_limit_exceeded',
+    { status: 429, format: SEMANTIC_INTENT_FIDELITY_V3_FORMAT, error: { type: 'rate_limit_error', code: 'rate_limit_exceeded',
       param: null, message: 'Rate limit reached' } },
   ] as const;
   try {
@@ -253,8 +248,8 @@ test('live provider HTTP errors record only bounded known envelope fields with b
       const client = createOpenAIResponsesClient({ apiKey: () => secret, model,
         fetchImpl: (async () => new Response(JSON.stringify({ error: cases[0]!.error }),
           { status: 400, headers: { 'Set-Cookie': `private=${secret}` } })) as typeof fetch });
-      expect(await withLiveDebugFlags(live, debug, () => client.complete(request(POC_PRIMARY_RESPONSE_FORMAT))))
-        .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+      expect(await withLiveDebugFlags(live, debug, () => client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT))))
+        .toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
       expect(ownedProviderErrorArtifacts(model)).toEqual([]);
     }
     await withLiveDebugFlags('1', '1', async () => {
@@ -266,7 +261,7 @@ test('live provider HTTP errors record only bounded known envelope fields with b
             private_body: secret }), { status: sample.status,
             headers: { Authorization: `Bearer ${secret}`, Cookie: 'private-cookie' } })) as typeof fetch });
         expect(await client.complete(request(sample.format)))
-          .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+          .toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
         expect(events).toMatchObject([{ kind: 'provider_failure', source: 'http_status',
           code: 'PROVIDER_ERROR', httpStatus: sample.status }]);
         expect(JSON.stringify(events)).not.toContain('invalid_schema');
@@ -295,7 +290,7 @@ test('live provider HTTP errors record only bounded known envelope fields with b
   } finally { cleanupOwnedProviderErrorArtifacts(model); }
 });
 
-test('non-JSON 5xx body is never persisted and PoC public failure mapping remains unchanged', async () => {
+test('non-JSON 5xx body is never persisted and semantic public failure mapping remains unchanged', async () => {
   const model = `debug-${randomUUID()}`;
   const secret = 'test-api-key-never-persist';
   try {
@@ -303,9 +298,9 @@ test('non-JSON 5xx body is never persisted and PoC public failure mapping remain
       const config = { apiKey: () => secret, model,
         fetchImpl: (async () => new Response(`private raw body ${secret}`, { status: 503 })) as typeof fetch };
       const client = createOpenAIResponsesClient(config);
-      expect(await client.complete(request(POC_PRIMARY_RESPONSE_FORMAT)))
-        .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
-      const adapter = createOpenAIPocSemanticModels(config);
+      expect(await client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT)))
+        .toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+      const adapter = createOpenAISemanticIntentModelsV3(config);
       await expect(adapter.primary.complete({ systemInstruction: 'Test instruction',
         userInstruction: 'Select Save.', signal: new AbortController().signal }))
         .rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
@@ -315,7 +310,7 @@ test('non-JSON 5xx body is never persisted and PoC public failure mapping remain
     for (const path of artifacts) {
       const diagnostic = JSON.parse(readFileSync(resolve(path, 'provider-error.json'), 'utf8'));
       expect(diagnostic).toMatchObject({ source: 'http_status', httpStatus: 503,
-        responseFormat: POC_PRIMARY_RESPONSE_FORMAT.name, model, providerResponseState: 'unavailable' });
+        responseFormat: SEMANTIC_INTENT_PRIMARY_V3_FORMAT.name, model, providerResponseState: 'unavailable' });
       expect(diagnostic).not.toHaveProperty('error');
       expect(JSON.stringify(diagnostic)).not.toContain(secret);
       expect(JSON.stringify(diagnostic)).not.toContain('private raw body');
@@ -330,8 +325,8 @@ test('completed HTTP response with provider error records its closed state witho
       fetchImpl: (async () => new Response(JSON.stringify({ status: 'failed',
         error: { type: 'server_error', code: 'model_error', param: null, message: 'Generation failed' },
         output: [] }), { status: 200 })) as typeof fetch });
-    expect(await withLiveDebugFlags('1', '1', () => client.complete(request(POC_PRIMARY_RESPONSE_FORMAT))))
-      .toEqual({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
+    expect(await withLiveDebugFlags('1', '1', () => client.complete(request(SEMANTIC_INTENT_PRIMARY_V3_FORMAT))))
+      .toMatchObject({ kind: 'failure', code: 'PROVIDER_ERROR', providerResponseState: 'unavailable' });
     const [path] = ownedProviderErrorArtifacts(model);
     expect(path).toBeTruthy();
     expect(JSON.parse(readFileSync(resolve(path!, 'provider-error.json'), 'utf8'))).toMatchObject({

@@ -1,3 +1,2 @@
-export * from './contracts.js';
-export * from './workflow.js';
-export * from './command.js';
+export * from './product-contracts.js';
+export * from './workflow-error.js';

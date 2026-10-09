@@ -1,20 +1,15 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import net from 'node:net';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { ProfileCatalog } from '../app/profile/contracts.js';
-import { ProtectedContextFactory } from '../app/profile/context.js';
-import { IsolatedBrowser } from '../app/profile/isolated-browser.js';
-import { DeferredFrameNoticeSchema, DeferredViewerLifecycle, type DeferredFrameNotice } from
-  '../app/observability/deferred-viewer-channel.js';
+import { NativeProfileCatalog } from '../app/profile/native-profile.js';
+import { ProtectedContextFactory } from '../app/profile/local-context.js';
+import { LocalFrameNoticeSchema, LocalFrameViewerLifecycle, type LocalFrameNotice } from
+  '../app/observability/local-frame-channel.js';
 import { DeferredBrowserDiagnosticCollector } from '../app/domain/deferred-browser-diagnostics.js';
-import { DeferredWorkflowStopStoreV1 } from '../app/evidence/deferred-workflow-store.js';
 
 test.describe.configure({ mode: 'serial' });
 
-const keys = ['PLAYWRIGHT_DEMO_BROWSER_BACKEND', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT',
+const keys = ['PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT',
   'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_STREAM_ID', 'PLAYWRIGHT_DEMO_DEFERRED_VIEWER_CAPABILITY'] as const;
 const profile = { id: 'local-frame-fixture', version: '1', profileSchemaVersion: '5' as const,
   browserIsolation: 'local-windows' as const, browserRuntime: 'playwright-chromium-windows' as const,
@@ -25,7 +20,7 @@ const ref = { id: profile.id, version: profile.version };
 
 async function channelFixture() {
   const streamId = randomUUID(), capability = randomBytes(32).toString('hex');
-  const notices: DeferredFrameNotice[] = [];
+  const notices: LocalFrameNotice[] = [];
   let error: unknown;
   const sockets = new Set<net.Socket>();
   const server = net.createServer(socket => {
@@ -42,7 +37,7 @@ async function channelFixture() {
             expect(value).toEqual({ deferredViewerVersion: '1', kind: 'hello', streamId, capability });
             greeted = true;
             socket.write(JSON.stringify({ deferredViewerVersion: '1', kind: 'ready', streamId }) + '\n');
-          } else notices.push(DeferredFrameNoticeSchema.parse(value));
+          } else notices.push(LocalFrameNoticeSchema.parse(value));
         } catch (caught) { error = caught; socket.destroy(); }
       }
     });
@@ -70,16 +65,13 @@ async function until(condition: () => boolean): Promise<void> {
 test('local frame stream uses owned pages, clears phase ownership and never opens Docker or RFB', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
-  const originalDocker = IsolatedBrowser.open;
-  IsolatedBrowser.open = async () => { throw new Error('Docker path reached'); };
-  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
   const wire = await channelFixture();
   const diagnostics = new DeferredBrowserDiagnosticCollector();
-  let lifecycle: DeferredViewerLifecycle | undefined;
+  let lifecycle: LocalFrameViewerLifecycle | undefined;
   const sessions: Awaited<ReturnType<ProtectedContextFactory['open']>>[] = [];
   try {
-    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-    const factory = new ProtectedContextFactory(new ProfileCatalog([profile], []));
+    lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+    const factory = new ProtectedContextFactory(new NativeProfileCatalog([profile]));
     const first = await factory.open(ref); sessions.push(first);
     await lifecycle.open(first, 'exploration', 'exploration-one');
     await until(() => diagnostics.snapshot().some(event => event.operation === 'capture' &&
@@ -139,7 +131,6 @@ test('local frame stream uses owned pages, clears phase ownership and never open
     lifecycle?.close();
     await Promise.allSettled(sessions.map(session => session.close()));
     await wire.close();
-    IsolatedBrowser.open = originalDocker;
     keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
   }
 });
@@ -147,16 +138,13 @@ test('local frame stream uses owned pages, clears phase ownership and never open
 test('capture failure marks only the local viewer unavailable while its browser stays usable', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
-  const originalDocker = IsolatedBrowser.open;
-  IsolatedBrowser.open = async () => { throw new Error('Docker path reached'); };
-  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
   const wire = await channelFixture();
   const diagnostics = new DeferredBrowserDiagnosticCollector();
-  let lifecycle: DeferredViewerLifecycle | undefined;
+  let lifecycle: LocalFrameViewerLifecycle | undefined;
   let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
   try {
-    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-    session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+    lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+    session = await new ProtectedContextFactory(new NativeProfileCatalog([profile])).open(ref);
     await lifecycle.open(session, 'exploration', 'exploration-one');
     const page = await session.context.newPage();
     await page.goto('data:text/html,<title>capture-fails</title>');
@@ -173,7 +161,6 @@ test('capture failure marks only the local viewer unavailable while its browser 
     expect(diagnostics.snapshot().some(event => event.operation === 'channel_loss')).toBe(false);
   } finally {
     lifecycle?.close(); await session?.close(); await wire.close();
-    IsolatedBrowser.open = originalDocker;
     keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
   }
 });
@@ -181,19 +168,16 @@ test('capture failure marks only the local viewer unavailable while its browser 
 test('timed-out local frame detaches, discards late pixels, and recovers on the next cadence', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
-  const originalDocker = IsolatedBrowser.open;
-  IsolatedBrowser.open = async () => { throw new Error('Docker path reached'); };
-  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
   const wire = await channelFixture();
   const diagnostics = new DeferredBrowserDiagnosticCollector();
-  let lifecycle: DeferredViewerLifecycle | undefined;
+  let lifecycle: LocalFrameViewerLifecycle | undefined;
   let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
   let resolveScreenshot!: (value: { data: string }) => void;
   const screenshot = new Promise<{ data: string }>(resolve => { resolveScreenshot = resolve; });
   let sessionsCreated = 0, detachCalls = 0;
   try {
-    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-    session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+    lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+    session = await new ProtectedContextFactory(new NativeProfileCatalog([profile])).open(ref);
     await lifecycle.open(session, 'exploration', 'exploration-one');
     const page = await session.context.newPage();
     await page.goto('data:text/html,<main><button>Ready</button></main>');
@@ -251,7 +235,6 @@ test('timed-out local frame detaches, discards late pixels, and recovers on the 
     expect(JSON.stringify(late)).not.toContain('<button>');
   } finally {
     lifecycle?.close(); await session?.close(); await wire.close();
-    IsolatedBrowser.open = originalDocker;
     keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
   }
 });
@@ -259,14 +242,13 @@ test('timed-out local frame detaches, discards late pixels, and recovers on the 
 test('private diagnostics distinguish channel loss from screenshot failure', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
-  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
   const wire = await channelFixture();
   const diagnostics = new DeferredBrowserDiagnosticCollector();
-  let lifecycle: DeferredViewerLifecycle | undefined;
+  let lifecycle: LocalFrameViewerLifecycle | undefined;
   let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
   try {
-    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-    session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+    lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+    session = await new ProtectedContextFactory(new NativeProfileCatalog([profile])).open(ref);
     await lifecycle.open(session, 'exploration', 'exploration-one');
     await session.context.newPage();
     await wire.close();
@@ -284,13 +266,12 @@ test('private diagnostics distinguish channel loss from screenshot failure', asy
 test('document replacement during capture skips stale pixels and later captures the new page', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
-  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
   const wire = await channelFixture(), diagnostics = new DeferredBrowserDiagnosticCollector();
-  let lifecycle: DeferredViewerLifecycle | undefined;
+  let lifecycle: LocalFrameViewerLifecycle | undefined;
   let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
   try {
-    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-    session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+    lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+    session = await new ProtectedContextFactory(new NativeProfileCatalog([profile])).open(ref);
     await lifecycle.open(session, 'exploration', 'exploration-one');
     const page = await session.context.newPage();
     await page.goto('data:text/html,<main>First document</main>');
@@ -325,13 +306,12 @@ for (const ending of ['browser', 'context'] as const) {
   test(`${ending} closure remains a terminal local viewer failure`, async () => {
     test.skip(process.platform !== 'win32', 'Windows process boundary');
     const old = keys.map(key => process.env[key]);
-    process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
     const wire = await channelFixture(), diagnostics = new DeferredBrowserDiagnosticCollector();
-    let lifecycle: DeferredViewerLifecycle | undefined;
+    let lifecycle: LocalFrameViewerLifecycle | undefined;
     let session: Awaited<ReturnType<ProtectedContextFactory['open']>> | undefined;
     try {
-      lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-      session = await new ProtectedContextFactory(new ProfileCatalog([profile], [])).open(ref);
+      lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+      session = await new ProtectedContextFactory(new NativeProfileCatalog([profile])).open(ref);
       await lifecycle.open(session, 'exploration', 'exploration-one');
       await session.context.newPage();
       if (ending === 'browser') await session.context.browser()!.close();
@@ -349,13 +329,12 @@ for (const ending of ['browser', 'context'] as const) {
 test('owner transition discards a late prior-owner frame', async () => {
   test.skip(process.platform !== 'win32', 'Windows process boundary');
   const old = keys.map(key => process.env[key]);
-  process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND = 'local-windows';
   const wire = await channelFixture(), diagnostics = new DeferredBrowserDiagnosticCollector();
-  let lifecycle: DeferredViewerLifecycle | undefined;
+  let lifecycle: LocalFrameViewerLifecycle | undefined;
   const sessions: Awaited<ReturnType<ProtectedContextFactory['open']>>[] = [];
   try {
-    lifecycle = await DeferredViewerLifecycle.connect('local-test', 'frame_stream', diagnostics.record);
-    const factory = new ProtectedContextFactory(new ProfileCatalog([profile], []));
+    lifecycle = await LocalFrameViewerLifecycle.connect('local-test', diagnostics.record);
+    const factory = new ProtectedContextFactory(new NativeProfileCatalog([profile]));
     const first = await factory.open(ref); sessions.push(first);
     await lifecycle.open(first, 'exploration', 'exploration-one');
     const page = await first.context.newPage();
@@ -381,28 +360,4 @@ test('owner transition discards a late prior-owner frame', async () => {
     lifecycle?.close(); await Promise.allSettled(sessions.map(session => session.close())); await wire.close();
     keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
   }
-});
-
-test('browser diagnostics are bounded, authenticated, and contain metadata only', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'deferred-browser-diagnostic-'));
-  try {
-    const collector = new DeferredBrowserDiagnosticCollector();
-    const event = { diagnosticVersion: '1' as const, source: 'viewer' as const, operation: 'capture' as const,
-      phase: 'exploration' as const, ownerId: 'exploration-one', startedAtMs: 1, endedAtMs: 2,
-      elapsedMs: 1, outcome: 'success' as const, page: 'open' as const, context: 'open' as const,
-      browser: 'connected' as const };
-    for (let i = 0; i < 820; i++) collector.record({ ...event, attemptOrdinal: i });
-    expect(collector.snapshot()).toHaveLength(800);
-    expect(collector.snapshot()[0]?.attemptOrdinal).toBe(0);
-    expect(collector.snapshot().at(-1)?.attemptOrdinal).toBe(819);
-    const store = new DeferredWorkflowStopStoreV1(root);
-    await store.writeBrowserDiagnostics('local-test', collector.snapshot());
-    expect(await store.readBrowserDiagnostics('local-test')).toEqual(collector.snapshot());
-    const file = path.join(root, 'deferred-browser-diagnostics-v1', 'local-test', 'browser.json');
-    const bytes = await readFile(file, 'utf8');
-    expect(bytes).not.toContain('imageBase64');
-    expect(bytes).not.toContain('<body>');
-    await writeFile(file, bytes.replace('"attemptOrdinal":819', '"attemptOrdinal":818'));
-    await expect(store.readBrowserDiagnostics('local-test')).rejects.toThrow('authentication mismatch');
-  } finally { await rm(root, { recursive: true, force: true }); }
 });

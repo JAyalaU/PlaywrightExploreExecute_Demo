@@ -4,7 +4,8 @@ import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { ProtectedContextFactory, ProfileCatalog } from '../app/profile/index.js';
+import { ProtectedContextFactory } from '../app/profile/local-context.js';
+import { NativeProfileCatalog } from '../app/profile/native-profile.js';
 import { McpExplorationSession } from '../app/exploration/mcp.js';
 import { admitSemanticIntentV3, type SemanticIntentStepV3 } from '../app/domain/semantic-intent-v3.js';
 import { SemanticGroundingSessionV1 } from '../app/exploration/semantic-grounding-v1.js';
@@ -16,8 +17,10 @@ import { runSemanticTwoFreshReplaysV2, requireTrustedSemanticReplayV2 } from '..
 import { SemanticReplayV2Store, requireTrustedSemanticReplayReadbackV2 } from '../app/evidence/semantic-replay-store-v2.js';
 import { deriveSemanticAgreementV2, parseSemanticReplayPairV2 } from '../app/domain/semantic-runner-v10.js';
 import { parseSemanticResolvedTestSpecV10 } from '../app/domain/semantic-resolved-v10.js';
-import { requireTrustedResolvedTestReadbackV9 } from '../app/evidence/deferred-compiler-store-v4.js';
 import { runSemanticGeneralizedOptInV1 } from '../app/interpretation/semantic-general-production-v1.js';
+import { runSemanticResolvedTestV10, requireTrustedSemanticRunV10 } from '../app/runner/semantic-v10.js';
+import { semanticRunSignatureV10 } from '../app/domain/semantic-runner-v10.js';
+import { SemanticRunnerDiagnosticsV10Store } from '../app/runner/semantic-v10-diagnostics.js';
 
 type Target = Extract<SemanticIntentStepV3, { type: 'action_intent' }>['target'];
 const target = (category: string, exactName: string | null = null, ordinal: number | null = null,
@@ -37,7 +40,7 @@ const nav = (url: string): SemanticIntentStepV3 => ({ id: 'nav', type: 'navigate
 
 async function fixture(html: string, stepsFor: (root: string) => SemanticIntentStepV3[],
   options: { replayHtml?: string; onRunStart?: (ordinal: 1 | 2, setHtml: (value: string) => void) => void;
-    beforeReplay?: (factory: ProtectedContextFactory) => void } = {}) {
+    beforeReplay?: (factory: ProtectedContextFactory) => void; diagnostics?: boolean } = {}) {
   let servedHtml = html;
   const server = http.createServer((request, response) => {
     response.setHeader('content-type', 'text/html');
@@ -52,12 +55,12 @@ async function fixture(html: string, stepsFor: (root: string) => SemanticIntentS
   const admission = admitSemanticIntentV3(source, { ...source, schemaVersion: '7', sourceContractVersion: '3',
     semanticMode: 'intent_v2', normalizationVersion: 'semantic_intent_normalization_v2',
     steps: stepsFor(root) }, { verdict: 'faithful', issues: [] });
-  const factory = new ProtectedContextFactory(new ProfileCatalog([{
+  const factory = new ProtectedContextFactory(new NativeProfileCatalog([{
     id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 }, locale: 'en-US',
     timeoutPolicy: { actionMs: 1500, navigationMs: 3000, waits: { default: 1500 } },
-    networkPolicyRef: { id: 'local', version: '1' },
-  }], [{ id: 'local', version: '1', destinations: [{ host: '127.0.0.1', ports: [address.port],
-    addresses: ['127.0.0.1'] }] }]));
+    profileSchemaVersion: '5', browserIsolation: 'local-windows',
+    browserRuntime: 'playwright-chromium-windows', presentationMode: 'headless',
+  }]));
   const artifactRoot = await mkdtemp(path.join(os.tmpdir(), 'semantic-v10-'));
   let session: McpExplorationSession | undefined;
   const close = async () => {
@@ -98,7 +101,8 @@ async function fixture(html: string, stepsFor: (root: string) => SemanticIntentS
     if (options.replayHtml !== undefined) servedHtml = options.replayHtml;
     options.beforeReplay?.(factory);
     const replay = await runSemanticTwoFreshReplaysV2(factory, readback,
-      ordinal => options.onRunStart?.(ordinal, value => { servedHtml = value; }));
+      ordinal => options.onRunStart?.(ordinal, value => { servedHtml = value; }),
+      options.diagnostics ? artifactRoot : undefined);
     const pair = requireTrustedSemanticReplayV2(replay);
     const replayStore = new SemanticReplayV2Store(artifactRoot);
     const replayReadback = await replayStore.writeReplayV2(replay, readback);
@@ -110,6 +114,109 @@ async function fixture(html: string, stepsFor: (root: string) => SemanticIntentS
 
 const addRemoveHtml = `<button onclick="let b=document.createElement('button');b.textContent='Delete';
   b.onclick=()=>b.remove();document.body.append(b)">Add Element</button>`;
+
+async function withActionPause<T>(raw: string, run: () => Promise<T>): Promise<T> {
+  const before = process.env.PLAYWRIGHT_DEMO_ACTION_PAUSE_MS;
+  process.env.PLAYWRIGHT_DEMO_ACTION_PAUSE_MS = raw;
+  try { return await run(); }
+  finally {
+    if (before === undefined) delete process.env.PLAYWRIGHT_DEMO_ACTION_PAUSE_MS;
+    else process.env.PLAYWRIGHT_DEMO_ACTION_PAUSE_MS = before;
+  }
+}
+
+test('v10 presentation pause follows only successful actions and preserves evidence and agreement', async () => {
+  const f = await withActionPause('0', () => fixture('<input type="checkbox"><input type="checkbox" checked>',
+    root => [nav(root), action('check1', target('checkbox', null, 1), 'set_checked', null, true),
+      verify('checked1', target('checkbox', null, 1), 'checked', true, 'check1'),
+      action('uncheck2', target('checkbox', null, 2), 'set_checked', null, false),
+      verify('checked2', target('checkbox', null, 2), 'checked', false, 'uncheck2')]));
+  try {
+    let now = 0;
+    const waits: number[] = [];
+    const clock = { now: () => now, wait: async (ms: number) => { waits.push(ms); now += ms; } };
+    const paced = await withActionPause('750', async () => requireTrustedSemanticRunV10(
+      await runSemanticResolvedTestV10(f.factory, f.readback, clock)));
+    expect(waits).toEqual([750, 750]);
+    expect(paced.result).toEqual(f.pair.runs[0]!.result);
+    expect(paced.steps).toEqual(f.pair.runs[0]!.steps);
+    expect(paced.steps.map(step => step.evidenceDigest)).toEqual(
+      f.pair.runs[0]!.steps.map(step => step.evidenceDigest));
+    expect(semanticRunSignatureV10(paced)).toBe(semanticRunSignatureV10(f.pair.runs[0]!));
+    expect(deriveSemanticAgreementV2([f.pair.runs[0]!, paced])).toEqual({
+      agreement: 'agreed', terminal: 'QA_PASS' });
+  } finally { await f.close(); }
+});
+
+test('v10 failed action has no presentation pause', async () => {
+  const f = await withActionPause('0', () => fixture('<button>Target</button>', root => [nav(root),
+    action('click', target('button', 'Target'), 'activate')], { replayHtml: '<button>Different</button>' }));
+  try {
+    const waits: number[] = [];
+    const clock = { now: () => 0, wait: async (ms: number) => { waits.push(ms); } };
+    const stopped = await withActionPause('750', async () => requireTrustedSemanticRunV10(
+      await runSemanticResolvedTestV10(f.factory, f.readback, clock)));
+    expect(stopped.result.kind).toBe('non_qa_stop');
+    expect(stopped.steps.at(-1)?.status).toBe('stopped');
+    expect(waits).toEqual([]);
+  } finally { await f.close(); }
+});
+
+test('v10 resulting-state settling remains active with a controlled presentation clock', async () => {
+  const html = `<div id="box"><input type="checkbox"></div>
+    <button onclick="setTimeout(()=>document.querySelector('#box').innerHTML='',60)">Remove</button>
+    <button onclick="setTimeout(()=>document.querySelector('#box').innerHTML='<input type=checkbox>',60)">Add</button>`;
+  const f = await withActionPause('0', () => fixture(html, root => [nav(root),
+    action('remove', target('button', 'Remove'), 'activate'),
+    verify('gone', target('checkbox'), 'exists', false, 'remove'),
+    action('add', target('button', 'Add'), 'activate'),
+    verify('back', target('checkbox'), 'exists', true, 'add')]));
+  try {
+    let virtualNow = 0;
+    const waits: number[] = [];
+    const clock = { now: () => virtualNow, wait: async (ms: number) => {
+      waits.push(ms); virtualNow += ms;
+    } };
+    const paced = await withActionPause('750', async () => requireTrustedSemanticRunV10(
+      await runSemanticResolvedTestV10(f.factory, f.readback, clock)));
+    expect(waits).toEqual([750, 750]);
+    expect(paced.result).toEqual({ kind: 'completed', assertions: 2, passed: true });
+    expect(paced.steps.filter(s => s.status === 'assertion_true').map(s => s.observation)).toEqual([0, 1]);
+    expect(deriveSemanticAgreementV2([f.pair.runs[0]!, paced])).toEqual({
+      agreement: 'agreed', terminal: 'QA_PASS' });
+  } finally { await f.close(); }
+});
+
+test('v10 post-click pause follows document readiness and next assertion keeps its own readiness', async () => {
+  let runningPage: import('@playwright/test').Page | undefined;
+  const html = `<a href="/case">Go</a><button>Ready</button>
+    <script>const until=Date.now()+60;while(Date.now()<until){}</script>`;
+  const f = await withActionPause('0', () => fixture(html, root => [nav(root),
+    action('go', target('link', 'Go'), 'activate'),
+    verify('ready', target('button', 'Ready'), 'exists', true, 'go')], {
+      beforeReplay: factory => {
+        const originalOpen = factory.open.bind(factory);
+        factory.open = async (...args) => {
+          const session = await originalOpen(...args);
+          session.context.on('page', page => { runningPage = page; });
+          return session;
+        };
+      },
+    }));
+  try {
+    const observed: Array<{ url: string; state: string }> = [];
+    const clock = { now: () => 0, wait: async (_ms: number) => {
+      const page = runningPage;
+      expect(page).toBeDefined();
+      observed.push({ url: page!.url(), state: await page!.evaluate(() => document.readyState) });
+    } };
+    const paced = await withActionPause('750', async () => requireTrustedSemanticRunV10(
+      await runSemanticResolvedTestV10(f.factory, f.readback, clock)));
+    expect(observed).toEqual([{ url: `${f.root}case`, state: 'complete' }]);
+    expect(paced.result).toEqual({ kind: 'completed', assertions: 1, passed: true });
+    expect(paced.steps.at(-1)?.status).toBe('assertion_true');
+  } finally { await f.close(); }
+});
 test('v10 Dropdown reaches two agreeing deterministic true replays', async () => {
   const f = await fixture('<select><option value="">Please select</option><option value="1">Option 1</option></select>',
     root => [nav(root), action('open', target('link', 'Dropdown'), 'activate'),
@@ -139,6 +246,182 @@ test('v10 repeated Delete uses authored created-by relation and count two then o
   try { expect(f.pair.terminal).toBe('QA_PASS'); expect(f.pair.runs).toHaveLength(2);
     expect(f.pair.runs[0]?.steps.find(s => s.stepId === 'two')?.observation).toBe(2);
     expect(f.pair.runs[0]?.steps.find(s => s.stepId === 'one')?.observation).toBe(1);
+  } finally { await f.close(); }
+});
+
+test('v10 private click and count diagnostics preserve repeated-control receipts and agreement', async () => {
+  const f = await fixture(addRemoveHtml, root => [nav(root),
+    action('add1', target('button', 'Add Element'), 'activate'),
+    action('add2', target('button', 'Add Element'), 'activate'),
+    verify('two', target('button', 'Delete'), 'cardinality', 2, 'add2'),
+    action('delete_new', target('button', 'Delete', null, 'created_by_step', 'add2'), 'activate'),
+    verify('one', target('button', 'Delete'), 'cardinality', 1, 'delete_new')],
+  { diagnostics: true });
+  try {
+    expect(f.pair.terminal).toBe('QA_PASS');
+    expect(f.pair.runs).toHaveLength(2);
+    const store = new SemanticRunnerDiagnosticsV10Store(f.artifactRoot);
+    for (const run of f.pair.runs) {
+      const privateRecord = await store.readByRunId(run.executionRunId);
+      expect(privateRecord.executionRunId).toBe(run.executionRunId);
+      expect(privateRecord.clicks.filter(item => item.phase === 'click_invocation_returned')).toHaveLength(3);
+      expect(privateRecord.clicks.filter(item => item.phase === 'action_receipt_sealed')).toHaveLength(3);
+      expect(privateRecord.effects.find(item => item.actionStepId === 'add1')).toMatchObject({
+        assertionStepId: 'two', count: 1, error: false });
+      expect(privateRecord.effects.find(item => item.actionStepId === 'add2')).toMatchObject({
+        assertionStepId: 'two', count: 2, error: false });
+      expect(privateRecord.effects.find(item => item.actionStepId === 'delete_new')).toMatchObject({
+        assertionStepId: 'one', count: 1, error: false });
+      expect(privateRecord.counts.map(item => [item.stepId, item.initialCount,
+        item.finalCount, item.exhausted])).toEqual([['two', 2, 2, false], ['one', 1, 1, false]]);
+      expect(privateRecord.boundaries.map(item => item.stepId)).toContain('delete_new');
+      expect(run.steps.find(item => item.stepId === 'delete_new')?.status).toBe('action_succeeded');
+    }
+    expect(f.pair.agreement).toBe('agreed');
+    const plain = requireTrustedSemanticRunV10(await runSemanticResolvedTestV10(f.factory, f.readback));
+    expect(plain.steps).toEqual(f.pair.runs[0]!.steps);
+    expect(semanticRunSignatureV10(plain)).toBe(semanticRunSignatureV10(f.pair.runs[0]!));
+  } finally { await f.close(); }
+});
+
+test('v10 click timeout after guards retains private throw phase without changing stop', async () => {
+  const f = await fixture('<button>Target</button>', root => [nav(root),
+    action('click', target('button', 'Target'), 'activate')], {
+    replayHtml: `<button>Target</button><div style="position:fixed;inset:0;z-index:1000;background:transparent"></div>`,
+    diagnostics: true,
+  });
+  try {
+    expect(f.pair.terminal).toBe('NON_QA');
+    const run = f.pair.runs[0]!;
+    expect(run.result).toMatchObject({ kind: 'non_qa_stop', reason: 'ACTION_FAILED_PARTIAL_OR_UNKNOWN',
+      failedStepId: 'click' });
+    expect(run.steps.at(-1)).toMatchObject({ invocation: 'unknown', status: 'stopped' });
+    const privateRecord = await new SemanticRunnerDiagnosticsV10Store(f.artifactRoot)
+      .readByRunId(run.executionRunId);
+    expect(privateRecord.clicks.map(item => item.phase)).toEqual([
+      'guard_complete', 'click_invocation_started', 'click_invocation_threw']);
+    expect(privateRecord.clicks.at(-1)?.failure).toBe('PLAYWRIGHT_CLICK_TIMEOUT');
+    expect(JSON.stringify(privateRecord)).not.toContain('Timeout 1500ms exceeded');
+  } finally { await f.close(); }
+});
+
+test('v10 injected detached click after guards retains private category and original stop', async () => {
+  const f = await fixture('<button>Target</button>', root => [nav(root),
+    action('click', target('button', 'Target'), 'activate')], { diagnostics: true,
+    beforeReplay: factory => {
+      const open = factory.open.bind(factory);
+      factory.open = async (...args) => {
+        const session = await open(...args);
+        const newPage = session.context.newPage.bind(session.context);
+        session.context.newPage = async () => {
+          const page = await newPage();
+          const locate = page.locator.bind(page);
+          page.locator = ((...locatorArgs: Parameters<typeof page.locator>) => {
+            const locator = locate(...locatorArgs);
+            const nth = locator.nth.bind(locator);
+            locator.nth = (index: number) => {
+              const item = nth(index);
+              const elementHandle = item.elementHandle.bind(item);
+              item.elementHandle = async (...handleArgs) => {
+                const handle = await elementHandle(...handleArgs);
+                if (handle) handle.click = async () => { throw new Error('Element is detached from DOM'); };
+                return handle;
+              };
+              return item;
+            };
+            return locator;
+          }) as typeof page.locator;
+          return page;
+        };
+        return session;
+      };
+    },
+  });
+  try {
+    const run = f.pair.runs[0]!;
+    expect(run.result).toMatchObject({ kind: 'non_qa_stop', reason: 'ACTION_FAILED_PARTIAL_OR_UNKNOWN',
+      failedStepId: 'click' });
+    const privateRecord = await new SemanticRunnerDiagnosticsV10Store(f.artifactRoot)
+      .readByRunId(run.executionRunId);
+    expect(privateRecord.clicks.map(item => item.phase)).toEqual([
+      'guard_complete', 'click_invocation_started', 'click_invocation_threw']);
+    expect(privateRecord.clicks.at(-1)?.failure).toBe('TARGET_DETACHED_DURING_CLICK');
+  } finally { await f.close(); }
+});
+
+test('v10 count diagnostic records observed asynchronous 0 to 1 to 2 settling', async () => {
+  const html = `<button onclick="setTimeout(()=>{let b=document.createElement('button');b.textContent='Delete';document.body.append(b)},80);setTimeout(()=>{let b=document.createElement('button');b.textContent='Delete';document.body.append(b)},300)">Add</button>`;
+  const f = await fixture(html, root => [nav(root),
+    action('add', target('button', 'Add'), 'activate'),
+    verify('two', target('button', 'Delete'), 'cardinality', 2, 'add')], { diagnostics: true });
+  try {
+    expect(f.pair.terminal).toBe('QA_PASS');
+    const privateRecord = await new SemanticRunnerDiagnosticsV10Store(f.artifactRoot)
+      .readByRunId(f.pair.runs[0]!.executionRunId);
+    const count = privateRecord.counts.find(item => item.stepId === 'two');
+    expect(count).toMatchObject({ initialCount: 0, finalCount: 2, exhausted: false });
+    expect(count?.transitions.map(item => item.count)).toEqual([1, 2]);
+    expect(privateRecord.effects.find(item => item.actionStepId === 'add')).toMatchObject({
+      count: 0, error: false });
+  } finally { await f.close(); }
+});
+
+test('v10 click diagnostic observes document replacement without changing receipt', async () => {
+  const f = await fixture('<button>Target</button>', root => [nav(`${root}case`),
+    action('click', target('button', 'Target'), 'activate')], {
+    replayHtml: `<button onclick="location.href='/case'">Target</button>`, diagnostics: true,
+  });
+  try {
+    const run = f.pair.runs[0]!;
+    expect(run.steps.at(-1)).toMatchObject({ invocation: 'returned', status: 'action_succeeded' });
+    const privateRecord = await new SemanticRunnerDiagnosticsV10Store(f.artifactRoot)
+      .readByRunId(run.executionRunId);
+    const returned = privateRecord.clicks.find(item => item.phase === 'click_invocation_returned');
+    expect(returned?.navigationDuringClick).toBe(true);
+    expect(returned?.documentReplacedDuringClick).toBe(true);
+  } finally { await f.close(); }
+});
+
+test('v10 count diagnostic retains bounded stable-zero false result', async () => {
+  const source = `<button onclick="for(let i=0;i<2;i++){let b=document.createElement('button');b.textContent='Delete';document.body.append(b)}">Add</button>`;
+  const f = await fixture(source, root => [nav(root),
+    action('add', target('button', 'Add'), 'activate'),
+    verify('two', target('button', 'Delete'), 'cardinality', 2, 'add')],
+  { replayHtml: '<button>Add</button>', diagnostics: true });
+  try {
+    expect(f.pair.terminal).toBe('QA_FAIL');
+    const run = f.pair.runs[0]!;
+    expect(run.steps.at(-1)).toMatchObject({ status: 'assertion_false', observation: 0 });
+    const privateRecord = await new SemanticRunnerDiagnosticsV10Store(f.artifactRoot)
+      .readByRunId(run.executionRunId);
+    expect(privateRecord.counts.find(item => item.stepId === 'two')).toMatchObject({
+      initialCount: 0, transitions: [], finalCount: 0, exhausted: true });
+    expect(privateRecord.effects.find(item => item.actionStepId === 'add')).toMatchObject({
+      count: 0, error: false });
+  } finally { await f.close(); }
+});
+
+test('v10 count diagnostic correlates transient two and reload request without changing stop', async () => {
+  const source = `<button onclick="for(let i=0;i<3;i++){let b=document.createElement('button');b.textContent='Delete';document.body.append(b)}">Add</button>`;
+  const replayHtml = `<button onclick="setTimeout(()=>{for(let i=0;i<2;i++){let b=document.createElement('button');b.textContent='Delete';document.body.append(b)}},80);setTimeout(()=>location.reload(),350)">Add</button>`;
+  const f = await fixture(source, root => [nav(root),
+    action('add', target('button', 'Add'), 'activate'),
+    verify('three', target('button', 'Delete'), 'cardinality', 3, 'add')],
+  { replayHtml, diagnostics: true });
+  try {
+    const run = f.pair.runs[0]!;
+    expect(run.result).toMatchObject({ kind: 'non_qa_stop', reason: 'ENVIRONMENT_FAILURE',
+      failedStepId: 'three' });
+    const privateRecord = await new SemanticRunnerDiagnosticsV10Store(f.artifactRoot)
+      .readByRunId(run.executionRunId);
+    const observed = privateRecord.counts.find(item => item.stepId === 'three');
+    const failure = privateRecord.countFailures.find(item => item.stepId === 'three');
+    expect(observed).toMatchObject({ initialCount: 0, transitions: [{ count: 2 }],
+      finalCount: 2, interrupted: true, navigationRequestedDuringSettling: true });
+    expect(failure?.category).toBe('COUNT_SETTLING_WAIT_ERROR');
+    expect(observed!.ended.navigationRequestGeneration).toBeGreaterThan(
+      observed!.started.navigationRequestGeneration);
+    expect(observed!.documentChanged).toBe(false);
   } finally { await f.close(); }
 });
 test('v10 Checkboxes replays ordinal check and uncheck idempotently in two fresh runs', async () => {
@@ -302,15 +585,13 @@ test('v10 actual protected cleanup uncertainty stops replay non-QA', async () =>
   } finally { await f.close(); }
 });
 
-test('v10 trusted handoff rejects malformed and v9 cross-version input', async () => {
+test('v10 trusted handoff rejects malformed cross-version input', async () => {
   const f = await fixture('<button>Go</button>', root => [nav(root),
     action('go', target('button', 'Go'), 'activate')]);
   try {
     const wrong = { ...f.compiled.resolved!, schemaVersion: '9' };
     expect(() => parseSemanticResolvedTestSpecV10(wrong, f.trace)).toThrow();
     expect(() => requireTrustedSemanticResolvedReadbackV10({} as typeof f.readback)).toThrow();
-    expect(() => requireTrustedResolvedTestReadbackV9(f.readback as unknown as Parameters<
-      typeof requireTrustedResolvedTestReadbackV9>[0])).toThrow();
     const restarted = new SemanticReplayV2Store(f.artifactRoot);
     const persisted = await restarted.readReplayV2(f.compiled.resolved!.testSpecId,
       f.compiled.resolved!.resolvedSpecId, f.pair.orchestrationId, f.readback);
@@ -337,19 +618,11 @@ test('v10 trusted handoff rejects malformed and v9 cross-version input', async (
   } finally { await f.close(); }
 });
 
-test('trusted semantic-general-v1 opt-in is operator selected and leaves default route unchanged', async () => {
+test('semantic-general v10 handoff runs without a route-selection gate', async () => {
   const f = await fixture('<button>Go</button>', root => [nav(root),
     action('go', target('button', 'Go'), 'activate'),
     verify('exists', target('button', 'Go'), 'exists', true, 'go')]);
-  const previousWorkflow = process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION;
-  const previousGate = process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE;
   try {
-    delete process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION;
-    delete process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE;
-    await expect(runSemanticGeneralizedOptInV1(f.factory, f.artifactRoot,
-      f.admission, f.trace)).rejects.toThrow('SEMANTIC_GENERAL_WORKFLOW_NOT_SELECTED');
-    process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION = 'semantic-general-v1';
-    process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE = 'offline-review';
     const outcome = await runSemanticGeneralizedOptInV1(f.factory, f.artifactRoot,
       f.admission, f.trace);
     expect(outcome.kind).toBe('replayed');
@@ -366,10 +639,6 @@ test('trusted semantic-general-v1 opt-in is operator selected and leaves default
       ]));
     }
   } finally {
-    if (previousWorkflow === undefined) delete process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION;
-    else process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION = previousWorkflow;
-    if (previousGate === undefined) delete process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE;
-    else process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE = previousGate;
     await f.close();
   }
 });

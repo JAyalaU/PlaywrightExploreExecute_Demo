@@ -1,14 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import type { TrustedSemanticIntentAdmissionV3 } from '../domain/semantic-intent-v3.js';
 import { requireTrustedSemanticIntentAdmissionV3 } from '../domain/semantic-intent-v3.js';
-import { parseSemanticGroundingWitnessV1, semanticGroundingDigestV1 as hash,
-  type SemanticGroundingWitnessV1, type SemanticGroundingCandidateV1 } from '../domain/semantic-grounding-v1.js';
+import { parseSemanticGroundingWitnessV1, parseSemanticActionExecutionReceiptV1,
+  semanticGroundingDigestV1 as hash,
+  type SemanticGroundingWitnessV1, type SemanticGroundingCandidateV1,
+  type SemanticActionExecutionReceiptV1 } from '../domain/semantic-grounding-v1.js';
 import { parseSemanticGroundedTraceV1, requireIssuedSemanticGroundedTraceV1,
   sealSemanticCompilerAttemptV5, sealSemanticResolvedTestSpecV10, parseSemanticResolvedTestSpecV10,
   semanticResolvedRolesV10, SemanticResolvedStepV10Schema,
   type SemanticGroundedTraceV1, type SemanticResolvedStepV10,
   type SemanticCompilerAttemptV5, type SemanticResolvedTestSpecV10 } from '../domain/semantic-resolved-v10.js';
-import { ProtectedContextFactory } from '../profile/index.js';
+import { ProtectedContextFactory } from '../profile/local-context.js';
 import { McpExplorationSession } from './mcp.js';
 import { SemanticGroundingSessionV1, SemanticGroundingStopV1 } from './semantic-grounding-v1.js';
 
@@ -20,7 +22,7 @@ export type SemanticCompilerRejectionCodeV1 = 'SOURCE_WITNESS_EXPIRED' | 'TRACE_
   'OPTION_VALUE_MISMATCH' | 'FRESHNESS_INVALID' | 'INTEGRITY_FAILURE' | 'UNKNOWN_COMPILER_REJECTION' |
   'CURRENT_EVIDENCE_EXPIRED' | 'FRESH_BROWSER_EVIDENCE_UNAVAILABLE' |
   'SOURCE_CURRENT_CORRESPONDENCE_MISMATCH' | 'CURRENT_CANDIDATE_DOMAIN_DRIFT' |
-  'CURRENT_RELATIONSHIP_ORDINAL_DRIFT';
+  'CURRENT_RELATIONSHIP_ORDINAL_DRIFT' | 'POST_ACTION_EVIDENCE_EXPIRED';
 export type SemanticCompilerRejectionV1 = {
   code: SemanticCompilerRejectionCodeV1; category: Reason; phase: string;
   stepId: string | null; witnessVersion: string | null; witnessIssuedAt: string | null;
@@ -36,6 +38,9 @@ export type SemanticCompilerRejectionV1 = {
   currentEvidenceExpired: boolean | null; sourceCurrentCorrespondence: boolean | null;
   sealedSteps: SemanticCompilerSealedStepV5[]; allStepsSealed: boolean;
   consumedEvidenceRefreshedAtFinalSeal: false;
+  preActionEvidenceAgeAtValidation?: number | null; preActionFreshnessPassed?: boolean | null;
+  actionDurationMs?: number | null; postActionEffectFreshnessPassed?: boolean | null;
+  actionStepSealed?: boolean;
 };
 export type SemanticCompilerSealedStepV5 = Readonly<{
   compilerAttemptId: string; testSpecId: string; traceDigest: string;
@@ -44,6 +49,10 @@ export type SemanticCompilerSealedStepV5 = Readonly<{
   currentEvidenceIssuedAt: string | null; currentEvidenceExpiresAt: string | null;
   currentEvidenceAgeAtUseMs: number | null; validatedAt: string;
   sourceCurrentCorrespondence: boolean | null; resolvedStepDigest: string;
+  preActionGuardDigest?: string | null; preActionEvidenceAgeAtValidation?: number | null;
+  preActionFreshnessPassed?: boolean | null; actionInvocationAt?: string | null;
+  actionReceiptDigest?: string | null; actionDurationMs?: number | null;
+  postActionEffectFreshnessPassed?: boolean | null; actionStepSealedAt?: string | null;
   sealDigest: string;
 }>;
 type SealData = Omit<SemanticCompilerSealedStepV5, 'sealDigest'>;
@@ -80,6 +89,21 @@ export function validateSemanticCompilerSealedSequenceV5(records: SemanticGround
         Date.parse(seal.validatedAt) - Date.parse(seal.currentEvidenceIssuedAt) !==
           seal.currentEvidenceAgeAtUseMs)
       fail('SOURCE_MISMATCH', 'INTEGRITY_FAILURE');
+    if (record.type === 'action') {
+      if (!seal.preActionGuardDigest || !seal.preActionFreshnessPassed ||
+          seal.preActionEvidenceAgeAtValidation !== seal.currentEvidenceAgeAtUseMs ||
+          !seal.actionInvocationAt || !seal.actionReceiptDigest ||
+          seal.actionDurationMs === null || seal.actionDurationMs === undefined ||
+          seal.actionDurationMs < 0 || !seal.postActionEffectFreshnessPassed ||
+          !seal.actionStepSealedAt ||
+          Date.parse(seal.actionInvocationAt) < Date.parse(seal.validatedAt) ||
+          Date.parse(seal.actionStepSealedAt) < Date.parse(seal.actionInvocationAt) ||
+          seal.preActionGuardDigest !== hash({ recordType: 'pre_action_guard_validated',
+            compilerAttemptId, stepId: seal.stepId, sourceWitnessDigest: seal.sourceWitnessDigest,
+            currentWitnessDigest: seal.currentWitnessDigest, validatedAt: seal.validatedAt,
+            ageMs: seal.preActionEvidenceAgeAtValidation, correspondence: true }))
+        fail('SOURCE_MISMATCH', 'INTEGRITY_FAILURE');
+    }
   }
 }
 class Stop extends Error {
@@ -354,6 +378,10 @@ export async function compileSemanticGroundedTraceV1(factory: ProtectedContextFa
   let currentWitness: SemanticGroundingWitnessV1 | undefined;
   let currentEvidenceValidatedAt: string | null = null;
   let sourceCurrentCorrespondence: boolean | null = null;
+  let preActionEvidenceAgeAtValidation: number | null = null;
+  let preActionFreshnessPassed: boolean | null = null;
+  let actionDurationMs: number | null = null;
+  let postActionEffectFreshnessPassed: boolean | null = null;
   let steps: SemanticResolvedStepV10[] = [];
   let cleanup: 'verified' | 'unverified' = 'verified';
   let freshSessionId = freshAttemptId;
@@ -373,6 +401,10 @@ export async function compileSemanticGroundedTraceV1(factory: ProtectedContextFa
       currentWitness = undefined;
       currentEvidenceValidatedAt = null;
       sourceCurrentCorrespondence = null;
+      preActionEvidenceAgeAtValidation = null;
+      preActionFreshnessPassed = null;
+      actionDurationMs = null;
+      postActionEffectFreshnessPassed = null;
       phase = 'step_correlation';
       if (record.type === 'navigate') {
         if (record.step.type !== 'navigate') throw new Stop('SOURCE_MISMATCH');
@@ -423,15 +455,61 @@ export async function compileSemanticGroundedTraceV1(factory: ProtectedContextFa
         phase = 'source_current_correspondence';
         compareFresh(source, fresh);
         sourceCurrentCorrespondence = true;
-        phase = 'action_receipt';
-        const receipt = await grounding.executeGroundedAction(fresh);
+        phase = 'assertion_projection';
+        const closed = SemanticResolvedStepV10Schema.parse(resolvedFor(source));
         phase = 'current_freshness';
-        currentEvidenceValidatedAt = new Date(Date.now()).toISOString();
-        validateCurrentEvidence(currentWitness);
+        const guardTime = Date.now();
+        currentEvidenceValidatedAt = new Date(guardTime).toISOString();
+        validateCurrentEvidence(currentWitness, guardTime);
+        preActionEvidenceAgeAtValidation = guardTime - Date.parse(currentWitness.evidence.observedAt);
+        preActionFreshnessPassed = true;
+        // The guard is immutable before dispatch. Its target witness cannot authorize a later step.
+        const preActionGuard = Object.freeze({ recordType: 'pre_action_guard_validated' as const,
+          compilerAttemptId, stepId: source.step.id, sourceWitnessDigest: source.witnessDigest,
+          currentWitnessDigest: currentWitness.witnessDigest, validatedAt: currentEvidenceValidatedAt,
+          ageMs: preActionEvidenceAgeAtValidation, correspondence: true as const });
+        const preActionGuardDigest = hash(preActionGuard);
+        const invocationMs = Date.now();
+        const receiptClockStartMs = new Date().getTime();
+        const actionInvocationAt = new Date(invocationMs).toISOString();
+        // The grounding session independently rechecks witness currency and live target identity.
         phase = 'action_receipt';
+        const deliveredReceipt = await grounding.executeGroundedAction(fresh);
+        const receipt: SemanticActionExecutionReceiptV1 = (() => {
+          try { return parseSemanticActionExecutionReceiptV1(deliveredReceipt); }
+          catch { return fail('OBSERVATION_MISMATCH', 'ACTION_RECEIPT_INVALID'); }
+        })();
+        const receiptConsumedMs = Date.now();
+        actionDurationMs = receiptConsumedMs - invocationMs;
+        if (actionDurationMs < 0 || receipt.stepId !== source.step.id ||
+            receipt.actionWitnessDigest !== currentWitness.witnessDigest ||
+            receipt.mechanic !== fresh.mechanic ||
+            receipt.beforePageUrl !== currentWitness.evidence.pageUrl)
+          fail('OBSERVATION_MISMATCH', 'ACTION_RECEIPT_INVALID');
+        // The receipt uses the browser session's wall-clock Date constructor. Keep its
+        // currentness check on that clock, independent of compiler logical-clock tests.
+        const receiptAgeMs = new Date().getTime() - Date.parse(receipt.executedAt);
+        if (receiptAgeMs < 0 || receiptAgeMs > 10_000 ||
+            Date.parse(receipt.executedAt) < receiptClockStartMs)
+          fail('STALE_EVIDENCE', 'POST_ACTION_EVIDENCE_EXPIRED');
+        postActionEffectFreshnessPassed = true;
         if (receipt.effectStatus !== record.receipt.effectStatus ||
             receipt.observedFinalState !== record.receipt.observedFinalState)
-          fail('OBSERVATION_MISMATCH');
+          fail('OBSERVATION_MISMATCH', 'ACTION_RECEIPT_INVALID');
+        const actionStepSealedAt = new Date(Date.now()).toISOString();
+        steps.push(closed);
+        sealedSteps.push(sealStep({ compilerAttemptId, testSpecId: trace.testSpecId,
+          traceDigest: trace.traceDigest, stepId: source.step.id, recordType: 'action',
+          sourceWitnessDigest: source.witnessDigest, currentWitnessDigest: currentWitness.witnessDigest,
+          currentEvidenceIssuedAt: currentWitness.evidence.observedAt,
+          currentEvidenceExpiresAt: currentWitness.evidence.expiresAt,
+          currentEvidenceAgeAtUseMs: preActionEvidenceAgeAtValidation,
+          validatedAt: currentEvidenceValidatedAt, sourceCurrentCorrespondence: true,
+          resolvedStepDigest: hash(closed), preActionGuardDigest,
+          preActionEvidenceAgeAtValidation, preActionFreshnessPassed,
+          actionInvocationAt, actionReceiptDigest: receipt.receiptDigest,
+          actionDurationMs, postActionEffectFreshnessPassed, actionStepSealedAt }));
+        continue;
       } else {
         phase = 'observation_witness';
         if (source.witnessVersion !== 'semantic_verification_grounding_v1') throw new Stop('SOURCE_MISMATCH');
@@ -539,11 +617,15 @@ export async function compileSemanticGroundedTraceV1(factory: ProtectedContextFa
       currentEvidenceIssuedAt: currentWitness?.evidence.observedAt ?? null,
       currentEvidenceExpiresAt: currentWitness?.evidence.expiresAt ?? null,
       currentEvidenceValidatedAt,
-      currentEvidenceAgeMs: currentWitness ? validationMs - Date.parse(currentWitness.evidence.observedAt) : null,
-      currentEvidenceExpired: currentWitness ? validationMs > Date.parse(currentWitness.evidence.expiresAt) : null,
+      currentEvidenceAgeMs: preActionEvidenceAgeAtValidation ??
+        (currentWitness ? validationMs - Date.parse(currentWitness.evidence.observedAt) : null),
+      currentEvidenceExpired: preActionFreshnessPassed ? false :
+        currentWitness ? validationMs > Date.parse(currentWitness.evidence.expiresAt) : null,
       sourceCurrentCorrespondence,
       sealedSteps: [...sealedSteps], allStepsSealed: false,
       consumedEvidenceRefreshedAtFinalSeal: false,
+      preActionEvidenceAgeAtValidation, preActionFreshnessPassed, actionDurationMs,
+      postActionEffectFreshnessPassed, actionStepSealed: false,
     };
     steps = [];
   } finally {
@@ -566,7 +648,9 @@ export async function compileSemanticGroundedTraceV1(factory: ProtectedContextFa
       currentEvidenceValidatedAt: null, currentEvidenceAgeMs: null,
       currentEvidenceExpired: null, sourceCurrentCorrespondence: null,
       sealedSteps: [...sealedSteps], allStepsSealed: false,
-      consumedEvidenceRefreshedAtFinalSeal: false };
+      consumedEvidenceRefreshedAtFinalSeal: false,
+      preActionEvidenceAgeAtValidation: null, preActionFreshnessPassed: null,
+      actionDurationMs: null, postActionEffectFreshnessPassed: null, actionStepSealed: false };
     steps = [];
   }
   if (!reason && cleanup !== 'verified') reason = 'CLEANUP_UNVERIFIED';
@@ -582,7 +666,9 @@ export async function compileSemanticGroundedTraceV1(factory: ProtectedContextFa
     currentEvidenceValidatedAt: null, currentEvidenceAgeMs: null,
     currentEvidenceExpired: null, sourceCurrentCorrespondence: null,
     sealedSteps: [...sealedSteps], allStepsSealed: !!trace && sealedSteps.length === trace.records.length,
-    consumedEvidenceRefreshedAtFinalSeal: false };
+    consumedEvidenceRefreshedAtFinalSeal: false,
+    preActionEvidenceAgeAtValidation, preActionFreshnessPassed, actionDurationMs,
+    postActionEffectFreshnessPassed, actionStepSealed: false };
   const sourceTrace = trace ?? input;
   const base = { compilerVersion: '5' as const, compilerAttemptId,
     traceDigest: sourceTrace.traceDigest, testSpecId: sourceTrace.testSpecId, sourceSessionId: sourceTrace.sessionId,

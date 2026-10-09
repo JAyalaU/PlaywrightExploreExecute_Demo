@@ -1,4 +1,4 @@
-"""P2-3C focused Python process-boundary tests."""
+"""Bounded Python v2 host supervision and transport tests."""
 
 import os
 import json
@@ -17,7 +17,7 @@ from playwright_demo.host import _provider_diagnostic  # noqa: E402
 
 MOCK = Path(__file__).with_name("mock_child.py")
 REQUEST = {
-    "protocolVersion": "1",
+    "protocolVersion": "2",
     "request": {
         "taskText": "Select Save.",
         "targetUrl": "http://127.0.0.1:4173/",
@@ -58,7 +58,7 @@ class SubprocessHostTests(unittest.TestCase):
         with patch.dict(os.environ, {"PLAYWRIGHT_DEMO_UI_DIAGNOSTICS": "1"}):
             result = run_mock("provider_diagnostic")
         self.assertEqual(result.outcome["kind"], "typed_stop")
-        self.assertEqual(result.outcome["terminal"]["reason"], "PROVIDER_ERROR")
+        self.assertEqual(result.outcome["context"]["result"]["terminal"]["reason"], "PROVIDER_ERROR")
         self.assertEqual(result.provider_diagnostic["httpStatus"], 429)
         self.assertNotIn("PLAYWRIGHT_DEMO_PROVIDER_DIAGNOSTIC", result.stderr)
         with patch.dict(os.environ, {"PLAYWRIGHT_DEMO_UI_DIAGNOSTICS": "0"}):
@@ -69,16 +69,16 @@ class SubprocessHostTests(unittest.TestCase):
     def test_one_valid_exchange_and_typed_stops(self):
         self.assertEqual(run_mock("success").outcome["kind"], "success")
         qa = run_mock("qa").outcome
-        self.assertEqual((qa["kind"], qa["stopKind"], qa["terminal"]["status"]),
+        self.assertEqual((qa["kind"], qa["stopKind"], qa["context"]["result"]["terminal"]["status"]),
                          ("typed_stop", "qa_failure", "QA_ASSERTION_FAILED"))
         runtime = run_mock("automation").outcome
-        self.assertEqual((runtime["kind"], runtime["stopKind"], runtime["terminal"]["status"]),
-                         ("typed_stop", "automation_stop", "LOCATOR_BINDING_FAILED"))
+        self.assertEqual((runtime["kind"], runtime["stopKind"], runtime["context"]["result"]["terminal"]["status"]),
+                         ("typed_stop", "automation_stop", "EXPLORATION_UNRESOLVED"))
 
     def test_missing_malformed_multiple_version_and_exit_mismatch(self):
         expected = {
             "missing": "MISSING_RESPONSE", "malformed": "MALFORMED_RESPONSE",
-            "multiple": "MULTIPLE_RESPONSE", "wrong_version": "MALFORMED_RESPONSE",
+            "multiple": "MALFORMED_RESPONSE", "wrong_version": "MALFORMED_RESPONSE",
             "wrong_exit": "UNEXPECTED_EXIT",
         }
         for mode, code in expected.items():
@@ -168,12 +168,12 @@ class SubprocessHostTests(unittest.TestCase):
             self.assertEqual(marker.with_suffix(".cleaned").exists(), not forced)
 
     def test_built_node_entry_uses_same_protocol_without_provider(self):
-        built = ROOT / "dist" / "subprocess" / "cli.js"
+        built = ROOT / "dist" / "subprocess" / "agentic-cli.js"
         if not built.exists():
             self.skipTest("Run npm run build for built-entry integration")
         result = call_node(REQUEST, node_entry=built, config_path="missing.json")
         self.assertEqual(result.outcome, {
-            "protocolVersion": "1", "kind": "bridge_error",
+            "protocolVersion": "2", "kind": "bridge_error",
             "code": "INVALID_TRUSTED_CONFIGURATION", "cleanup": "not_started",
         })
 

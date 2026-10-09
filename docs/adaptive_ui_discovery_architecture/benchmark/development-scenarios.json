@@ -1,0 +1,18 @@
+{
+  "version": "1",
+  "purpose": "development",
+  "scenarios": [
+    {
+      "id": "dev-accessible-resettable",
+      "category": "well-labeled form and role/name interaction",
+      "fixture": "local deterministic application with explicit state-reset hook",
+      "requiredBehavior": "observe before planning, discover one interaction, reset application state, cleanly execute, verify the original outcome"
+    },
+    {
+      "id": "dev-honest-stop",
+      "category": "ambiguous or unsupported request",
+      "fixture": "local deterministic application",
+      "requiredBehavior": "request clarification or stop without reporting verified success"
+    }
+  ]
+}

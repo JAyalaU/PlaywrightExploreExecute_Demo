@@ -6,11 +6,18 @@ import { interpretSemanticIntentV3, normalizeSemanticIntentV3, semanticIntentFid
 import { SEMANTIC_INTENT_FIDELITY_V3_FORMAT, SEMANTIC_INTENT_PRIMARY_V3_FORMAT,
   SemanticIntentPrimaryWireV3Schema } from '../app/interpretation/semantic-intent-v3-wire.js';
 import { createOpenAISemanticIntentModelsV3 } from '../app/interpretation/semantic-intent-v3-adapters.js';
-import { deferredFiveStepSource } from './helpers/deferred-five-step-source.js';
+import { semanticIntentCanonicalDigestV3 } from '../app/interpretation/semantic-intent-v3-relations.js';
 
 const root = 'https://the-internet.herokuapp.com/';
+const dropdownInstruction = [
+  `Go to ${root}`,
+  'Find and click the link with the text: "Dropdown"',
+  `Confirm it takes you to ${root}dropdown`,
+  'From the dropdown, select Option 1.',
+  'Verify that Option 1 is selected.',
+].map((clause, index) => `${index + 1}. ${clause}`).join('\n');
 const source = (instruction: string) => ({ testSpecId: 'intent-fixture', sourceInstruction: instruction,
-  executionProfileRef: deferredFiveStepSource().executionProfileRef, startState: { url: 'about:blank' } });
+  executionProfileRef: { id: 'desktop', version: '1' }, startState: { url: 'about:blank' } });
 const target = (category: string | null, exactName: string | null = null, ordinal: number | null = null,
   relation: 'unspecified' | 'same_as_step' | 'created_by_step' | 'any_matching' = 'unspecified',
   relatedStepId: string | null = null, context: string | null = null) =>
@@ -30,7 +37,7 @@ const verify = (id: string, authoredText: string, subject: ReturnType<typeof tar
   ({ id, type: 'verification_intent', authoredText, subject, observable, comparator, expected, dependsOnStepId });
 
 const fixtures = [
-  { name: 'Dropdown', instruction: deferredFiveStepSource().sourceInstruction, steps: [
+  { name: 'Dropdown', instruction: dropdownInstruction, steps: [
     nav('s1'), act('s2', 'Find and click the link with the text: "Dropdown"', target('link', 'Dropdown'),
       'activate', null, null, 's1', 'click'),
     verify('s3', 'Verify destination URL', null, 'url', `${root}dropdown`, 's2'),
@@ -119,6 +126,208 @@ test('repeated Delete retains any-matching ambiguity without invented ordinal or
   expect(JSON.stringify(action)).not.toMatch(/locator|nth\(|\.first|selector/);
 });
 
+test('authored repetition and complete-set counts have one canonical relation and digest', () => {
+  const instruction = `Go to ${root}\nFind and activate the link named "Add/Remove Elements".\n` +
+    `Verify that the current URL is ${root}add_remove_elements/\n` +
+    'Activate the "Add Element" button twice.\n' +
+    'Verify that exactly two "Delete" buttons exist.\n' +
+    'Activate the first "Delete" button.\n' +
+    'Verify that exactly one "Delete" button exists.';
+  const steps: SemanticIntentStepV3[] = [
+    nav('n1'), act('a2', 'Activate link', target('link', 'Add/Remove Elements'), 'activate', null, null, 'n1'),
+    verify('v3', 'Verify URL', null, 'url', `${root}add_remove_elements/`, 'a2'),
+    act('a4', 'Add first', target('button', 'Add Element'), 'activate', null, null, 'v3'),
+    act('a5', 'Add second', target('button', 'Add Element'), 'activate', null, null, 'a4'),
+    verify('v6', 'Count two Delete', target('button', 'Delete'), 'cardinality', 2, 'a5'),
+    act('a7', 'First Delete', target('button', 'Delete', 1), 'activate', null, null, 'v6'),
+    verify('v8', 'Count one Delete', target('button', 'Delete'), 'cardinality', 1, 'a7'),
+  ];
+  const canonical = normalizeSemanticIntentV3(source(instruction),
+    { response: { kind: 'extraction', steps } });
+  const digest = semanticIntentCanonicalDigestV3(canonical);
+  for (const relation of ['unspecified', 'same_as_step', 'any_matching'] as const) {
+    const variant = steps.map((step, index) => index === 4 && step.type === 'action_intent' ?
+      { ...step, target: target('button', 'Add Element', null, relation,
+        relation === 'same_as_step' ? 'a4' : null) } :
+      index === 6 && step.type === 'action_intent' ?
+        { ...step, target: target('button', 'Delete', 1, 'any_matching') } :
+      (index === 5 || index === 7) && step.type === 'verification_intent' ?
+        { ...step, subject: target('button', 'Delete', null, 'any_matching') } : step);
+    const normalized = normalizeSemanticIntentV3(source(instruction),
+      { response: { kind: 'extraction', steps: variant } });
+    expect(normalized.steps).toEqual(steps);
+    expect(semanticIntentCanonicalDigestV3(normalized)).toBe(digest);
+    const firstDelete = normalized.steps[6];
+    expect(firstDelete?.type === 'action_intent' ? firstDelete.target.ordinal : null).toBe(1);
+  }
+  const differentIdentity = { ...canonical, testSpecId: 'different-id',
+    steps: canonical.steps.map((step, index) => ({ ...step, id: `other${index + 1}`,
+      dependsOnStepId: step.dependsOnStepId ? `other${index}` : null,
+      ...(step.type === 'action_intent' ? { target: { ...step.target,
+        relatedStepId: step.target.relatedStepId ? `other${index}` : null } } : {}),
+      ...(step.type === 'verification_intent' && step.subject ? { subject: { ...step.subject,
+        relatedStepId: step.subject.relatedStepId ? `other${index}` : null } } : {}),
+    })) as SemanticIntentStepV3[] };
+  expect(semanticIntentCanonicalDigestV3(differentIdentity)).toBe(digest);
+});
+
+test('authored first ordinal overrides any-matching model candidate before semantic validation', async () => {
+  const instruction = `Go to ${root}\nActivate the first "Delete" button.`;
+  const steps: SemanticIntentStepV3[] = [nav('s1'),
+    act('s2', 'First Delete', target('button', 'Delete', 1), 'activate', null, null, 's1')];
+  const candidate = steps.map((step) => step.type === 'action_intent' ?
+    { ...step, target: { ...step.target, relation: 'any_matching' as const } } : step);
+  const expected = normalizeSemanticIntentV3(source(instruction),
+    { response: { kind: 'extraction', steps } });
+  const canonical = normalizeSemanticIntentV3(source(instruction),
+    { response: { kind: 'extraction', steps: candidate } });
+  expect(canonical).toEqual(expected);
+  expect(semanticIntentCanonicalDigestV3(canonical)).toBe(semanticIntentCanonicalDigestV3(expected));
+  expect(canonical.steps[1]).toMatchObject({ target: { ordinal: 1, relation: 'unspecified' },
+    desiredEffect: 'activate' });
+  const accepted = await interpretSemanticIntentV3(source(instruction),
+    mockedModels(candidate, steps, instruction));
+  expect(accepted.kind).toBe('accepted');
+  if (accepted.kind === 'accepted') expect(accepted.admission.spec).toEqual(expected);
+});
+
+test('malformed candidate references stop before relation canonicalization', async () => {
+  const instruction = `Go to ${root}\nActivate the first "Delete" button.`;
+  const run = (step: SemanticIntentStepV3) => interpretSemanticIntentV3(source(instruction), {
+    primary: { complete: async () => JSON.stringify({ response: { kind: 'extraction',
+      steps: [nav('s1'), step] } }) },
+    reviewer: { complete: async () => { throw new Error('Reviewer must not run'); } },
+  });
+  for (const relatedStepId of ['missing', 's1']) {
+    const result = await run(act('s2', 'First Delete', target('button', 'Delete', 1,
+      'any_matching', relatedStepId), 'activate', null, null, 's1'));
+    expect(result).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+      normalizationDiagnostic: { phase: 'spec_cross_step', predicate: 'INVALID_TARGET_RELATION',
+        stepIndex: 1, fieldFamily: 'relation' } });
+  }
+});
+
+test('explicit one-of, same target, created-by and selected-option ownership survive canonicalization', () => {
+  const cases = [
+    { instruction: `Go to ${root}\nActivate the "Delete" button.\nActivate one of the "Delete" buttons.`,
+      last: act('s3', 'Any Delete', target('button', 'Delete'), 'activate', null, null, 's2'),
+      expected: { relation: 'any_matching', relatedStepId: null } },
+    { instruction: `Go to ${root}\nActivate the "Control" button.\nActivate that same "Control" button.`,
+      last: act('s3', 'Same Control', target('button', 'Control'), 'activate', null, null, 's2'),
+      expected: { relation: 'same_as_step', relatedStepId: 's2' } },
+    { instruction: `Go to ${root}\nActivate the "Add" button.\nActivate the button just added.`,
+      last: act('s3', 'Created control', target('button'), 'activate', null, null, 's2'),
+      expected: { relation: 'created_by_step', relatedStepId: 's2' } },
+  ] as const;
+  for (const fixture of cases) {
+    const steps: SemanticIntentStepV3[] = [nav('s1'),
+      act('s2', 'First action', target('button', fixture.expected.relation === 'created_by_step' ? 'Add' :
+        fixture.expected.relation === 'any_matching' ? 'Delete' : 'Control'),
+      'activate', null, null, 's1'), fixture.last];
+    const normalized = normalizeSemanticIntentV3(source(fixture.instruction),
+      { response: { kind: 'extraction', steps } });
+    const last = normalized.steps[2];
+    expect(last?.type === 'action_intent' ? last.target : null).toMatchObject(fixture.expected);
+  }
+  const dropdown = fixtures[0];
+  const spec = normalizeSemanticIntentV3(source(dropdown.instruction),
+    { response: { kind: 'extraction', steps: dropdown.steps } });
+  const selected = spec.steps[4];
+  expect(selected?.type === 'verification_intent' ? selected.subject : null).toMatchObject({
+    relation: 'same_as_step', relatedStepId: 's4' });
+});
+
+test('normalization rejection exposes only closed phase, predicate, step and field family', async () => {
+  const instruction = `Go to ${root}\nActivate the "Control" button.`;
+  const first = nav('s1');
+  const run = (step: unknown) => interpretSemanticIntentV3(source(instruction), {
+    primary: { complete: async () => JSON.stringify({ response: { kind: 'extraction',
+      steps: [first, step] } }) },
+    reviewer: { complete: async () => { throw new Error('Reviewer must not run'); } },
+  });
+  const invalidDependency = await run(act('s2', 'Control', target('button', 'Control'),
+    'activate', null, null, 'missing'));
+  expect(invalidDependency).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'spec_cross_step', predicate: 'INVALID_STEP_DEPENDENCY',
+      stepIndex: 1, fieldFamily: 'dependency' } });
+  const candidateRelation = normalizeSemanticIntentV3(source(instruction),
+    { response: { kind: 'extraction', steps: [first, act('s2', 'Control',
+      target('button', 'Control', null, 'same_as_step'), 'activate', null, null, 's1')] } });
+  expect(candidateRelation.steps[1]).toMatchObject({ target: { relation: 'unspecified',
+    relatedStepId: null } });
+  const invalidEffect = await run({ ...act('s2', 'Control', target('button', 'Control'),
+    'activate', null, null, 's1'), desiredEffect: 'unsupported' });
+  expect(invalidEffect).toMatchObject({ kind: 'rejected', code: 'PROVIDER_OUTPUT_INVALID' });
+  const invalidActionArgument = await run(act('s2', 'Control', target('button', 'Control'),
+    'set_checked', null, null, 's1'));
+  expect(invalidActionArgument).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'spec_cross_step', predicate: 'INVALID_ACTION_EFFECT_ARGUMENT',
+      stepIndex: 1, fieldFamily: 'action_argument' } });
+  const invalidCount = await run(verify('s2', 'Count controls', target('button', 'Control'),
+    'cardinality', 'two', 's1'));
+  expect(invalidCount).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'spec_cross_step', predicate: 'INVALID_CARDINALITY_VALUE',
+      stepIndex: 1, fieldFamily: 'verification_value' } });
+  if (invalidDependency.kind === 'rejected')
+    expect(JSON.stringify(invalidDependency.normalizationDiagnostic)).not.toContain('Control');
+});
+
+test('unaccounted repetition and contradictory source relations reject with separate closed reasons', async () => {
+  const steps: SemanticIntentStepV3[] = [nav('s1'),
+    act('s2', 'Control', target('button', 'Control'), 'activate', null, null, 's1')];
+  const model = (candidate: SemanticIntentStepV3[]) => ({
+    primary: { complete: async () => JSON.stringify({ response: { kind: 'extraction', steps: candidate } }) },
+    reviewer: { complete: async () => { throw new Error('Reviewer must not run'); } },
+  });
+  const malformed = await interpretSemanticIntentV3(source(`Go to ${root}\nActivate the "Control" button twice.`),
+    model(steps));
+  expect(malformed).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'relation_canonicalization',
+      predicate: 'MALFORMED_REPETITION_EXPANSION', fieldFamily: 'relation' } });
+  const contradictory = await interpretSemanticIntentV3(source(`Go to ${root}\n` +
+    'Activate the "Control" button.\nActivate one of the same "Control" buttons.'),
+  model([...steps, act('s3', 'Other Control', target('button', 'Control'), 'activate', null, null, 's2')]));
+  expect(contradictory).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'relation_canonicalization',
+      predicate: 'CONTRADICTORY_TARGET_CONSTRAINTS', stepIndex: 2, fieldFamily: 'relation' } });
+  const oneOfFirst = await interpretSemanticIntentV3(source(`Go to ${root}\n` +
+    'Activate one of the first "Delete" buttons.'), model([nav('s1'),
+    act('s2', 'One of first Delete', target('button', 'Delete', 1, 'any_matching'),
+      'activate', null, null, 's1')]));
+  expect(oneOfFirst).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'relation_canonicalization',
+      predicate: 'INVALID_ORDINAL_RELATION_COMBINATION', stepIndex: 1, fieldFamily: 'ordinal' } });
+});
+
+test('verification wording twice does not expand action slots or misassign one-of ownership', () => {
+  const steps: SemanticIntentStepV3[] = [nav('s1'),
+    verify('s2', 'Action happened twice', target('button', 'Delete'), 'exists', true, 's1'),
+    act('s3', 'Choose Delete', target('button', 'Delete'), 'activate', null, null, 's2')];
+  for (const verification of ['Verify that the action happened twice.',
+    'Check that the action happened twice.']) {
+    const instruction = `Go to ${root}\n${verification}\nActivate one of the "Delete" buttons.`;
+    const spec = normalizeSemanticIntentV3(source(instruction),
+      { response: { kind: 'extraction', steps } });
+    const action = spec.steps[2];
+    expect(action?.type === 'action_intent' ? action.target.relation : null).toBe('any_matching');
+  }
+});
+
+test('matching slot count cannot grant a relation to a different named target', async () => {
+  const instruction = `Go to ${root}\nActivate the "Add" button.\n` +
+    'Activate one of the "Delete" buttons.';
+  const steps: SemanticIntentStepV3[] = [nav('s1'),
+    act('s2', 'Add', target('button', 'Add'), 'activate', null, null, 's1'),
+    act('s3', 'Wrong name', target('button', 'Add'), 'activate', null, null, 's2')];
+  const result = await interpretSemanticIntentV3(source(instruction), {
+    primary: { complete: async () => JSON.stringify({ response: { kind: 'extraction', steps } }) },
+    reviewer: { complete: async () => { throw new Error('Reviewer must not run'); } },
+  });
+  expect(result).toMatchObject({ kind: 'rejected', code: 'INVALID_SOURCE_REPRESENTATION',
+    normalizationDiagnostic: { phase: 'relation_canonicalization',
+      predicate: 'CLAUSE_OWNERSHIP_UNRESOLVED', stepIndex: 2, fieldFamily: 'relation' } });
+});
+
 test('intent vocabulary covers state setting and all requested resulting-state predicates', () => {
   const t = target('control');
   const steps: SemanticIntentStepV3[] = [
@@ -166,10 +375,14 @@ test('negative fidelity fixtures reject invented name and ordinal, click substit
     { fixture: repeated, steps: repeated.steps.map((step) => step.id === 's6' && step.type === 'action_intent' ?
       { ...step, target: target('button', 'Delete', 1) } : step) },
   ];
-  for (const { fixture, steps } of mutations) {
+  for (const [mutationIndex, { fixture, steps }] of mutations.entries()) {
     const result = await interpretSemanticIntentV3(source(fixture.instruction),
       mockedModels(steps as SemanticIntentStepV3[], fixture.steps, fixture.instruction));
-    expect(result).toMatchObject({ kind: 'rejected', code: 'SEMANTIC_FIDELITY_MISMATCH' });
+    expect(result).toMatchObject({ kind: 'rejected', code: mutationIndex === 8 ?
+      'INVALID_SOURCE_REPRESENTATION' : 'SEMANTIC_FIDELITY_MISMATCH' });
+    if (mutationIndex === 8) expect(result).toMatchObject({ normalizationDiagnostic: {
+      phase: 'relation_canonicalization', predicate: 'INVALID_ORDINAL_RELATION_COMBINATION',
+      stepIndex: 5, fieldFamily: 'ordinal' } });
   }
 });
 

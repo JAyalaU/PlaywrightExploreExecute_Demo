@@ -5,7 +5,8 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { ProtectedContextFactory, ProfileCatalog } from '../app/profile/index.js';
+import { ProtectedContextFactory } from '../app/profile/local-context.js';
+import { NativeProfileCatalog } from '../app/profile/native-profile.js';
 import { McpExplorationSession } from '../app/exploration/mcp.js';
 import { admitSemanticIntentV3, type SemanticIntentStepV3 } from '../app/domain/semantic-intent-v3.js';
 import { sealSemanticGroundingEvidenceV1, sealSemanticGroundingWitnessV1,
@@ -54,12 +55,12 @@ async function fixture(html: string, makeSteps: (root: string) => SemanticIntent
   const admission = admitSemanticIntentV3(source, { ...source, schemaVersion: '7', sourceContractVersion: '3',
     semanticMode: 'intent_v2', normalizationVersion: 'semantic_intent_normalization_v2', steps },
   { verdict: 'faithful', issues: [] });
-  const factory = new ProtectedContextFactory(new ProfileCatalog([{
+  const factory = new ProtectedContextFactory(new NativeProfileCatalog([{
     id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 }, locale: 'en-US',
     timeoutPolicy: { actionMs: 1500, navigationMs: 3000, waits: { default: 1500 } },
-    networkPolicyRef: { id: 'local', version: '1' },
-  }], [{ id: 'local', version: '1', destinations: [{ host: '127.0.0.1', ports: [address.port],
-    addresses: ['127.0.0.1'] }] }]));
+    profileSchemaVersion: '5', browserIsolation: 'local-windows',
+    browserRuntime: 'playwright-chromium-windows', presentationMode: 'headless',
+  }]));
   const attemptId = 'semantic-source-attempt';
   let session: McpExplorationSession | undefined;
   try {
@@ -476,9 +477,11 @@ test('final assembly refuses missing or altered sealed step proof', async () => 
   } finally { await f.close(); }
 });
 
-test('current evidence expiring after re-grounding but before step use is rejected', async () => {
-  const f = await fixture('<button>Go</button>', root => [nav(root),
-    action('go', target('button', 'Go'), 'activate')]);
+test('fresh link guard survives thirty seconds of navigation and compiler continues', async () => {
+  const f = await fixture('<button>Add Element</button>', root => [nav(root),
+    action('link', target('link', 'Add/Remove Elements'), 'activate'),
+    verify('url', null, 'url', `${root}case`, 'link'),
+    action('add', target('button', 'Add Element'), 'activate')]);
   const originalExecute = SemanticGroundingSessionV1.prototype.executeGroundedAction;
   const originalNow = Date.now;
   let offset = 0;
@@ -486,16 +489,20 @@ test('current evidence expiring after re-grounding but before step use is reject
     Date.now = () => originalNow() + offset;
     SemanticGroundingSessionV1.prototype.executeGroundedAction = async function (witness) {
       const receipt = await originalExecute.call(this, witness);
-      offset = 20_000;
+      if (witness.step.id !== 'link') return receipt;
+      offset = 30_000;
       return receipt;
     };
     const result = await compileSemanticGroundedTraceV1(f.factory, f.admission, f.trace);
-    expect(result.kind).toBe('compilation_stop');
-    expect(result.resolved).toBeUndefined();
-    expect(requireSemanticCompilerRejectionV1(result)).toMatchObject({
-      code: 'CURRENT_EVIDENCE_EXPIRED', phase: 'current_freshness', stepId: 'go',
-      currentEvidenceExpired: true, sourceCurrentCorrespondence: true,
-      allStepsSealed: false, consumedEvidenceRefreshedAtFinalSeal: false });
+    expect(result.kind, result.kind === 'compilation_stop' ?
+      JSON.stringify(requireSemanticCompilerRejectionV1(result)) : '').toBe('compiled');
+    const seals = requireSemanticCompilerSealedStepsV5(result);
+    expect(seals.map(step => step.stepId)).toEqual(['nav', 'link', 'url', 'add']);
+    expect(seals[1]).toMatchObject({ preActionFreshnessPassed: true,
+      postActionEffectFreshnessPassed: true });
+    expect(seals[1]!.actionDurationMs).toBeGreaterThanOrEqual(30_000);
+    expect(Date.now() - Date.parse(seals[1]!.validatedAt)).toBeGreaterThan(10_000);
+    expect(seals[3]!.currentWitnessDigest).not.toBe(seals[1]!.currentWitnessDigest);
   } finally {
     SemanticGroundingSessionV1.prototype.executeGroundedAction = originalExecute;
     Date.now = originalNow;
@@ -503,7 +510,7 @@ test('current evidence expiring after re-grounding but before step use is reject
   }
 });
 
-test('a later step expiring before use rejects only after earlier steps were sealed', async () => {
+test('a later long action keeps earlier sealed steps and seals its own fresh guard', async () => {
   const f = await fixture('<button>First</button><button>Second</button>', root => [nav(root),
     action('first', target('button', 'First'), 'activate'),
     action('second', target('button', 'Second'), 'activate')]);
@@ -514,20 +521,59 @@ test('a later step expiring before use rejects only after earlier steps were sea
     Date.now = () => originalNow() + offset;
     SemanticGroundingSessionV1.prototype.executeGroundedAction = async function (witness) {
       const receipt = await originalExecute.call(this, witness);
-      if (witness.step.id === 'second') offset = 20_000;
+      if (witness.step.id !== 'second') return receipt;
+      offset = 20_000;
       return receipt;
     };
     const result = await compileSemanticGroundedTraceV1(f.factory, f.admission, f.trace);
-    expect(result.kind).toBe('compilation_stop');
-    const diagnostic = requireSemanticCompilerRejectionV1(result);
-    expect(diagnostic).toMatchObject({ code: 'CURRENT_EVIDENCE_EXPIRED',
-      phase: 'current_freshness', stepId: 'second', sourceCurrentCorrespondence: true });
-    expect(diagnostic.sealedSteps.map(step => step.stepId)).toEqual(['nav', 'first']);
-    expect(result.resolved).toBeUndefined();
+    expect(result.kind).toBe('compiled');
+    const seals = requireSemanticCompilerSealedStepsV5(result);
+    expect(seals.map(step => step.stepId)).toEqual(['nav', 'first', 'second']);
+    expect(seals[2]).toMatchObject({ preActionFreshnessPassed: true,
+      postActionEffectFreshnessPassed: true });
+    expect(seals[2]!.actionDurationMs).toBeGreaterThanOrEqual(20_000);
   } finally {
     SemanticGroundingSessionV1.prototype.executeGroundedAction = originalExecute;
     Date.now = originalNow;
     await f.close();
+  }
+});
+
+test('invalid and stale post-action receipts reject under their own evidence categories', async () => {
+  const f = await fixture('<button>Go</button>', root => [nav(root),
+    action('go', target('button', 'Go'), 'activate')]);
+  const originalExecute = SemanticGroundingSessionV1.prototype.executeGroundedAction;
+  const diagnosticsRoot = await mkdtemp(path.join(os.tmpdir(), 'semantic-action-receipt-diagnostics-'));
+  try {
+    const store = new SemanticCompilerDiagnosticsV1Store(diagnosticsRoot);
+    await store.writeTrace(f.trace, f.admission);
+    for (const [kind, expectedCode] of [
+      ['invalid', 'ACTION_RECEIPT_INVALID'],
+      ['stale', 'POST_ACTION_EVIDENCE_EXPIRED'],
+    ] as const) {
+      SemanticGroundingSessionV1.prototype.executeGroundedAction = async function (witness) {
+        const receipt = await originalExecute.call(this, witness);
+        const { receiptDigest: _digest, ...data } = receipt;
+        return sealSemanticActionExecutionReceiptV1(kind === 'invalid' ?
+          { ...data, actionWitnessDigest: '0'.repeat(64) } :
+          { ...data, executedAt: new Date(new Date().getTime() - 20_000).toISOString() });
+      };
+      const result = await compileSemanticGroundedTraceV1(f.factory, f.admission, f.trace);
+      expect(result.kind).toBe('compilation_stop');
+      expect(result.resolved).toBeUndefined();
+      expect(requireSemanticCompilerRejectionV1(result)).toMatchObject({
+        code: expectedCode, phase: 'action_receipt', stepId: 'go',
+        preActionFreshnessPassed: true, actionStepSealed: false,
+        allStepsSealed: false });
+      await store.writeRejection(result, f.trace);
+      expect((await store.readByCorrelation({ compilerAttemptId: result.compiler.compilerAttemptId }))[0])
+        .toMatchObject({ recordVersion: 'semantic_compiler_rejection_diagnostic_v2',
+          code: expectedCode, preActionFreshnessPassed: true, actionStepSealed: false });
+    }
+  } finally {
+    SemanticGroundingSessionV1.prototype.executeGroundedAction = originalExecute;
+    await f.close();
+    await rm(diagnosticsRoot, { recursive: true, force: true });
   }
 });
 
@@ -563,7 +609,8 @@ test('Dynamic Controls compile bounded resulting-state assertions', async () => 
     expect(Date.parse(later.witness.evidence.observedAt) -
       Date.parse(early.witness.evidence.observedAt)).toBeGreaterThan(10_000);
     const result = await compileSemanticGroundedTraceV1(f.factory, f.admission, agedTrace);
-    expect(result.kind).toBe('compiled');
+    expect(result.kind, result.kind === 'compilation_stop' ?
+      JSON.stringify(requireSemanticCompilerRejectionV1(result)) : '').toBe('compiled');
     const seals = requireSemanticCompilerSealedStepsV5(result);
     expect(seals).toHaveLength(agedTrace.records.length);
     expect(seals[1]).toMatchObject({ stepId: 'link', sourceCurrentCorrespondence: true });
@@ -597,6 +644,11 @@ test('restricted diagnostics separate old source age from fresh correspondence r
     expect(acceptedReadback).toMatchObject([{ recordVersion: 'semantic_compiler_seal_diagnostic_v1',
       allStepsSealed: true, consumedEvidenceRefreshedAtFinalSeal: false }]);
     expect(acceptedReadback[0]).toHaveProperty('sealedSteps');
+    if (acceptedReadback[0]?.recordVersion !== 'semantic_compiler_seal_diagnostic_v1')
+      throw new Error('Missing accepted seal diagnostic');
+    expect(acceptedReadback[0].sealedSteps[1]).toMatchObject({
+      preActionFreshnessPassed: true, postActionEffectFreshnessPassed: true });
+    expect(acceptedReadback[0].sealedSteps[1]?.actionDurationMs).toBeGreaterThanOrEqual(0);
     expect(JSON.stringify(acceptedReadback)).not.toContain('Offline authored fixture');
     const trace = changedAction(f, 1, witness => resealAction(witness, {}, {
       ...agedEvidence(witness), candidates: driftedCandidate(witness) }));
@@ -674,13 +726,9 @@ test('opt-in semantic handoff persists current-domain rejection without a v10 ar
   const f = await fixture('<input type="checkbox">', root => [nav(root),
     action('check1', target('checkbox'), 'set_checked', null, true)]);
   const root = await mkdtemp(path.join(os.tmpdir(), 'semantic-rejected-handoff-'));
-  const previousWorkflow = process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION;
-  const previousGate = process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE;
   try {
     const trace = changedAction(f, 1, witness => resealAction(witness, {}, {
       ...agedEvidence(witness), candidates: driftedCandidate(witness) }));
-    process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION = 'semantic-general-v1';
-    process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE = 'offline-review';
     const outcome = await runSemanticGeneralizedOptInV1(f.factory, root, f.admission, trace);
     expect(outcome.kind).toBe('compilation_stop');
     if (outcome.kind !== 'compilation_stop') throw new Error('Expected rejected semantic compilation');
@@ -691,10 +739,6 @@ test('opt-in semantic handoff persists current-domain rejection without a v10 ar
     await expect(new SemanticCompilerV5Store(root).readResolvedV10(trace.testSpecId,
       outcome.compiler.compilerAttemptId, f.admission)).rejects.toThrow();
   } finally {
-    if (previousWorkflow === undefined) delete process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION;
-    else process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION = previousWorkflow;
-    if (previousGate === undefined) delete process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE;
-    else process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE = previousGate;
     await f.close(); await rm(root, { recursive: true, force: true });
   }
 });

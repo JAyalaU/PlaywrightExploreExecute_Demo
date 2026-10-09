@@ -1,7 +1,8 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { expect, test, type ElementHandle, type Page } from '@playwright/test';
-import { ProtectedContextFactory, ProfileCatalog } from '../app/profile/index.js';
+import { ProtectedContextFactory } from '../app/profile/local-context.js';
+import { NativeProfileCatalog } from '../app/profile/native-profile.js';
 import { McpExplorationSession } from '../app/exploration/mcp.js';
 import { admitSemanticIntentV3, type SemanticIntentStepV3 } from '../app/domain/semantic-intent-v3.js';
 import { parseSemanticGroundingWitnessV1,
@@ -41,12 +42,12 @@ async function fixture(html: string, makeSteps: (root: string) => SemanticIntent
   const spec = { ...source, schemaVersion: '7', sourceContractVersion: '3', semanticMode: 'intent_v2',
     normalizationVersion: 'semantic_intent_normalization_v2', steps };
   const admission = admitSemanticIntentV3(source, spec, { verdict: 'faithful', issues: [] });
-  const factory = new ProtectedContextFactory(new ProfileCatalog([{
+  const factory = new ProtectedContextFactory(new NativeProfileCatalog([{
     id: 'desktop', version: '1', browser: 'chromium', viewport: { width: 900, height: 600 }, locale: 'en-US',
     timeoutPolicy: { actionMs: 1500, navigationMs: 3000, waits: { default: 1500 } },
-    networkPolicyRef: { id: 'local', version: '1' },
-  }], [{ id: 'local', version: '1', destinations: [{ host: '127.0.0.1', ports: [address.port],
-    addresses: ['127.0.0.1'] }] }]));
+    profileSchemaVersion: '5', browserIsolation: 'local-windows',
+    browserRuntime: 'playwright-chromium-windows', presentationMode: 'headless',
+  }]));
   let session: McpExplorationSession | undefined;
   try {
     session = await McpExplorationSession.open(factory, source.executionProfileRef,

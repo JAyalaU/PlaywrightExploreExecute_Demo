@@ -1,5 +1,14 @@
 # Playwright MCP feasibility-spike fixture
 
+> **Frozen historical experiment (pre-semantic-general).** This directory stays
+> outside product and opt-in experiment tooling. Its checked-in `artifacts/`
+> evidence remains tracked at this path; moving it would make it match the
+> repository-wide artifact ignore rule. The commands below document the
+> original spike and are not maintained as current product tooling. The
+> [last result](../../docs/experiments/playwright-mcp-spike-results.md) belongs to the
+> pre-semantic-general MCP feasibility architecture; it required the local
+> Python fixture server and isolated Playwright dependency described below.
+
 This directory is an intentionally small, local-only fixture for the approved
 Playwright MCP feasibility spike. It is not product code.
 

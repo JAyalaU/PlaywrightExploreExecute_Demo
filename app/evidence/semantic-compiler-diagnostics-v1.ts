@@ -19,7 +19,7 @@ const code = z.enum(['SOURCE_WITNESS_EXPIRED', 'TRACE_LINEAGE_MISMATCH', 'TRACE_
   'FRESHNESS_INVALID', 'INTEGRITY_FAILURE', 'UNKNOWN_COMPILER_REJECTION',
   'CURRENT_EVIDENCE_EXPIRED', 'FRESH_BROWSER_EVIDENCE_UNAVAILABLE',
   'SOURCE_CURRENT_CORRESPONDENCE_MISMATCH', 'CURRENT_CANDIDATE_DOMAIN_DRIFT',
-  'CURRENT_RELATIONSHIP_ORDINAL_DRIFT']);
+  'CURRENT_RELATIONSHIP_ORDINAL_DRIFT', 'POST_ACTION_EVIDENCE_EXPIRED']);
 const reason = z.enum(['SOURCE_MISMATCH', 'STALE_EVIDENCE', 'DOMAIN_MISMATCH', 'TARGET_MISMATCH',
   'CAPABILITY_MISMATCH', 'MECHANIC_MISMATCH', 'OPTION_MISMATCH', 'OBSERVATION_MISMATCH',
   'UNSUPPORTED_RELATIONSHIP', 'ENVIRONMENT_UNAVAILABLE', 'CLEANUP_UNVERIFIED']);
@@ -75,6 +75,15 @@ const sealedStep = z.strictObject({
   currentEvidenceAgeAtUseMs: z.number().finite().nullable(),
   validatedAt: z.iso.datetime(), sourceCurrentCorrespondence: z.boolean().nullable(),
   resolvedStepDigest: digest, sealDigest: digest,
+  // Optional for authenticated records written before pre-dispatch action sealing.
+  preActionGuardDigest: digest.nullable().optional(),
+  preActionEvidenceAgeAtValidation: z.number().finite().nullable().optional(),
+  preActionFreshnessPassed: z.boolean().nullable().optional(),
+  actionInvocationAt: z.iso.datetime().nullable().optional(),
+  actionReceiptDigest: digest.nullable().optional(),
+  actionDurationMs: z.number().finite().nonnegative().nullable().optional(),
+  postActionEffectFreshnessPassed: z.boolean().nullable().optional(),
+  actionStepSealedAt: z.iso.datetime().nullable().optional(),
 });
 const rejectionDataV2 = rejectionData.omit({ recordVersion: true }).extend({
   recordVersion: z.literal('semantic_compiler_rejection_diagnostic_v2'),
@@ -88,6 +97,11 @@ const rejectionDataV2 = rejectionData.omit({ recordVersion: true }).extend({
   sealedSteps: z.array(sealedStep).max(100).optional(),
   allStepsSealed: z.boolean().optional(),
   consumedEvidenceRefreshedAtFinalSeal: z.literal(false).optional(),
+  preActionEvidenceAgeAtValidation: z.number().finite().nullable().optional(),
+  preActionFreshnessPassed: z.boolean().nullable().optional(),
+  actionDurationMs: z.number().finite().nonnegative().nullable().optional(),
+  postActionEffectFreshnessPassed: z.boolean().nullable().optional(),
+  actionStepSealed: z.boolean().optional(),
 });
 const sealData = z.strictObject({ recordVersion: z.literal('semantic_compiler_seal_diagnostic_v1'),
   workflowVersion: z.literal('semantic-general-v1'), compilerVersion: z.literal('5'),
@@ -176,7 +190,12 @@ function projectRejection(trace: SemanticGroundedTraceV1, attempt: SemanticCompi
     currentEvidenceExpired: diagnostic.currentEvidenceExpired,
     sourceCurrentCorrespondence: diagnostic.sourceCurrentCorrespondence,
     sealedSteps: diagnostic.sealedSteps, allStepsSealed: diagnostic.allStepsSealed,
-    consumedEvidenceRefreshedAtFinalSeal: diagnostic.consumedEvidenceRefreshedAtFinalSeal });
+    consumedEvidenceRefreshedAtFinalSeal: diagnostic.consumedEvidenceRefreshedAtFinalSeal,
+    preActionEvidenceAgeAtValidation: diagnostic.preActionEvidenceAgeAtValidation,
+    preActionFreshnessPassed: diagnostic.preActionFreshnessPassed,
+    actionDurationMs: diagnostic.actionDurationMs,
+    postActionEffectFreshnessPassed: diagnostic.postActionEffectFreshnessPassed,
+    actionStepSealed: diagnostic.actionStepSealed });
 }
 function projectAcceptedSeal(trace: SemanticGroundedTraceV1,
   compilation: object & { compiler: SemanticCompilerAttemptV5 }): z.infer<typeof sealData> {

@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import type { ProtectedBrowserSession } from '../profile/context.js';
-import { DeferredRunnerStopV9Schema } from './deferred-action-runner.js';
+import type { BrowserContext } from '@playwright/test';
+type ProtectedBrowserSession = { context: BrowserContext; isClosed: boolean };
 
 const id = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
 const ms = z.number().finite().min(0).max(1_000_000_000_000);
@@ -26,7 +26,7 @@ export const DeferredBrowserDiagnosticV1Schema = z.strictObject({
     'initial_state', 'candidate_enumeration', 'enumeration_predicate', 'role_pre_name',
     'role_post_name', 'native_select_inventory', 'candidate_filtering', 'fresh_state',
     'freshness_comparison', 'final_result', 'pre_action_ownership', 'rich_after_url',
-    'frame_enumeration', 'frame_content', 'runner_v9_state', 'execution_entry_ownership',
+    'frame_enumeration', 'frame_content', 'execution_entry_ownership',
     'document_readiness', 'main_document_response', 'main_document_navigation', 'committed_document_wait']),
   readinessBoundary: z.enum(['bootstrap_start', 'bootstrap_complete', 'before_click', 'after_click',
     'url_observation', 'before_candidate_query']).optional(),
@@ -67,7 +67,6 @@ export const DeferredBrowserDiagnosticV1Schema = z.strictObject({
     'BROWSER_DISCONNECTED', 'FRAME_DETACHED', 'EXECUTION_CONTEXT_DESTROYED',
     'NAVIGATION_INTERRUPTED', 'PROTOCOL_ERROR', 'STATE_READ_API_FAILURE',
     'UNKNOWN_PLAYWRIGHT_ERROR']).optional(),
-  runnerStopCode: DeferredRunnerStopV9Schema.optional(),
 });
 export type DeferredBrowserDiagnosticV1 = z.infer<typeof DeferredBrowserDiagnosticV1Schema>;
 export type DeferredBrowserDiagnosticSink = (event: DeferredBrowserDiagnosticV1) => void;

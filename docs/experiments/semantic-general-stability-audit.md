@@ -1,0 +1,76 @@
+# Semantic-general cross-run stability audit
+
+2026-10-06. Read-only review of three operator-supplied public attempts of the same eight-step Add/Remove Elements instruction. No workflow, model, browser, or public-site call was made. This report contains only bounded diagnostic projections and code facts; private traces and provider payloads remain in their restricted stores.
+
+## Evidence and limits
+
+The authenticated `SemanticExplorationDiagnosticsV1Store` readback for B and C and `SemanticCompilerDiagnosticsV1Store` readback for B came from the existing `jobs/structured-action-20260930-220304-1cba42dfafc0461492cfe9745ba14bfa/artifacts` root. Run A has no matching retained interpretation artifact in the workspace. The v7 semantic TestSpecs for B and C are not persisted there either; exploration milestones expose only step type/family and the presence of ordinal or relationship intent. Thus exact v7 field-by-field equivalence and A's admission/fidelity subcode cannot be reconstructed. Current routing maps internal `INVALID_SOURCE_REPRESENTATION` to the operator-reported `INVALID_TEST_SPEC`; the exact source, primary normalization/spec, or admission rejection is not retained. The three terminal labels alone do not establish a common cause.
+
+## Interpretation
+
+| Authored step | B admitted intent, as exposed by safe downstream evidence | C admitted intent, as exposed by safe exploration milestones | Fields unavailable without retained v7 projection |
+|---|---|---|---|
+| 1 root URL | `navigate` | `navigate` | Exact literal in v7 (B trace proves the root navigation) |
+| 2 Add/Remove link | action `activate`; one grounded candidate, `click` | action `activate`; grounded and dispatched `click` | Target name/role constraints, authored mechanic, dependencies |
+| 3 destination URL | verification `url`, satisfied | verification `url`, grounded | Exact v7 literal, comparator, dependency |
+| 4 Add #1 | action `activate`; one candidate, `click` | action `activate`; `click` returned | Exact target intent and dependency |
+| 5 Add #2 | action `activate`; one candidate, `click` | action `activate`; `click` returned | Exact target intent and dependency |
+| 6 two Delete controls | verification `cardinality`; complete count 2, satisfied | verification `cardinality`; grounded after bounded settling | C's observed/expected count, comparator, dependency |
+| 7 first Delete | action `activate`; authored ordinal 1 of complete domain 2, `click` | action `activate` with ordinal present; failed before grounding | C's ordinal value and exact target constraint |
+| 8 one Delete control | verification `cardinality`; complete count 1, satisfied | never reached | C's expected count and polarity |
+
+B's authenticated trace diagnostic proves its cardinality literals 2 and 1, URL assertion satisfaction, two-candidate ordinal proof, and ordered click mechanics. C's milestone shape matches B through step 7 but omits literal values, polarity, exact names, dependency edges, and final semantic field values. A has neither an admitted projection nor a retained precise rejection. **Interpretation classification: `INTERPRETATION_DIAGNOSTICS_INSUFFICIENT`.** The same authored text had one reported interpretation rejection and two admitted interpretations, so the model/admission boundary is operationally variable, but material semantic variation between B and C is unproven. Step-family agreement is weaker than v7 equivalence.
+
+## Exploration: first divergence
+
+Both B and C launched a connected protected browser, created one context/page, committed the root document, and returned from root navigation. B committed at 18:59:07.871Z and returned at 18:59:38.067Z; C committed at 19:01:52.685Z and returned at 19:02:22.885Z. Both grounded and dispatched the destination-link click, then completed its effect after about a 30-second document-readiness wait. Both grounded the URL check and returned two Add clicks. B's step 6 had a complete two-candidate Delete domain, expected count satisfied and settled; step 7 grounded ordinal 1/index 0 in that complete domain, returned its click, and step 8 observed one candidate. It issued a successful trace.
+
+C's step 6 first observation completed at 19:02:54.950Z, then another observation began at 19:03:04.968Z, consistent with the bounded resulting-state wait. It grounded a cardinality witness at 19:03:05.055Z. **The first observable timing divergence is step 6 settling for about ten seconds in C; the first terminal divergence is step 7:** candidate read completed at 19:03:05.099Z, followed by `GROUNDING_CANDIDATE_FAILED` at 19:03:05.103Z, before `step_grounded` or Delete dispatch. The failure snapshot shows one open page and connected browser at the intended `/add_remove_elements/` URL, a 2xx main response, the same complete document generation, DOMContentLoaded observed, returned navigation, and a ready viewer. Cleanup completed. This excludes an observed HTTP/navigation failure, browser disconnect, and a recorded stale-rebinding failure at the stopping boundary. It does **not** distinguish `ORDINAL_OUT_OF_BOUNDS`, `UNRESOLVED_TARGET`, `AMBIGUOUS_TARGET`, `RESULT_LIMIT`, `UNSUPPORTED_CAPABILITY`, or an explicit-mechanic mismatch: the v1 collector collapses those grounding reasons into `GROUNDING_CANDIDATE_FAILED` and retains no step-7 domain count. The ten-second step-6 settling strongly suggests a count mismatch or delayed mutation, but its observed values are not retained, so the exact cause of C is **candidate/ordinal grounding failure with specific predicate insufficient**. No Delete action or final count check occurred.
+
+B's trace has one candidate for the link and each Add action; step 6 has 2, step 7 has 2 with ordinal proof, step 8 has 1. Its action receipts are delivery-only for clicks, and grounded assertions show the expected counts. The trace's MCP revision is 2 for browser-bound records. C's milestone record does not retain domain counts, action receipts, or mutation/revision numbers. Consequently it cannot prove whether the public DOM had zero, one, or two Delete candidates at step 7, nor whether step-6 verification was false. Current candidate scans guard mutation generation and node identity, but that code cannot fill gaps in historical diagnostics.
+
+## Compiler B and fix timeline
+
+The authenticated compiler-v2 rejection is `step_2`, phase `current_freshness`, `CURRENT_EVIDENCE_EXPIRED` (`STALE_EVIDENCE`). The historical exploration witness was issued 18:59:38.345Z and was 94,529 ms old at rejection against a 10,000 ms lifetime. More decisively, the compiler's own fresh witness was issued 19:00:41.945Z, expired 19:00:51.945Z, and was validated at 19:01:12.874Z: **30,929 ms old, 20,929 ms past expiry**. The source/current correspondence check had passed. Step 2 had one complete-domain candidate, selected index 0, reviewed `click`, and no ordinal/relationship proof. Only navigation step 1 was sealed. The failed check is after `executeGroundedAction(fresh)` and before projecting/sealing step 2. A slow destination navigation/readiness interval can therefore consume the witness lifetime after valid grounding and click dispatch.
+
+This is **different from both earlier fixed bugs**: expired historical source provenance before fresh grounding, and rechecking all early compiler witnesses at final seal. Current code still validates the step-2 compiler witness after the action/effect interval. The point-of-use fix was already present: source `semantic-trace-compiler-v5.ts` modification was 17:17:48Z, and the built file was 18:57:27Z, before B began at 18:59:04Z. This is a current implementation/invariant placement issue at a later within-step boundary, not evidence that the previous final-seal correction failed. It remains non-QA and produces no runnable v10 artifact.
+
+| Run | Code state/fixes present | First failing stage | Exact cause | Still applicable to current HEAD? |
+|---|---|---|---|---|
+| A | Timestamp and executable fingerprint unavailable | Interpretation | Reported `INVALID_TEST_SPEC`; exact admission/fidelity reason unavailable | `INSUFFICIENT`; model variability remains possible |
+| B | Built grounding/compiler files timestamped 18:57:27Z, before 18:59Z run; mutation guard and compiler point-of-use/final-seal fixes present in those source files | Compilation | Fresh compiler step-2 witness aged 30,929 ms across action/effect/readiness; post-action current-freshness check rejected despite correspondence | Yes, `CURRENT_IMPLEMENTATION_DEFECT` in current compiler path |
+| C | Same built-file timestamps precede 19:01Z run; exact loaded-process fingerprint not retained | Exploration | Step-7 candidate/ordinal grounding failed; specific closed predicate and candidate count not retained | `INSUFFICIENT` as to root cause; public DOM variability is plausible, not proved |
+
+B and C are close in time and consistent with the same build. No run-scoped executable digest or immutable git-worktree snapshot proves identical code state. A cannot be placed relative to the fixes. Neither B nor C should be assigned to the two historical **fixed** freshness defects. The earlier Dynamic Controls stale rebinding and compiler source/final-seal failures in the runtime log are `FIXED_BY_LATER_CHANGE`; they are not part of this three-run current reliability estimate. B is `CURRENT_IMPLEMENTATION_DEFECT`. A and C are `INSUFFICIENT` at the requested exact-cause level. The 2xx snapshot for C rules out a specific public HTTP error, while public same-document behavior remains a candidate explanation.
+
+## Current nondeterministic boundaries
+
+| Boundary | Variability and present classification |
+|---|---|
+| Primary extraction and independent fidelity review | Model outputs/verdicts can vary; schema, trusted admission, and fidelity stop guard wrong semantics. A shows a reported stop, but retained fields cannot say whether output semantics changed. Joint model/reviewer errors can still produce inconsistent semantics. |
+| Public browser and Heroku site | HTTP, commit/readiness timing, and same-document mutations are external. Protected approval/isolation and typed environment stops guard authority; 2xx/complete at C's stop only rules out an observed HTTP failure there. External timing can still produce unresolved stops. |
+| Grounding | Complete candidate ordering, ordinal proof, stable element handles, mutation generation, final domain recheck, and bounded settling guard silent wrong-target action. A genuinely changed/absent domain or exhausted settle window can still stop non-QA. C's collapsed diagnostic cannot attribute its precise branch. |
+| Compiler | A second fresh browser reconstructs the path and compares source/current witnesses. This is an intentional reproducibility gate. The current post-action reuse of a pre-action 10-second witness can reject a slow but correctly dispatched action, as B proves. |
+| Runner and replay pair | v10 has no model repair; each of two fresh sessions guards target domain and computes assertions. Browser/site divergence can yield non-QA or disagreement. Earlier public replay divergence in the runtime log is not a deterministic-runner defect proof; its exact browser cause was insufficient. Offline repeated-control closure does not eliminate public variance. |
+
+There is no evidence in these three attempts of an executed runner defect: none reached v10 replay. False unresolved risk remains at compiler freshness and potentially at bounded public grounding. Incorrect semantics risk remains at the two-model interpretation boundary, but is not demonstrated by comparing retained B/C fields.
+
+## Reliability and demo decision
+
+**Do not make a production/demo success claim depend on one uninterrupted pass through one interpretation, one exploration, one compiler, and two public replays.** That chain multiplies model and external availability/timing chances; a terminal stop cannot identify which earlier stage would have succeeded later. Keep each stage's provenance and authority explicit.
+
+- **A — current model:** Most direct live end-to-end proof, but fragile for presentation. Preserve it as an integration gate, with typed non-QA stops visible.
+- **B — stable semantic admission:** Freeze an authenticated v7 artifact only after independent fidelity and trusted admission. Later browser attempts can reuse its exact intent and source digest; each attempt still needs its own protected grounding and fresh compiler proof. This isolates model variance without treating an old browser witness as current.
+- **C — stage-scoped recovery:** Retry only positively classified transient provider transport or environment failures, within bounded policy and fresh sessions. Do not retry semantic ambiguity, material fidelity rejection, ordinal ambiguity, stale evidence, QA false, or unknown action delivery as if transient. Record attempts separately.
+- **D — cached resolved presentation artifact:** A reviewed, authenticated resolved v10 can demonstrate deterministic replay independently, with current profile/source/approval compatibility and two fresh runs. It cannot be presented as live interpretation or fresh compilation; if its target has drifted, normal runner guards must stop. Do not reuse a protected exploration witness beyond its authority window to claim a new compiler pass.
+
+For the working demo, show **Phase 1: natural-language interpretation and protected grounding**, with the admitted artifact and any stop named honestly. Then show **Phase 2: deterministic two-replay QA execution** from a separately identified reviewed resolved artifact, clearly labeled as precompiled. A live end-to-end run can be attempted as an optional integration demonstration, never silently replaced by cached output. This preserves the exploration/compiler/replay authority split, public-browser approval/isolation, and non-QA classification.
+
+## Minimal next measurements (not executed)
+
+1. **Best next experiment:** run the exact authored input through interpretation only for a small fixed N, retaining a bounded authenticated v7 semantic projection/digest plus admission/fidelity reason. Compare step count, target/effect, ordinal, count, mechanics, dependencies, polarity, and URL literals. This resolves the largest evidence gap before blaming the model.
+2. Reuse one fixed admitted v7 TestSpec for N protected groundings on a deterministic local repeated-control fixture. Compare complete candidate domains, ordinal proof, receipt and count-settling observations; keep public-site attempts in a separate external-variability arm.
+3. Reuse one fixed authenticated resolved v10 in N two-session replay pairs on the same local fixture. Compare completed assertion signatures and non-QA stops. Do not infer public reliability from the local result alone.
+
+**Final classification: `MULTI_STAGE_RELIABILITY_PROBLEM`.** The retained attempts demonstrate an interpretation stop, a current compiler freshness stop, and a distinct grounding stop; only B's precise implementation cause is proved. B/C semantic equivalence and C's specific candidate predicate are unproven. This classification describes stage exposure, not a quantified reliability rate or a claim that the generalized architecture cannot represent the test.
+

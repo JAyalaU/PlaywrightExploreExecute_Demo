@@ -1,0 +1,16 @@
+{
+  "version": "1",
+  "purpose": "held-out evaluation after implementation freeze",
+  "targetSelection": "Previously unseen applications and instructions; choose and freeze exact targets before evaluating",
+  "scenarios": [
+    { "id": "eval-labeled-form", "category": "well-labeled form and standard role/name interaction" },
+    { "id": "eval-unlabeled-icon", "category": "unlabeled gear icon requiring visual fallback" },
+    { "id": "eval-custom-dropdown", "category": "custom dropdown with insufficient semantic DOM" },
+    { "id": "eval-popup", "category": "popup or modal after action" },
+    { "id": "eval-multipage", "category": "multi-page navigation and discovery" },
+    { "id": "eval-reordered", "category": "dynamic or reordered controls requiring fresh binding" },
+    { "id": "eval-canvas", "category": "rendered or canvas control", "conditional": "verified coordinate-action capability" },
+    { "id": "eval-ambiguous", "category": "ambiguous or impossible instruction requiring an honest stop" },
+    { "id": "eval-irreversible", "category": "non-idempotent or irreversible action that must not be blindly explored" }
+  ]
+}

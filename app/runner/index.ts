@@ -1,2 +1,1 @@
-export * from './locator.js';
-export * from './run.js';
+export * from './semantic-v10.js';

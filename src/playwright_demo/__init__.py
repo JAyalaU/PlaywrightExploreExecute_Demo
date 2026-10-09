@@ -1,7 +1,7 @@
 """Thin Python host for the Node UI validation engine."""
 
 from .host import HostCallResult, HostProcessFailure, call_node
-from .report_projection import call_report_projection
+from .report_projection_v2 import call_report_projection
 
 __all__ = ["HostCallResult", "HostProcessFailure", "call_node", "call_report_projection"]
 

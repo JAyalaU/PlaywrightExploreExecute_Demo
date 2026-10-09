@@ -10,7 +10,7 @@ process.stderr.write = discard as typeof process.stderr.write;
 const { MAX_PROJECTION_V2_REQUEST_BYTES, MAX_PROJECTION_V2_RESPONSE_BYTES,
   AgenticReportProjectionResponseV2Schema, parseAgenticReportProjectionRequestV2,
   projectStoredAgenticReportV2 } = await import('./report-projection-v2.js');
-const { readSubprocessTrustedConfiguration } = await import('./entry.js');
+const { readSubprocessTrustedConfiguration } = await import('./read-request.js');
 const unavailable = (reason: 'INVALID_REQUEST' | 'CONFIGURATION_UNAVAILABLE' | 'REPORT_TOO_LARGE') =>
   ({ reportProjectionVersion: '2' as const, kind: 'unavailable' as const, reason });
 let response;
@@ -27,7 +27,7 @@ try {
       chunks.push(bytes);
     }
     const request = parseAgenticReportProjectionRequestV2(Buffer.concat(chunks, length));
-    const config = await readSubprocessTrustedConfiguration(path, 'active-poc').catch(() => undefined);
+    const config = await readSubprocessTrustedConfiguration(path).catch(() => undefined);
     response = config ? await projectStoredAgenticReportV2(request, config) :
       unavailable('CONFIGURATION_UNAVAILABLE');
   }

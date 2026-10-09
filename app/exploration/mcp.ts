@@ -6,7 +6,8 @@ import path from 'node:path';
 import { createConnection } from '@playwright/mcp';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { type EffectiveProfile, ProtectedContextFactory, type ProtectedBrowserSession } from '../profile/index.js';
+import { ProtectedContextFactory, type ProtectedBrowserSession } from '../profile/local-context.js';
+import type { NativeEffectiveProfile } from '../profile/native-profile.js';
 
 const require = createRequire(import.meta.url);
 export const MCP_VERSION = (require('@playwright/mcp/package.json') as { version: string }).version;
@@ -82,7 +83,7 @@ export class McpExplorationSession {
   }
 
   static async open(factory: ProtectedContextFactory, profileRef: { id: string; version: string },
-    expectedProfile: EffectiveProfile, attemptId?: string, observeCall?: McpCallObserver): Promise<McpExplorationSession> {
+    expectedProfile: NativeEffectiveProfile, attemptId?: string, observeCall?: McpCallObserver): Promise<McpExplorationSession> {
     const browserSession = await factory.open(profileRef, expectedProfile,
       attemptId ? { observationOwner: { kind: 'attempt', id: attemptId } } : undefined);
     let outputDir: string | undefined;

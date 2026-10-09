@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from .protocol import (_FP, InvalidWire, _id, _obj, _one, _pairs_unique,
-                       _version, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES)
+from .wire_common import (_FP, InvalidWire, _id, _obj, _one, _pairs_unique,
+                          _version, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES)
 
 VERSION = "2"
 REASONS = frozenset((
@@ -57,8 +57,8 @@ def terminal(value: Any) -> dict[str, Any]:
 def result_record(value: Any, request_ref: Mapping[str, Any]) -> dict[str, Any]:
     item = _obj(value, {"resultVersion", "workflowVersion", "testSpecId", "executionProfileRef",
         "profileFingerprint", "presentationMode", "observation", "executionRunIds", "terminal", "cleanup"},
-        {"explorationAttemptId", "successfulTraceId", "compilerAttemptId", "resolvedSpecId", "deferredReplay", "deferredStage", "semanticReplay"})
-    if item["resultVersion"] != VERSION or item["workflowVersion"] not in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}:
+        {"explorationAttemptId", "successfulTraceId", "compilerAttemptId", "resolvedSpecId", "semanticReplay"})
+    if item["resultVersion"] != VERSION or item["workflowVersion"] != "semantic-general-v1":
         raise InvalidWire("Wrong agentic result version")
     _id(item["testSpecId"])
     ref = _obj(item["executionProfileRef"], {"id", "version"})
@@ -82,48 +82,39 @@ def result_record(value: Any, request_ref: Mapping[str, Any]) -> dict[str, Any]:
         item.get("resolvedSpecId") and not item.get("compilerAttemptId") or
         runs and not item.get("resolvedSpecId")):
         raise InvalidWire("Broken agentic ID chain")
-    if item["workflowVersion"] == "deferred-action-v1":
-        from .deferred_contract_v2 import validate_deferred_linkage
-        validate_deferred_linkage(item)
-    elif item["workflowVersion"] == "semantic-general-v1":
-        if "deferredReplay" in item or "deferredStage" in item or \
-           bool(item.get("resolvedSpecId")) != bool(item.get("semanticReplay")):
-            raise InvalidWire("Semantic v10 linkage mismatch")
-        if "semanticReplay" in item:
-            linkage = _obj(item["semanticReplay"], {"sourceSchemaVersion", "sourceContractVersion",
-                "groundingVersion", "traceVersion", "compilerVersion", "resolvedSchemaVersion",
-                "runnerVersion", "replayPairVersion", "orchestrationId", "traceDigest",
-                "resolvedDigest", "pairDigest", "executionSessionIds", "runDigests"})
-            for key, expected in (("sourceSchemaVersion", "7"), ("sourceContractVersion", "3"),
-                                  ("groundingVersion", "semantic_capability_discovery_v1"),
-                                  ("traceVersion", "semantic_grounded_trace_v1"),
-                                  ("compilerVersion", "5"), ("resolvedSchemaVersion", "10"),
-                                  ("runnerVersion", "10"), ("replayPairVersion", "2")):
-                if linkage[key] != expected: raise InvalidWire("Wrong semantic replay version")
-            _id(linkage["orchestrationId"])
-            for key in ("traceDigest", "resolvedDigest", "pairDigest"):
-                if type(linkage[key]) is not str or not _FP.fullmatch(linkage[key]):
-                    raise InvalidWire("Invalid semantic replay digest")
-            sessions = linkage["executionSessionIds"]
-            digests = linkage["runDigests"]
-            if type(sessions) is not list or type(digests) is not list or \
-               len(sessions) != len(runs) or len(digests) != len(runs):
-                raise InvalidWire("Semantic replay run mismatch")
-            for session in sessions:
-                if session is not None: _id(session)
-            if len({session for session in sessions if session is not None}) != \
-               len([session for session in sessions if session is not None]):
-                raise InvalidWire("Duplicate semantic replay session")
-            for digest in digests:
-                if type(digest) is not str or not _FP.fullmatch(digest):
-                    raise InvalidWire("Invalid semantic run digest")
-            if item["terminal"]["stage"] == "qa" and any(session is None for session in sessions):
-                raise InvalidWire("QA requires two fresh semantic sessions")
-    elif "deferredReplay" in item or "deferredStage" in item:
-        raise InvalidWire("Deferred linkage in historical result")
-    elif "semanticReplay" in item:
-        raise InvalidWire("Semantic replay linkage in historical result")
-    t = item["terminal"] if item["workflowVersion"] == "deferred-action-v1" and item["terminal"].get("status") == "EXECUTION_REPRODUCED" else terminal(item["terminal"])
+    if bool(item.get("resolvedSpecId")) != bool(item.get("semanticReplay")):
+        raise InvalidWire("Semantic v10 linkage mismatch")
+    if "semanticReplay" in item:
+        linkage = _obj(item["semanticReplay"], {"sourceSchemaVersion", "sourceContractVersion",
+            "groundingVersion", "traceVersion", "compilerVersion", "resolvedSchemaVersion",
+            "runnerVersion", "replayPairVersion", "orchestrationId", "traceDigest",
+            "resolvedDigest", "pairDigest", "executionSessionIds", "runDigests"})
+        for key, expected in (("sourceSchemaVersion", "7"), ("sourceContractVersion", "3"),
+                              ("groundingVersion", "semantic_capability_discovery_v1"),
+                              ("traceVersion", "semantic_grounded_trace_v1"),
+                              ("compilerVersion", "5"), ("resolvedSchemaVersion", "10"),
+                              ("runnerVersion", "10"), ("replayPairVersion", "2")):
+            if linkage[key] != expected: raise InvalidWire("Wrong semantic replay version")
+        _id(linkage["orchestrationId"])
+        for key in ("traceDigest", "resolvedDigest", "pairDigest"):
+            if type(linkage[key]) is not str or not _FP.fullmatch(linkage[key]):
+                raise InvalidWire("Invalid semantic replay digest")
+        sessions = linkage["executionSessionIds"]
+        digests = linkage["runDigests"]
+        if type(sessions) is not list or type(digests) is not list or \
+           len(sessions) != len(runs) or len(digests) != len(runs):
+            raise InvalidWire("Semantic replay run mismatch")
+        for session in sessions:
+            if session is not None: _id(session)
+        if len({session for session in sessions if session is not None}) != \
+           len([session for session in sessions if session is not None]):
+            raise InvalidWire("Duplicate semantic replay session")
+        for digest in digests:
+            if type(digest) is not str or not _FP.fullmatch(digest):
+                raise InvalidWire("Invalid semantic run digest")
+        if item["terminal"]["stage"] == "qa" and any(session is None for session in sessions):
+            raise InvalidWire("QA requires two fresh semantic sessions")
+    t = terminal(item["terminal"])
     if (t["stage"] in {"qa", "reproducibility"} and
         (len(runs) != 2 or not item.get("resolvedSpecId") or item["cleanup"] != "verified")):
         raise InvalidWire("Unverified authoritative result")
@@ -185,7 +176,7 @@ def _parse_response(data: bytes, request_ref: Mapping[str, Any]) -> tuple[dict[s
     report = _obj(context["report"], {"kind"}, {"testSpecId"})
     if report["kind"] == "available":
         _obj(report, {"kind", "testSpecId"}); _id(report["testSpecId"])
-        if report["testSpecId"] != record["testSpecId"] or not record.get("successfulTraceId") or record.get("deferredStage"):
+        if report["testSpecId"] != record["testSpecId"] or not record.get("successfulTraceId"):
             raise InvalidWire("Invalid report correlation")
     elif report["kind"] == "unavailable": _obj(report, {"kind"})
     else: raise InvalidWire("Unknown report kind")

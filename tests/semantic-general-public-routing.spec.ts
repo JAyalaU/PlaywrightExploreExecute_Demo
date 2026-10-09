@@ -5,8 +5,9 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { parseActivePocTrustedConfiguration, selectActivePocBrowserProfile } from '../app/local/contracts.js';
+import { parseProductTrustedConfiguration, selectNativeLocalWindowsProductProfile } from '../app/local/product-contracts.js';
 import { SemanticExplorationDiagnosticsV1Store } from '../app/evidence/semantic-exploration-diagnostics-v1.js';
+import { approveNativeLocalWindowsInspection, inspectNativePublicUrl } from '../app/profile/native-admission.js';
 
 async function child(entry: string, config: string, wire: unknown, env: Record<string, string | undefined>) {
   const childEnv: NodeJS.ProcessEnv = { ...process.env, OPENAI_API_KEY: '' };
@@ -23,13 +24,25 @@ async function child(entry: string, config: string, wire: unknown, env: Record<s
   return { code, stdout, stderr };
 }
 
-test('closed Node selector rejects missing gate and unknown workflow before provider/browser', async () => {
+test('ordinary Node entry rejects retired workflow and Docker selectors before provider/browser', async () => {
   const entry = path.resolve('dist/subprocess/agentic-cli.js');
   const wire = { protocolVersion: '2', request: { taskText: 'Offline', targetUrl: 'http://127.0.0.1/',
     executionProfileRef: { id: 'desktop', version: '1' } } };
+  for (const selected of ['legacy', 'agentic-exploration-v1', 'goal-directed-v1',
+    'structured-action-v1', 'deferred-action-v1', 'unknown-workflow']) {
+    const result = await child(entry, 'unused-config', wire, {
+      PLAYWRIGHT_DEMO_WORKFLOW_VERSION: selected, PLAYWRIGHT_DEMO_BROWSER_BACKEND: undefined,
+    });
+    expect(result.stderr).toBe('');
+    expect(JSON.parse(result.stdout)).toEqual({ protocolVersion: '2', kind: 'bridge_error',
+      code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
+    expect(result.code).toBe(64);
+  }
   for (const env of [
-    { PLAYWRIGHT_DEMO_WORKFLOW_VERSION: 'semantic-general-v1', PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE: '' },
-    { PLAYWRIGHT_DEMO_WORKFLOW_VERSION: 'unknown-workflow', PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE: 'offline-review' },
+    { PLAYWRIGHT_DEMO_WORKFLOW_VERSION: undefined, PLAYWRIGHT_DEMO_BROWSER_BACKEND: 'docker-isolated' },
+    { PLAYWRIGHT_DEMO_WORKFLOW_VERSION: undefined, PLAYWRIGHT_DEMO_BROWSER_BACKEND: 'local-windows' },
+    { PLAYWRIGHT_DEMO_WORKFLOW_VERSION: undefined, PLAYWRIGHT_DEMO_BROWSER_BACKEND: undefined,
+      PLAYWRIGHT_DEMO_ACTION_PAUSE_MS: '-5' },
   ]) {
     const result = await child(entry, 'unused-config', wire, env);
     expect(result.stderr).toBe('');
@@ -37,6 +50,29 @@ test('closed Node selector rejects missing gate and unknown workflow before prov
       code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
     expect(result.code).toBe(64);
   }
+});
+
+test('direct Node product entry rejects an unapproved target before provider/browser', async () => {
+  const approvedUrl = 'https://approved.example.org/path';
+  const inspection = await inspectNativePublicUrl(approvedUrl, async () => ['93.184.215.14']);
+  const { profile, approval } = await approveNativeLocalWindowsInspection(inspection, approvedUrl, 'headless',
+    async () => ['93.184.215.14']);
+  const root = await mkdtemp(path.join(os.tmpdir(), 'semantic-approved-routing-'));
+  try {
+    const configPath = path.join(root, 'config.json');
+    await writeFile(configPath, JSON.stringify({ profiles: [profile],
+      publicTargetApproval: approval, artifactRoot: path.join(root, 'artifacts'), retentionDays: 7,
+      evidencePolicy: { finalScreenshot: false, failureScreenshot: false, failureTrace: false,
+        failureVideo: false, sensitiveBinaryApproved: false } }));
+    const response = await child(path.resolve('dist/subprocess/agentic-cli.js'), configPath, {
+      protocolVersion: '2', request: { taskText: 'Check the page',
+        targetUrl: 'https://other.example.org/path',
+        executionProfileRef: approval.executionProfileRef },
+    }, { PLAYWRIGHT_DEMO_WORKFLOW_VERSION: undefined, PLAYWRIGHT_DEMO_BROWSER_BACKEND: undefined });
+    expect(response.code).toBe(64);
+    expect(JSON.parse(response.stdout)).toEqual({ protocolVersion: '2', kind: 'bridge_error',
+      code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('Python UI host launches gated v7 to v10 route and renders two fresh offline QA passes', async () => {
@@ -49,41 +85,41 @@ test('Python UI host launches gated v7 to v10 route and renders two fresh offlin
   const rootUrl = `http://127.0.0.1:${address.port}/`;
   const root = await mkdtemp(path.join(os.tmpdir(), 'semantic-public-routing-'));
   const configPath = path.join(root, 'config.json');
-  const config = { profiles: [{ id: 'desktop', version: '1', profileSchemaVersion: '3',
-    browserIsolation: 'docker', presentationMode: 'headless', browser: 'chromium',
+  const config = { profiles: [{ id: 'desktop', version: '1', profileSchemaVersion: '5',
+    browserIsolation: 'local-windows', browserRuntime: 'playwright-chromium-windows',
+    presentationMode: 'headless', browser: 'chromium',
     viewport: { width: 900, height: 600 }, locale: 'en-US',
-    timeoutPolicy: { actionMs: 3000, navigationMs: 3000, waits: { default: 2000 } },
-    networkPolicyRef: { id: 'fixture', version: '1' } }],
-    networkPolicies: [{ id: 'fixture', version: '1', destinations: [{ host: '127.0.0.1',
-      ports: [address.port], addresses: ['127.0.0.1'] }] }],
+    timeoutPolicy: { actionMs: 3000, navigationMs: 3000, waits: { default: 2000 } } }],
     artifactRoot: path.join(root, 'artifacts'), retentionDays: 7,
     evidencePolicy: { finalScreenshot: false, failureScreenshot: false, failureTrace: false,
       failureVideo: false, sensitiveBinaryApproved: false } };
   await writeFile(configPath, JSON.stringify(config));
-  const selected = selectActivePocBrowserProfile(parseActivePocTrustedConfiguration(config), 'local-windows');
+  const selected = selectNativeLocalWindowsProductProfile(parseProductTrustedConfiguration(config));
+  expect(selected.reference).toEqual({ id: 'desktop', version: '1' });
+  expect(selected.config.profiles).toHaveLength(1);
+  expect(selected.config.profiles[0]).toMatchObject({ profileSchemaVersion: '5',
+    browserIsolation: 'local-windows' });
   const wire = { protocolVersion: '2', request: { taskText: 'Offline checkbox test', targetUrl: rootUrl,
     executionProfileRef: selected.reference } };
   const selectedCli = await child(path.resolve('dist/subprocess/agentic-cli.js'), configPath, wire, {
     PLAYWRIGHT_DEMO_WORKFLOW_VERSION: 'semantic-general-v1',
-    PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE: 'offline-review',
-    PLAYWRIGHT_DEMO_BROWSER_BACKEND: 'local-windows', PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
+    PLAYWRIGHT_DEMO_BROWSER_BACKEND: undefined, PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
   });
   expect(JSON.parse(selectedCli.stdout)).toMatchObject({ kind: 'bridge_error',
-    code: 'PROVIDER_CONFIGURATION_ERROR', cleanup: 'not_started' });
+    code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
   const defaultCli = await child(path.resolve('dist/subprocess/agentic-cli.js'), configPath,
     { ...wire, request: { ...wire.request, executionProfileRef: { id: 'desktop', version: '1' } } }, {
     PLAYWRIGHT_DEMO_WORKFLOW_VERSION: undefined, PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE: undefined,
-    PLAYWRIGHT_DEMO_BROWSER_BACKEND: 'local-windows', PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
+    PLAYWRIGHT_DEMO_BROWSER_BACKEND: undefined, PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
   });
   expect(JSON.parse(defaultCli.stdout)).toMatchObject({ kind: 'bridge_error',
-    code: 'PROVIDER_CONFIGURATION_ERROR', cleanup: 'not_started' });
+    code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
   const deferredCli = await child(path.resolve('dist/subprocess/agentic-cli.js'), configPath, wire, {
     PLAYWRIGHT_DEMO_WORKFLOW_VERSION: 'deferred-action-v1',
-    PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE: 'offline-review',
-    PLAYWRIGHT_DEMO_BROWSER_BACKEND: 'local-windows', PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
+    PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
   });
   expect(JSON.parse(deferredCli.stdout)).toMatchObject({ kind: 'bridge_error',
-    code: 'PROVIDER_CONFIGURATION_ERROR', cleanup: 'not_started' });
+    code: 'INVALID_TRUSTED_CONFIGURATION', cleanup: 'not_started' });
   const alias = path.join(root, 'ui-build', 'dist', 'subprocess');
   await mkdir(alias, { recursive: true });
   await writeFile(path.join(alias, 'agentic-cli.js'),
@@ -99,17 +135,19 @@ test('Python UI host launches gated v7 to v10 route and renders two fresh offlin
     'ref=json.loads(sys.argv[4]); fingerprint=sys.argv[5]',
     'approval={"kind":"approved","admissionVersion":"1","canonicalUrl":sys.argv[3],"executionProfileRef":ref,"profileFingerprint":fingerprint}',
     'with patch("playwright_demo.ui_workflow.lookup_public_admission",return_value=approval):',
-    '  result=run_ui_workflow(UiRequest(sys.argv[3],"Go to site. Check checkbox 1. Verify checkbox 1 is checked."),config_path=sys.argv[1],build_root=__import__("pathlib").Path(sys.argv[2]),workflow_version="semantic-general-v1")',
+    '  result=run_ui_workflow(UiRequest(sys.argv[3],"Go to site. Check checkbox 1. Verify checkbox 1 is checked."),config_path=sys.argv[1],build_root=__import__("pathlib").Path(sys.argv[2]))',
     'out=result.outcome',
     'print(json.dumps({"uiKind":result.kind,"workflow":result.workflow_version,"wireKind":out["kind"],"record":out.get("context",{}).get("result"),"projection":result.projection}))',
   ].join('\n');
   const python = path.resolve('.venv/Scripts/python.exe');
+  const smokeEnv: NodeJS.ProcessEnv = { ...process.env, OPENAI_API_KEY: '',
+    PLAYWRIGHT_DEMO_LIVE_VIEW: '0', PYTHONPATH: path.resolve('src') };
+  delete smokeEnv.PLAYWRIGHT_DEMO_WORKFLOW_VERSION;
+  delete smokeEnv.PLAYWRIGHT_DEMO_BROWSER_BACKEND;
+  delete smokeEnv.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE;
   const run = spawn(python, ['-c', script, configPath, path.join(root, 'ui-build'), rootUrl,
     JSON.stringify(selected.reference), selected.fingerprint], { windowsHide: true,
-    env: { ...process.env, OPENAI_API_KEY: '', PLAYWRIGHT_DEMO_WORKFLOW_VERSION: 'semantic-general-v1',
-      PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE: 'offline-review',
-      PLAYWRIGHT_DEMO_BROWSER_BACKEND: 'local-windows', PLAYWRIGHT_DEMO_LIVE_VIEW: '0',
-      PYTHONPATH: path.resolve('src') }, stdio: ['ignore', 'pipe', 'pipe'] });
+    env: smokeEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '', stderr = '';
   run.stdout.setEncoding('utf8').on('data', part => { stdout += part; });
   run.stderr.setEncoding('utf8').on('data', part => { stderr += part; });

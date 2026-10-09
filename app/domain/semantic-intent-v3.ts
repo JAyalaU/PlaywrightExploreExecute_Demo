@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { ApprovedAbsoluteUrlSchema, ExecutionProfileRefSchema } from './schema.js';
+import { ApprovedAbsoluteUrlSchema, ExecutionProfileRefSchema } from './shared-contracts.js';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);
 const phrase = z.string().min(1).max(1024);
@@ -48,35 +48,67 @@ export const SemanticIntentTestSpecV3Schema = TrustedSemanticSourceV3Schema.exte
 });
 export type SemanticIntentTestSpecV3 = z.infer<typeof SemanticIntentTestSpecV3Schema>;
 
-export function parseSemanticIntentTestSpecV3(input: unknown): SemanticIntentTestSpecV3 {
+export class SemanticIntentValidationErrorV3 extends Error {
+  constructor(readonly predicate: 'DUPLICATE_STEP_ID' | 'INVALID_STEP_DEPENDENCY' |
+    'INVALID_TARGET_RELATION' | 'CONFLICTING_TARGET_IDENTITY' |
+    'INVALID_ACTION_EFFECT_ARGUMENT' | 'INVALID_VERIFICATION_PREDICATE' | 'INVALID_CARDINALITY_VALUE',
+  readonly stepIndex: number, readonly fieldFamily: 'step_identity' | 'dependency' | 'relation' |
+    'ordinal' | 'action_argument' | 'verification_value') { super(predicate); }
+}
+
+function parseSemanticIntentTestSpecV3AtBoundary(input: unknown,
+  validateCanonicalRelations: boolean): SemanticIntentTestSpecV3 {
   const spec = SemanticIntentTestSpecV3Schema.parse(input);
-  const prior = new Set<string>();
-  for (const step of spec.steps) {
-    if (prior.has(step.id)) throw new Error('DUPLICATE_STEP_ID');
-    if (step.dependsOnStepId && !prior.has(step.dependsOnStepId)) throw new Error('INVALID_STEP_DEPENDENCY');
+  const prior = new Map<string, SemanticIntentStepV3>();
+  for (const [stepIndex, step] of spec.steps.entries()) {
+    if (prior.has(step.id)) throw new SemanticIntentValidationErrorV3('DUPLICATE_STEP_ID', stepIndex, 'step_identity');
+    if (step.dependsOnStepId && !prior.has(step.dependsOnStepId))
+      throw new SemanticIntentValidationErrorV3('INVALID_STEP_DEPENDENCY', stepIndex, 'dependency');
     if (step.type === 'action_intent' || step.type === 'verification_intent' && step.subject) {
       const target = step.type === 'action_intent' ? step.target : step.subject!;
-      if ((target.relation === 'same_as_step' || target.relation === 'created_by_step') !== !!target.relatedStepId ||
-          target.relatedStepId && !prior.has(target.relatedStepId)) throw new Error('INVALID_TARGET_RELATION');
-      if (target.ordinal !== null && target.relation === 'any_matching') throw new Error('CONFLICTING_TARGET_IDENTITY');
+      const referenced = target.relatedStepId ? prior.get(target.relatedStepId) : undefined;
+      // A candidate relation cannot veto stronger authored semantics. Reference existence and
+      // ownership are structural; relation/reference agreement is checked on canonical intent.
+      if (target.relatedStepId && (!referenced || referenced.type === 'navigate' ||
+          referenced.type === 'verification_intent' && referenced.subject === null))
+        throw new SemanticIntentValidationErrorV3('INVALID_TARGET_RELATION', stepIndex, 'relation');
+      if (validateCanonicalRelations) {
+        if ((target.relation === 'same_as_step' || target.relation === 'created_by_step') !==
+            !!target.relatedStepId || target.relation === 'created_by_step' &&
+            referenced?.type !== 'action_intent')
+          throw new SemanticIntentValidationErrorV3('INVALID_TARGET_RELATION', stepIndex, 'relation');
+        if (target.ordinal !== null && target.relation === 'any_matching')
+          throw new SemanticIntentValidationErrorV3('CONFLICTING_TARGET_IDENTITY', stepIndex, 'ordinal');
+      }
     }
     if (step.type === 'action_intent') {
       if ((step.desiredEffect === 'choose' || step.desiredEffect === 'set_value') !== (step.value !== null) ||
           (step.desiredEffect === 'set_checked') !== (step.checkedState !== null))
-        throw new Error('INVALID_ACTION_EFFECT_ARGUMENT');
+        throw new SemanticIntentValidationErrorV3('INVALID_ACTION_EFFECT_ARGUMENT', stepIndex, 'action_argument');
     }
     if (step.type === 'verification_intent') {
+      if (step.observable === 'cardinality' && typeof step.expected !== 'number')
+        throw new SemanticIntentValidationErrorV3('INVALID_CARDINALITY_VALUE', stepIndex, 'verification_value');
       if ((step.observable === 'url') !== (step.subject === null) ||
           (['exists', 'visible', 'enabled', 'checked', 'selected'].includes(step.observable) &&
             (typeof step.expected !== 'boolean' || step.comparator !== 'equals')) ||
           (['value', 'url'].includes(step.observable) &&
-            (typeof step.expected !== 'string' || step.comparator !== 'equals')) ||
-          (step.observable === 'cardinality' && typeof step.expected !== 'number'))
-        throw new Error('INVALID_VERIFICATION_PREDICATE');
+            (typeof step.expected !== 'string' || step.comparator !== 'equals')))
+        throw new SemanticIntentValidationErrorV3('INVALID_VERIFICATION_PREDICATE', stepIndex, 'verification_value');
     }
-    prior.add(step.id);
+    prior.set(step.id, step);
   }
   return spec;
+}
+
+/** Provider candidate: validate shape, primitive consistency, and prior references only. */
+export function parseSemanticIntentTestSpecStructureV3(input: unknown): SemanticIntentTestSpecV3 {
+  return parseSemanticIntentTestSpecV3AtBoundary(input, false);
+}
+
+/** Admitted intent: all structural and canonical cross-step semantic invariants hold. */
+export function parseSemanticIntentTestSpecV3(input: unknown): SemanticIntentTestSpecV3 {
+  return parseSemanticIntentTestSpecV3AtBoundary(input, true);
 }
 
 const stable = (value: unknown): string => Array.isArray(value) ? `[${value.map(stable).join(',')}]` :

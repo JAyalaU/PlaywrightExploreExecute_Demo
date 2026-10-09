@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { Page, Request } from '@playwright/test';
-import type { ProtectedBrowserSession } from '../profile/context.js';
+import type { BrowserContext } from '@playwright/test';
+type ProtectedBrowserSession = { context: BrowserContext; isClosed: boolean;
+  onClosing(observer: () => void): () => void };
 
 export type CommittedDocumentWaitStop = 'PAGE_NOT_OWNED' | 'PAGE_CLOSED' | 'CONTEXT_CLOSED' |
   'BROWSER_DISCONNECTED' | 'DOCUMENT_REPLACED' | 'TIMEOUT';

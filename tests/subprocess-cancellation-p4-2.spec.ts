@@ -1,9 +1,8 @@
 import { expect, test } from '@playwright/test';
 import type { Browser, BrowserContext } from '@playwright/test';
 import { installSubprocessCancellation } from '../app/subprocess/cancellation.js';
-import { ProtectedBrowserSession } from '../app/profile/context.js';
-import type { EffectiveProfile } from '../app/profile/contracts.js';
-import type { IsolatedBrowser } from '../app/profile/isolated-browser.js';
+import { ProtectedBrowserSession } from '../app/profile/local-context.js';
+import type { NativeEffectiveProfile } from '../app/profile/native-profile.js';
 
 test('P4-2 Node child catches the host graceful cancellation signal', () => {
   const controller = new AbortController();
@@ -14,16 +13,15 @@ test('P4-2 Node child catches the host graceful cancellation signal', () => {
   } finally { remove(); }
 });
 
-test('P4-2 concurrent protected closes both await isolated disposal', async () => {
+test('concurrent native protected closes await browser disposal', async () => {
   let finishDisposal!: () => void;
   const disposal = new Promise<void>((resolve) => { finishDisposal = resolve; });
   let contextClosed = 0;
-  let isolatedClosed = 0;
+  let browserClosed = 0;
   const session = new ProtectedBrowserSession(
-    { version: () => 'test' } as Browser,
+    { version: () => 'test', close: async () => { browserClosed++; await disposal; } } as Browser,
     { close: async () => { contextClosed++; } } as unknown as BrowserContext,
-    { fingerprint: '0'.repeat(64) } as EffectiveProfile,
-    { close: async () => { isolatedClosed++; await disposal; } } as unknown as IsolatedBrowser,
+    { fingerprint: '0'.repeat(64) } as NativeEffectiveProfile,
   );
   let observerClose: Promise<void> | undefined;
   session.onClosing(() => { observerClose = session.close(); });
@@ -37,18 +35,17 @@ test('P4-2 concurrent protected closes both await isolated disposal', async () =
   finishDisposal();
   await Promise.all([first, second]);
   expect(observerClose).toBe(first);
-  expect([contextClosed, isolatedClosed]).toEqual([1, 1]);
+  expect([contextClosed, browserClosed]).toEqual([1, 1]);
   await session.close();
-  expect([contextClosed, isolatedClosed]).toEqual([1, 1]);
+  expect([contextClosed, browserClosed]).toEqual([1, 1]);
 });
 
 test('P4-2 cleanup failure propagates after context close', async () => {
   let contextClosed = false;
   const session = new ProtectedBrowserSession(
-    { version: () => 'test' } as Browser,
+    { version: () => 'test', close: async () => { throw new Error('disposal failed'); } } as unknown as Browser,
     { close: async () => { contextClosed = true; } } as unknown as BrowserContext,
-    { fingerprint: '0'.repeat(64) } as EffectiveProfile,
-    { close: async () => { throw new Error('disposal failed'); } } as unknown as IsolatedBrowser,
+    { fingerprint: '0'.repeat(64) } as NativeEffectiveProfile,
   );
   await expect(session.close()).rejects.toThrow('Protected browser session cleanup failed');
   expect(contextClosed).toBe(true);

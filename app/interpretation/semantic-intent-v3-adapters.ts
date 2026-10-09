@@ -1,5 +1,6 @@
 import { createOpenAIResponsesClient, type OpenAIResponsesConfig } from './openai-responses.js';
 import { ModelCompletionFailure } from './model-failure.js';
+import { semanticPrimaryWireFailureDiagnosticV1 } from './semantic-primary-output-diagnostic-v1.js';
 import type { SemanticIntentModelsV3 } from './semantic-intent-v3.js';
 import { SEMANTIC_INTENT_FIDELITY_V3_FORMAT, SEMANTIC_INTENT_PRIMARY_V3_FORMAT,
   SemanticIntentFidelityWireV3Schema, SemanticIntentPrimaryWireV3Schema } from './semantic-intent-v3-wire.js';
@@ -16,12 +17,15 @@ export function createOpenAISemanticIntentModelsV3(primaryConfig: OpenAIResponse
         format: phase === 'primary' ? SEMANTIC_INTENT_PRIMARY_V3_FORMAT : SEMANTIC_INTENT_FIDELITY_V3_FORMAT,
         signal });
       if (outcome.kind === 'failure') throw new ModelCompletionFailure(outcome.code,
-        outcome.completedMalformedOutput === true);
+        outcome.completedMalformedOutput === true, phase === 'primary' ? outcome.semanticPrimaryDiagnostic : undefined);
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(outcome.output) as unknown;
+        parsed = JSON.parse(outcome.output) as unknown;
         return JSON.stringify(phase === 'primary' ? SemanticIntentPrimaryWireV3Schema.parse(parsed) :
           SemanticIntentFidelityWireV3Schema.parse(parsed));
-      } catch { throw new ModelCompletionFailure('PROVIDER_OUTPUT_INVALID', true); }
+      } catch (error) { throw new ModelCompletionFailure('PROVIDER_OUTPUT_INVALID', true,
+        phase === 'primary' ? semanticPrimaryWireFailureDiagnosticV1(error,
+          outcome.semanticPrimaryCorrelation, parsed) : undefined); }
     } };
   };
   return { primary: adapter(primaryConfig, 'primary'), reviewer: adapter(reviewerConfig, 'reviewer') };

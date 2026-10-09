@@ -47,7 +47,7 @@ async function regular(file: string, limit: number): Promise<Buffer> {
   if (!info.isFile() || info.isSymbolicLink() || info.size > limit) throw new Error('Invalid semantic restricted file');
   return readFile(file);
 }
-/** Separate authenticated namespace. v9 readers cannot mint or parse v10 runner authority. */
+/** Separate authenticated namespace for resolved-v10 runner authority. */
 export class SemanticCompilerV5Store {
   readonly #root: string;
   #key: Promise<Buffer> | undefined;

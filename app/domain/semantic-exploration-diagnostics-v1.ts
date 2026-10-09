@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ProtectedBrowserSession } from '../profile/context.js';
+import type { ProtectedBrowserSession } from '../profile/local-context.js';
 import { diagnosticBrowserUrl } from './deferred-browser-diagnostics.js';
 
 const id = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/).max(128);

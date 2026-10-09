@@ -1,10 +1,10 @@
 import { TextDecoder } from 'node:util';
 import { z } from 'zod';
 import { ResultRecordV2Schema, type ResultRecordV2 } from '../domain/agentic-result-v2.js';
-import { ExecutionProfileRefSchema } from '../domain/schema.js';
-import { LocalWorkflowRequestSchema } from '../local/contracts.js';
+import { ExecutionProfileRefSchema } from '../domain/shared-contracts.js';
+import { LocalWorkflowRequestSchema } from '../local/product-contracts.js';
 import { BridgeErrorCodeSchema, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, SUBPROCESS_EXIT,
-  SubprocessProtocolError } from './protocol.js';
+  SubprocessProtocolError } from './shared-protocol.js';
 
 export const SUBPROCESS_PROTOCOL_V2 = '2' as const;
 const id = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_-]*$/);
@@ -39,8 +39,6 @@ const withContext = z.strictObject({ result: ResultRecordV2Schema, progress, rep
     issue.addIssue({ code: 'custom', path: ['report'], message: 'Report owner mismatch' });
   if (value.report.kind === 'available' && !r.successfulTraceId)
     issue.addIssue({ code: 'custom', path: ['report'], message: 'Report requires a stored successful trace' });
-  if (value.report.kind === 'available' && r.deferredStage)
-    issue.addIssue({ code: 'custom', path: ['report'], message: 'Deferred pre-replay stops have no successful replay projection' });
   const p = value.progress;
   if (p.stage === 'not_started' ? !!r.explorationAttemptId || !!r.compilerAttemptId || r.executionRunIds.length > 0 :
       p.explorationAttemptId !== r.explorationAttemptId ||

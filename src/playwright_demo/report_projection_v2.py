@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .host import HostCallResult, _Drain, _failure, _stderr_summary, _stop_child
-from .protocol import InvalidWire, _FP, _id, _obj, _pairs_unique, STATUSES
-from .protocol_v2 import REASONS, parse_response
+from .wire_common import InvalidWire, _FP, _id, _obj, _pairs_unique
+from .protocol_v2 import REASONS, TERMINALS, parse_response
 
 VERSION = "2"
 MAX_REQUEST_BYTES = 8_192
@@ -47,10 +47,6 @@ def _parse_report_projection(data: bytes, result: Mapping[str, Any]) -> dict[str
             parse_constant=lambda _: (_ for _ in ()).throw(InvalidWire("Invalid JSON constant")))
     except (UnicodeError, ValueError) as error:
         raise InvalidWire("Invalid projection JSON") from error
-    if result.get("context", {}).get("result", {}).get("workflowVersion") == "deferred-action-v1" and type(value) is dict and value.get("kind") != "unavailable":
-        if len(data) > 8192: raise InvalidWire("Deferred projection exceeds bound")
-        from .deferred_contract_v2 import validate_projection
-        return validate_projection(value, result)
     item = _obj(value, {"reportProjectionVersion", "kind"}, {"reason", "testSpecId", "executionProfileRef",
         "profileFingerprint", "explorationAttemptId", "successfulTraceId", "compilerAttemptId",
         "resolvedSpecId", "executionRunIds", "terminal", "stages", "replays", "reproducibility",
@@ -106,7 +102,7 @@ def _parse_report_projection(data: bytes, result: Mapping[str, Any]) -> dict[str
         _obj(outcome, {"executionRunId", "status", "expected", "actual"},
              {"originStepId", "executionStepId", "reason"})
         _id(outcome["executionRunId"])
-        if outcome["executionRunId"] not in record["executionRunIds"] or outcome["status"] not in STATUSES or \
+        if outcome["executionRunId"] not in record["executionRunIds"] or outcome["status"] not in TERMINALS or \
            ("reason" in outcome and outcome["reason"] not in REASONS):
             raise InvalidWire("Invalid projected outcome")
         for key in ("originStepId", "executionStepId"):

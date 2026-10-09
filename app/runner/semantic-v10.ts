@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type ElementHandle, type Locator, type Page } from '@playwright/test';
-import { ProtectedContextFactory, ProtectedFinalCheckError, type ProtectedBrowserSession } from '../profile/context.js';
-import { assertEquivalentEffectiveProfile } from '../profile/contracts.js';
+import { ProtectedContextFactory, ProtectedFinalCheckError, type ProtectedBrowserSession } from '../profile/local-context.js';
+import { assertEquivalentNativeProfile } from '../profile/native-profile.js';
 import { CommittedDocumentReadiness, CommittedDocumentReadinessError } from '../browser-action/committed-document-readiness.js';
 import { semanticGroundingDigestV1 as hash } from '../domain/semantic-grounding-v1.js';
 import { type SemanticResolvedStepV10, type SemanticResolvedTestSpecV10,
@@ -11,6 +11,10 @@ import { sealSemanticRunnerRecordV10, sealSemanticRunnerStepV10,
   type SemanticRunnerStopV10, type SemanticRunnerGuardProofV10 } from '../domain/semantic-runner-v10.js';
 import { requireTrustedSemanticResolvedReadbackV10,
   type TrustedSemanticResolvedReadbackV10 } from '../evidence/semantic-compiler-store-v5.js';
+import { parseDemoActionPauseMs, pauseAfterSuccessfulAction,
+  type PresentationClock } from './demo-action-pacing.js';
+import { RunnerV10DiagnosticCollector, SemanticRunnerDiagnosticsV10Store,
+  classifyClickFailureV10, type CountSettlingV10 } from './semantic-v10-diagnostics.js';
 
 type Domain = Extract<SemanticResolvedStepV10, { type: 'action' }>['domain'];
 type Target = Extract<SemanticResolvedStepV10, { type: 'action' }>['target'];
@@ -22,6 +26,10 @@ const SELECTOR = 'a,button,input,select,textarea,[role]';
 const MAX_CANDIDATES = 100;
 class Stop extends Error { constructor(readonly reason: SemanticRunnerStopV10) { super(reason); } }
 const stop = (reason: SemanticRunnerStopV10): never => { throw new Stop(reason); };
+const observeOnly = (callback: () => void): void => { try { callback(); } catch { /* diagnostics */ } };
+const diagnosticValue = <T>(callback: () => T, fallback: T): T => {
+  try { return callback(); } catch { return fallback; }
+};
 function same(a: unknown, b: unknown): boolean { return hash(a) === hash(b); }
 async function sameNode(a: ElementHandle, b: ElementHandle): Promise<boolean> {
   return a.evaluate((node, other) => node === other, b);
@@ -57,7 +65,8 @@ class Runtime {
   readonly #readiness: CommittedDocumentReadiness;
   readonly #selectedByStep = new Map<string, string>();
   readonly #beforeAction = new Map<string, { identities: Set<string>; paths: Set<string> }>();
-  constructor(readonly session: ProtectedBrowserSession, readonly page: Page, readonly deadline: number) {
+  constructor(readonly session: ProtectedBrowserSession, readonly page: Page, public deadline: number,
+    readonly diagnostics: RunnerV10DiagnosticCollector | undefined) {
     this.#readiness = new CommittedDocumentReadiness(session);
   }
   bounded(): void {
@@ -65,6 +74,7 @@ class Runtime {
     if (this.session.isClosed || this.page.isClosed() || this.session.context.pages().length !== 1 ||
       this.session.context.pages()[0] !== this.page) stop('ENVIRONMENT_FAILURE');
   }
+  excludePresentationTime(elapsedMs: number): void { this.deadline += elapsedMs; }
   async ready(): Promise<void> {
     this.bounded();
     try { await this.#readiness.wait(this.page, Math.max(1, Math.min(
@@ -167,7 +177,8 @@ class Runtime {
   async dispose(candidates: Candidate[]): Promise<void> {
     await Promise.allSettled(candidates.map(c => c.handle.dispose()));
   }
-  async action(step: Extract<SemanticResolvedStepV10, { type: 'action' }>, onInvoke: () => void): Promise<{
+  async action(step: Extract<SemanticResolvedStepV10, { type: 'action' }>, onInvoke: () => void,
+    nextCount?: Extract<SemanticResolvedStepV10, { type: 'assert_count' }>): Promise<{
     guard: SemanticRunnerGuardProofV10; effect: boolean | string | null }> {
     const bound = await this.guard(step), selected = bound.selected ?? stop('LOCATOR_BINDING_FAILED');
     let ownedOptions: ElementHandle[] = [];
@@ -205,7 +216,14 @@ class Runtime {
         if (!await sameNode(selected.handle, renewedTarget.handle) ||
           this.page.url() !== currentUrl) stop('STALE_EVIDENCE');
         this.bounded();
+        const clickStart = diagnosticValue(() => this.diagnostics?.startMs() ?? 0, 0);
+        const domainDigest = this.diagnostics ?
+          diagnosticValue(() => hash(step.domain), '0'.repeat(64)) : '0'.repeat(64);
+        if (step.operation === 'click') observeOnly(() => this.diagnostics?.milestone(step.stepId, 'guard_complete',
+          renewedTarget.identity, domainDigest, clickStart));
         onInvoke();
+        if (step.operation === 'click') observeOnly(() => this.diagnostics?.milestone(step.stepId, 'click_invocation_started',
+          renewedTarget.identity, domainDigest, clickStart));
         try {
           if (step.operation === 'check') await renewedTarget.handle.check({ timeout: this.actionTimeout() });
           else if (step.operation === 'uncheck') await renewedTarget.handle.uncheck({ timeout: this.actionTimeout() });
@@ -213,7 +231,21 @@ class Runtime {
             { value: step.argument! }, { timeout: this.actionTimeout() });
           else if (step.operation === 'fill') await renewedTarget.handle.fill(step.argument!, { timeout: this.actionTimeout() });
           else await renewedTarget.handle.click({ timeout: this.actionTimeout() });
-        } catch { stop('ACTION_FAILED_PARTIAL_OR_UNKNOWN'); }
+        } catch (error) {
+          if (step.operation === 'click' && this.diagnostics) {
+            observeOnly(() => { const state = this.diagnostics!.base();
+              this.diagnostics!.milestone(step.stepId, 'click_invocation_threw',
+                renewedTarget.identity, domainDigest, clickStart, classifyClickFailureV10(error, state)); });
+          }
+          stop('ACTION_FAILED_PARTIAL_OR_UNKNOWN');
+        }
+        if (step.operation === 'click') {
+          observeOnly(() => this.diagnostics?.milestone(step.stepId, 'click_invocation_returned',
+            renewedTarget.identity, domainDigest, clickStart));
+          if (nextCount && this.diagnostics)
+            observeOnly(() => this.diagnostics!.effect(step.stepId, nextCount.stepId,
+              () => this.probeCount(nextCount.domain)));
+        }
         this.#selectedByStep.set(step.stepId, selected.identity);
         if (step.operation === 'click') return { guard: renewed.guard, effect: null };
         const after = await this.guard(step);
@@ -248,6 +280,18 @@ class Runtime {
   }
   actionTimeout(): number { return Math.max(1, Math.min(this.session.effectiveProfile.profile.timeoutPolicy.actionMs,
     this.deadline - Date.now())); }
+  /** Passive complete-role-domain count; no readiness, guard, or execution decision depends on it. */
+  async probeCount(domain: Domain): Promise<number> {
+    const groups = await Promise.all(domain.roles.map(async role => this.page.getByRole(
+      role as Parameters<Page['getByRole']>[0],
+      { includeHidden: true, ...(domain.exactName !== null ? { name: domain.exactName, exact: true } : {}) })
+      .evaluateAll(nodes => nodes.map(node => ({
+        contextText: node.parentElement?.textContent?.trim().slice(0, 512) ?? '',
+        tag: node.tagName.toLowerCase() })) )));
+    return groups.reduce((sum, group, index) => sum + group.filter(candidate =>
+      contextKind(domain.context, { domIndex: 0, role: domain.roles[index]!, name: '', tag: candidate.tag,
+        inputType: '', path: '', contextText: candidate.contextText }, domain.roles) !== null).length, 0);
+  }
   async options(candidate: Candidate): Promise<Array<{ label: string; value: string; selected: boolean; disabled: boolean }>> {
     return candidate.handle.evaluate(node => Array.from((node as HTMLSelectElement).options).map(option => ({
       label: option.label.slice(0, 512), value: option.value.slice(0, 1024), selected: option.selected,
@@ -284,8 +328,39 @@ class Runtime {
   }
   async assert(step: Exclude<SemanticResolvedStepV10, { type: 'action' | 'navigate' }>): Promise<{
     guard: SemanticRunnerGuardProofV10 | null; observed: boolean | string | number; passed: boolean }> {
-    const initial = await this.observe(step);
-    if (initial.passed || step.wait.mode !== 'bounded_resulting_state') return initial;
+    const countStart = step.type === 'assert_count' ?
+      diagnosticValue(() => this.diagnostics?.startMs(), undefined) : undefined;
+    const initialState = step.type === 'assert_count' ?
+      diagnosticValue(() => this.diagnostics?.base(), undefined) : undefined;
+    if (initialState) observeOnly(() => this.diagnostics?.enrich(initialState));
+    let initial: Awaited<ReturnType<Runtime['observe']>>;
+    try { initial = await this.observe(step); }
+    catch (error) {
+      if (step.type === 'assert_count') observeOnly(() => this.diagnostics?.countFailure(step.stepId,
+        'COUNT_OBSERVATION_ERROR'));
+      throw error;
+    }
+    const transitions: CountSettlingV10['transitions'] = [];
+    const finishCount = (result: typeof initial, exhausted: boolean, interrupted = false): void => {
+      if (step.type !== 'assert_count' || !this.diagnostics || !initialState || countStart === undefined ||
+        typeof initial.observed !== 'number' || typeof result.observed !== 'number') return;
+      const ended = diagnosticValue(() => this.diagnostics!.base(), undefined);
+      if (!ended) return;
+      observeOnly(() => this.diagnostics?.enrich(ended));
+      const initialCount = initial.observed, finalCount = result.observed;
+      const diagnostics = this.diagnostics;
+      observeOnly(() => this.diagnostics!.counts.push({ stepId: step.stepId, comparator: step.operator,
+        expected: step.expected, started: initialState, initialCount,
+        transitions, finalCount, ended,
+        elapsedMs: Math.max(0, diagnostics.startMs() - countStart), exhausted,
+        interrupted,
+        navigationRequestedDuringSettling:
+          ended.navigationRequestGeneration !== initialState.navigationRequestGeneration,
+        documentChanged: ended.navigationGeneration !== initialState.navigationGeneration }));
+    };
+    if (initial.passed || step.wait.mode !== 'bounded_resulting_state') {
+      finishCount(initial, false); return initial;
+    }
     const deadline = Math.min(this.deadline, Date.now() +
       (this.session.effectiveProfile.profile.timeoutPolicy.waits.default ?? 3000));
     let previous = initial;
@@ -309,10 +384,26 @@ class Runtime {
             requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
           }), remaining);
         }
-      } catch { stop('ENVIRONMENT_FAILURE'); }
-      previous = await this.observe(step);
-      if (previous.passed) return previous;
+      } catch {
+        if (step.type === 'assert_count') observeOnly(() => this.diagnostics?.countFailure(step.stepId,
+          'COUNT_SETTLING_WAIT_ERROR'));
+        finishCount(previous, false, true);
+        stop('ENVIRONMENT_FAILURE');
+      }
+      try { previous = await this.observe(step); }
+      catch (error) {
+        if (step.type === 'assert_count') observeOnly(() => this.diagnostics?.countFailure(step.stepId,
+          'COUNT_OBSERVATION_ERROR'));
+        throw error;
+      }
+      if (step.type === 'assert_count' && typeof previous.observed === 'number' &&
+        previous.observed !== (transitions.at(-1)?.count ?? initial.observed))
+        observeOnly(() => { const state = this.diagnostics?.base() ?? initialState!;
+          this.diagnostics?.enrich(state);
+          if (transitions.length < 32) transitions.push({ count: previous.observed as number, state }); });
+      if (previous.passed) { finishCount(previous, false); return previous; }
     }
+    finishCount(previous, true);
     return previous;
   }
 }
@@ -332,10 +423,13 @@ export function requireTrustedSemanticRunV10(input: TrustedSemanticRunV10): Sema
 }
 /** One independent deterministic replay; only a trusted v10 readback can enter this boundary. */
 export async function runSemanticResolvedTestV10(factory: ProtectedContextFactory,
-  input: TrustedSemanticResolvedReadbackV10): Promise<TrustedSemanticRunV10> {
+  input: TrustedSemanticResolvedReadbackV10,
+  presentationClock?: PresentationClock, diagnosticRoot?: string): Promise<TrustedSemanticRunV10> {
+  const actionPauseMs = parseDemoActionPauseMs(process.env.PLAYWRIGHT_DEMO_ACTION_PAUSE_MS);
   const executionRunId = `semantic-run-${randomUUID()}`, startedAt = new Date().toISOString();
   let artifact: ReturnType<typeof requireTrustedSemanticResolvedReadbackV10> | undefined;
   let session: ProtectedBrowserSession | undefined, runtime: Runtime | undefined;
+  let diagnostics: RunnerV10DiagnosticCollector | undefined;
   let reason: SemanticRunnerStopV10 | undefined, failedStepId: string | null = null;
   let cleanup: 'verified' | 'unverified' = 'verified';
   const steps: SemanticRunnerStepV10[] = [];
@@ -349,12 +443,15 @@ export async function runSemanticResolvedTestV10(factory: ProtectedContextFactor
     const profile = factory.catalog.resolve(profileRef);
     if (profile.fingerprint !== resolved.profileFingerprint) stop('PROFILE_MISMATCH');
     session = await factory.open(profileRef, profile, { observationOwner: { kind: 'run', id: executionRunId } });
-    assertEquivalentEffectiveProfile(profile, session.effectiveProfile);
+    assertEquivalentNativeProfile(profile, session.effectiveProfile);
     if (session.effectiveProfile.fingerprint !== resolved.profileFingerprint) stop('PROFILE_MISMATCH');
     const page = await session.context.newPage();
-    runtime = new Runtime(session, page, Date.now() + 120_000);
-    for (const step of resolved.executionSteps) {
+    try { if (diagnosticRoot) diagnostics = new RunnerV10DiagnosticCollector(page); }
+    catch { /* diagnostics cannot affect execution */ }
+    runtime = new Runtime(session, page, Date.now() + 120_000, diagnostics);
+    for (const [stepIndex, step] of resolved.executionSteps.entries()) {
       failedStepId = step.stepId;
+      observeOnly(() => diagnostics?.boundary(step.stepId, 'step_started'));
       runtime.bounded();
       let guard: SemanticRunnerGuardProofV10 | null = null, invocation: SemanticRunnerStepV10['invocation'] = 'not_invoked';
       let operation: SemanticRunnerStepV10['operation'] = null, effect: SemanticRunnerStepV10['effect'] = null;
@@ -371,7 +468,11 @@ export async function runSemanticResolvedTestV10(factory: ProtectedContextFactor
           invocation = 'returned'; status = 'action_succeeded';
         } else if (step.type === 'action') {
           operation = step.operation;
-          const result = await runtime.action(step, () => { invocation = 'unknown'; });
+          const followingAssertion = resolved.executionSteps.slice(stepIndex + 1).find(item =>
+            item.type !== 'action' && item.type !== 'navigate');
+          const nextCount = step.operation === 'click' && followingAssertion?.type === 'assert_count' ?
+            followingAssertion : undefined;
+          const result = await runtime.action(step, () => { invocation = 'unknown'; }, nextCount);
           guard = result.guard; effect = result.effect; invocation = 'returned'; status = 'action_succeeded';
         } else {
           const result = await runtime.assert(step);
@@ -381,13 +482,25 @@ export async function runSemanticResolvedTestV10(factory: ProtectedContextFactor
         }
         steps.push(sealSemanticRunnerStepV10({ stepId: step.stepId, resolvedType: step.type, status,
           guard, invocation, operation, effect, observation, expected, stopReason: null }));
+        observeOnly(() => diagnostics?.boundary(step.stepId, 'step_sealed'));
+        if (step.type === 'action' && step.operation === 'click') try {
+          diagnostics?.milestone(step.stepId, 'action_receipt_sealed', step.target.identity,
+            hash(step.domain), diagnostics.clickStart(step.stepId));
+          diagnostics?.milestone(step.stepId, 'post_action_boundary_entered', step.target.identity,
+            hash(step.domain), diagnostics.clickStart(step.stepId));
+        } catch { /* diagnostics cannot affect execution */ }
       } catch (error) {
         const code: SemanticRunnerStopV10 = error instanceof Stop ? error.reason :
           invocation === 'unknown' ? 'ACTION_FAILED_PARTIAL_OR_UNKNOWN' : 'ENVIRONMENT_FAILURE';
         steps.push(sealSemanticRunnerStepV10({ stepId: step.stepId, resolvedType: step.type,
           status: 'stopped', guard, invocation, operation, effect, observation, expected, stopReason: code }));
+        observeOnly(() => diagnostics?.boundary(step.stepId, 'step_sealed'));
         stop(code);
       }
+      // Presentation happens only after the successful action receipt is sealed.
+      // It is outside the action/error boundary and never becomes step evidence.
+      if (step.type === 'action')
+        runtime.excludePresentationTime(await pauseAfterSuccessfulAction(actionPauseMs, presentationClock));
     }
     failedStepId = null;
   } catch (error) { reason = error instanceof Stop ? error.reason : 'ENVIRONMENT_FAILURE'; }
@@ -409,5 +522,11 @@ export async function runSemanticResolvedTestV10(factory: ProtectedContextFactor
     result: reason ? { kind: 'non_qa_stop', reason, failedStepId } :
       { kind: 'completed', assertions: steps.filter(s => s.status.startsWith('assertion_')).length,
         passed: !steps.some(s => s.status === 'assertion_false') } });
+  if (diagnostics && diagnosticRoot && artifact) try {
+    await new SemanticRunnerDiagnosticsV10Store(diagnosticRoot).write(diagnostics.record({ executionRunId,
+      resolvedSpecId: artifact.resolved.resolvedSpecId,
+      compilerAttemptId: artifact.resolved.compilerAttemptId,
+      traceDigest: artifact.resolved.traceDigest }));
+  } catch { /* restricted diagnostics never change runner truth */ }
   return new TrustedSemanticRunV10(token, record);
 }

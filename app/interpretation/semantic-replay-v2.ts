@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ProtectedContextFactory } from '../profile/context.js';
+import { ProtectedContextFactory } from '../profile/local-context.js';
 import { semanticGroundingDigestV1 as hash } from '../domain/semantic-grounding-v1.js';
 import { sealSemanticReplayPairV2, parseSemanticReplayPairV2,
   type SemanticReplayPairV2, type SemanticRunnerRecordV10 } from '../domain/semantic-runner-v10.js';
@@ -73,12 +73,13 @@ export function validateSemanticReplayRunsV2(runs: SemanticRunnerRecordV10[],
 /** Two sequential fresh sessions. Only matching complete deterministic assertions can issue QA. */
 export async function runSemanticTwoFreshReplaysV2(factory: ProtectedContextFactory,
   input: TrustedSemanticResolvedReadbackV10,
-  onRunStart?: (ordinal: 1 | 2) => void): Promise<TrustedSemanticReplayV2> {
+  onRunStart?: (ordinal: 1 | 2) => void, diagnosticRoot?: string): Promise<TrustedSemanticReplayV2> {
   const artifact = requireTrustedSemanticResolvedReadbackV10(input);
   const startedAt = new Date().toISOString(), runs: SemanticRunnerRecordV10[] = [];
   for (let index = 0; index < 2; index++) {
     onRunStart?.(index === 0 ? 1 : 2);
-    try { runs.push(requireTrustedSemanticRunV10(await runSemanticResolvedTestV10(factory, input))); }
+    try { runs.push(requireTrustedSemanticRunV10(await runSemanticResolvedTestV10(factory, input,
+      undefined, diagnosticRoot))); }
     catch { break; }
     if (runs[index]!.cleanup !== 'verified' || runs[index]!.result.kind !== 'completed') break;
   }

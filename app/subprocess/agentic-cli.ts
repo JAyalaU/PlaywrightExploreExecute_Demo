@@ -15,19 +15,21 @@ try {
   const { loadProjectEnv } = await import('../local/project-env.js');
   loadProjectEnv();
   const { runAgenticSubprocessAdapterV2 } = await import('./agentic-entry.js');
-  const { readSubprocessTrustedConfiguration } = await import('./entry.js');
+  const { readSubprocessTrustedConfiguration } = await import('./read-request.js');
   const { serializeSubprocessResponseV2, SUBPROCESS_PROTOCOL_V2 } = await import('./protocol-v2.js');
+  const { parseDemoActionPauseMs } = await import('../runner/demo-action-pacing.js');
+  const { requireSemanticGeneralProductEnvironment } = await import('../local/product-contracts.js');
   const args = process.argv.slice(2);
   const path = args.length === 2 && args[0] === '--config' && args[1] ? args[1] : undefined;
-  const selected = process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION ?? 'agentic-exploration-v1';
-  const workflowVersion = selected === 'semantic-general-v1' && process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE === 'offline-review' ||
-    selected === 'deferred-action-v1' && process.env.PLAYWRIGHT_DEMO_DEFERRED_ACTION_GATE === 'offline-review' ||
-    selected === 'structured-action-v1' || selected === 'goal-directed-v1' || selected === 'agentic-exploration-v1'
-    ? selected : undefined;
-  const response = path && workflowVersion ? await runAgenticSubprocessAdapterV2(process.stdin,
-    () => readSubprocessTrustedConfiguration(path, 'active-poc'),
+  let productConfigurationValid = true;
+  try {
+    requireSemanticGeneralProductEnvironment();
+    parseDemoActionPauseMs(process.env.PLAYWRIGHT_DEMO_ACTION_PAUSE_MS);
+  } catch { productConfigurationValid = false; }
+  const response = path && productConfigurationValid ? await runAgenticSubprocessAdapterV2(process.stdin,
+    () => readSubprocessTrustedConfiguration(path),
     { provider: { apiKey: () => process.env.OPENAI_API_KEY } },
-    { signal: controller.signal, workflowVersion }) :
+    { signal: controller.signal }) :
     { protocolVersion: SUBPROCESS_PROTOCOL_V2, kind: 'bridge_error' as const,
       code: 'INVALID_TRUSTED_CONFIGURATION' as const, cleanup: 'not_started' as const };
   let wire;

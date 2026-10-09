@@ -7,23 +7,18 @@ classification are supplied by later host integration, never by this module.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import base64
 import inspect
-import json
 import os
-import re
 from threading import Event, Lock, Thread
-from typing import TYPE_CHECKING, Callable, Literal, Any
+from typing import TYPE_CHECKING, Callable, Literal
 import atexit
-from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary
 
 import streamlit as st
-from .live_events import LiveEventBuffer
-from .live_images import LiveImageBuffer
-from .live_viewer import LiveViewerBuffer
-from .deferred_live_viewer import DeferredViewerBuffer
+from .local_frame_viewer import LocalFrameViewerBuffer as DeferredViewerBuffer
+from .local_frame_ui import render_local_frame_viewer
+from .demo_action_pacing import parse_demo_action_pause_ms
 
 if TYPE_CHECKING:
     from .ui_workflow import UiFinalResult
@@ -53,11 +48,7 @@ _RUN_KEY = "playwright_demo_active_run"
 _live_runs: set["UiRun"] = set()
 # Viewer capabilities stay in this process's volatile host buffer, never in
 # Streamlit session state or a reusable media endpoint.
-_viewer_buffers: WeakKeyDictionary["UiRun", LiveViewerBuffer] = WeakKeyDictionary()
 _deferred_viewer_buffers: WeakKeyDictionary["UiRun", DeferredViewerBuffer] = WeakKeyDictionary()
-_VIEWER_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
-_VIEWER_TOKEN = re.compile(r"^[a-f0-9]{64}$")
-_VIEWER_EXPIRY = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)$")
 
 
 class UiRun:
@@ -65,17 +56,8 @@ class UiRun:
 
     def __init__(self, request: UiRequest, execute: Callable[..., UiFinalResult | None]):
         self.request = request
-        self.deferred_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") in {"deferred-action-v1", "semantic-general-v1"}
-        self.agentic = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}
-        self.events = LiveEventBuffer()
-        self.images = LiveImageBuffer(self.events)
-        _viewer_buffers[self] = LiveViewerBuffer(self.events)
-        if self.deferred_workflow and os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") == "1":
-            _deferred_viewer_buffers[self] = DeferredViewerBuffer(
-                "frame_stream" if os.environ.get("PLAYWRIGHT_DEMO_BROWSER_BACKEND") == "local-windows" else "rfb")
-        if self.agentic:
-            self.events.mark_unavailable()
-            self.images.set_state("capture_disabled")
+        if os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") == "1":
+            _deferred_viewer_buffers[self] = DeferredViewerBuffer("frame_stream")
         self.cancel = Event()
         self.done = Event()
         self.result: UiFinalResult | None = None
@@ -89,18 +71,8 @@ class UiRun:
 
     def _run(self) -> None:
         try:
-            arguments = {"live_events": self.events, "cancel_event": self.cancel}
+            arguments = {"cancel_event": self.cancel}
             signature = inspect.signature(self._execute)
-            if "live_images" in signature.parameters or any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
-            ):
-                arguments["live_images"] = self.images
-            if "live_viewer" in signature.parameters or any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
-            ):
-                arguments["live_viewer"] = _viewer_buffers[self]
             if self in _deferred_viewer_buffers and ("deferred_viewer" in signature.parameters or any(
                 parameter.kind == inspect.Parameter.VAR_KEYWORD
                 for parameter in signature.parameters.values()
@@ -108,9 +80,6 @@ class UiRun:
                 arguments["deferred_viewer"] = _deferred_viewer_buffers[self]
             self.result = self._execute(self.request, **arguments)
             if self.result is None or self.result.kind != "engine":
-                self.images.set_state("capture_disabled")
-                if _viewer_buffers[self].snapshot()[0] != "not_started":
-                    _viewer_buffers[self].close()
                 if self in _deferred_viewer_buffers:
                     _deferred_viewer_buffers[self].close()
         except Exception:
@@ -118,8 +87,6 @@ class UiRun:
         finally:
             # A final host result (or host exception) ends UI authorization,
             # even if the child lifecycle channel omitted its closed notice.
-            if _viewer_buffers[self].snapshot()[0] != "not_started":
-                _viewer_buffers[self].close()
             if self in _deferred_viewer_buffers:
                 _deferred_viewer_buffers[self].close()
             self.done.set()
@@ -130,8 +97,6 @@ class UiRun:
 def _shutdown_live_runs() -> None:
     for run in tuple(_live_runs): run.cancel.set()
     for run in tuple(_live_runs): run.thread.join(timeout=5)
-    for run in tuple(_live_runs): run.images.clear()
-    for run in tuple(_live_runs): _viewer_buffers[run].close()
     for run in tuple(_live_runs):
         if run in _deferred_viewer_buffers: _deferred_viewer_buffers[run].close()
 
@@ -142,12 +107,10 @@ atexit.register(_shutdown_live_runs)
 @st.fragment(run_every="500ms")
 def _render_live_viewer_fragment(run: UiRun) -> None:
     if run in _deferred_viewer_buffers:
-        _render_deferred_viewer(_deferred_viewer_buffers[run])
-    elif run.deferred_workflow:
+        render_local_frame_viewer(_deferred_viewer_buffers[run], st)
+    else:
         st.subheader("Live browser view")
         st.caption("Live view disabled by trusted configuration.")
-    else:
-        _render_live_viewer(_viewer_buffers[run])
 
 
 @st.fragment(run_every="500ms")
@@ -167,196 +130,12 @@ def _render_live_run(run: UiRun) -> None:
         if st.button("Cancel active test", key="cancel_active_test"):
             run.cancel.set()
             st.warning("Cancellation requested. Waiting for child cleanup.")
-    if not run.agentic: _render_live_image(run.images)
-    state, omitted, events = run.events.snapshot()
     st.subheader("Execution timeline")
-    if run.agentic:
-        st.caption("Agentic terminal timeline is unavailable pending reviewed correlation.")
-    elif run.done.is_set() and run.result is not None and run.result.kind != "engine":
-        st.caption("No engine execution timeline was started for this request.")
-    elif state in {"unavailable", "inconsistent"}:
-        st.warning(f"Live timeline {state}. The final typed result remains authoritative.")
-    elif state == "waiting":
-        st.caption("Waiting for validated Node events.")
-    if not run.agentic and state != "inconsistent" and omitted:
-        st.caption(f"{omitted} older validated events omitted from display.")
-    for event in events if state != "inconsistent" and not run.agentic else ():
-        data = event["data"]
-        label = f"{event['sequence']}. {event['kind']}"
-        for name in ("tool", "outcome", "status", "availability", "cause", "basis"):
-            if name in data: label += f" · {data[name]}"
-        if "reasons" in data and data["reasons"]:
-            label += " · " + ", ".join(data["reasons"])
-        st.write(label)
+    st.caption("Agentic terminal timeline is unavailable pending reviewed correlation.")
     if run.done.is_set():
         st.subheader("Result")
         if run.result is not None: _render_result(run.result)
         elif run.failed: st.caption("No trusted final result is available.")
-
-
-def _render_live_image(images: LiveImageBuffer) -> None:
-    image_state, header, image_bytes = images.snapshot()
-    st.subheader("Live browser image")
-    if image_state in {"available", "limit_reached"} and header is not None and image_bytes is not None:
-        # st.html sends inline HTML in the local session delta. st.image would
-        # create a reusable /media/ endpoint, violating P4-G1 expiry semantics.
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        owner = header["owner"]
-        st.caption(f"{owner['kind']} {owner['id']} · {header['capturedAt']}")
-        st.html(f'<img src="data:image/jpeg;base64,{encoded}" width="{header["width"]}" '
-                f'height="{header["height"]}" alt="Restricted live browser image" />')
-        if image_state == "limit_reached": st.caption("Live image capture limit reached.")
-    elif image_state == "capture_disabled":
-        st.caption("Live image capture is disabled by trusted configuration.")
-    elif image_state == "not_captured":
-        st.caption("Live image authorized; no validated frame is available yet.")
-    elif image_state == "limit_reached":
-        st.caption("Live image capture limit reached.")
-    elif image_state == "closed":
-        st.caption("Live image session closed or expired.")
-    else:
-        st.warning("Live image temporarily unavailable. The final QA result is unchanged.")
-
-
-def _viewer_markup(handle: dict[str, Any], *, allow_expired_existing: bool = False) -> str:
-    """Build only a validated local, view-only client for the current owner."""
-    owner = handle.get("owner")
-    port, path = handle.get("port"), handle.get("path")
-    token, expiry = handle.get("connectionCapability"), handle.get("expiresAt")
-    if (type(owner) is not dict or set(owner) != {"kind", "id"} or
-            owner["kind"] not in {"attempt", "run"} or
-            type(owner["id"]) is not str or not _VIEWER_ID.fullmatch(owner["id"]) or
-            type(port) is not int or not 1 <= port <= 65535 or path != "/rfb" or
-            type(token) is not str or not _VIEWER_TOKEN.fullmatch(token) or
-            type(expiry) is not str or not _VIEWER_EXPIRY.fullmatch(expiry)):
-        raise ValueError("Invalid live viewer handle")
-    remaining = (datetime.fromisoformat(expiry.replace("Z", "+00:00")) -
-                 datetime.now(timezone.utc)).total_seconds()
-    if (not allow_expired_existing and not 0 < remaining <= 60.5) or \
-            (allow_expired_existing and remaining > 60.5):
-        raise ValueError("Expired live viewer handle")
-    # JSON quoting protects the module script even if this helper is called
-    # outside the validated lifecycle channel in a test or future UI seam.
-    identity = json.dumps(f"{owner['kind']}:{owner['id']}:{port}:{expiry}:{token}")
-    asset = json.dumps(f"http://127.0.0.1:{port}/core/rfb.js")
-    socket_url = json.dumps(f"ws://127.0.0.1:{port}/rfb")
-    capability = json.dumps(f"viewer.{token}")
-    expires = json.dumps(expiry)
-    return f'''<div id="p4-viewer-anchor"></div><script>
-      (() => {{
-      const anchor = document.getElementById('p4-viewer-anchor');
-      const identity = {identity};
-      const prior = window.__p4LiveViewer;
-      if (prior && prior.identity === identity) {{
-        anchor.replaceWith(prior.screen);
-      }} else {{
-        if (prior) {{
-          prior.cancelled = true;
-          if (prior.rfb) prior.rfb.disconnect();
-          if (prior.socket) prior.socket.close();
-          prior.screen.remove();
-        }}
-        const screen = document.createElement('div');
-        screen.style.maxWidth = '800px';
-        screen.style.height = '500px';
-        const status = document.createElement('p');
-        status.textContent = 'Connecting to the protected browser view...';
-        screen.appendChild(status);
-        anchor.replaceWith(screen);
-        // Register before the asynchronous module import. Fragment rerenders
-        // must never spend this single-use WebSocket capability twice.
-        const current = {{identity, screen, cancelled: false, socket: null, rfb: null}};
-        window.__p4LiveViewer = current;
-        import({asset}).then((module) => {{
-          if (current.cancelled || window.__p4LiveViewer !== current) return;
-          if (Date.now() >= Date.parse({expires})) {{
-            status.textContent = 'Protected browser view unavailable.';
-            return;
-          }}
-          const socket = new WebSocket({socket_url}, ['binary', {capability}]);
-          current.socket = socket;
-          const rfb = new module.default(screen, socket);
-          current.rfb = rfb;
-          rfb.viewOnly = true;
-          rfb.scaleViewport = true;
-          rfb.addEventListener('connect', () => {{ status.remove(); }});
-          rfb.addEventListener('disconnect', () => {{
-            if (!current.cancelled) status.textContent = 'Protected browser view disconnected.';
-          }});
-        }}).catch(() => {{
-          if (!current.cancelled) status.textContent = 'Protected browser view unavailable.';
-        }});
-      }}
-      }})();
-    </script>'''
-
-
-def _render_live_viewer(viewer: LiveViewerBuffer) -> None:
-    state, handle = viewer.snapshot()
-    st.subheader("Live browser view")
-    if state == "available" and handle is not None:
-        owner = handle["owner"]
-        st.caption(f"View only: {owner['kind']} {owner['id']}. Browser input is disabled.")
-        try:
-            st.html(_viewer_markup(handle), unsafe_allow_javascript=True)
-        except ValueError:
-            viewer.mark_unavailable()
-            st.warning("Live viewer unavailable. The final QA result is unchanged.")
-    else:
-        # A previous viewer must not remain visible as the next owner starts.
-        st.html("<script>const p=window.__p4LiveViewer; if(p){p.cancelled=true;if(p.rfb)p.rfb.disconnect();if(p.socket)p.socket.close();p.screen.remove();delete window.__p4LiveViewer}</script>",
-                unsafe_allow_javascript=True)
-        if state == "not_started": st.caption("No headed viewer has started.")
-        elif state == "connecting": st.caption("Connecting to the approved headed browser view.")
-        elif state == "transitioning": st.caption("Protected browser session is transitioning.")
-        elif state == "closed": st.caption("Protected browser view closed.")
-        else: st.warning("Live viewer unavailable. The final QA result is unchanged.")
-
-
-def _render_deferred_viewer(viewer: DeferredViewerBuffer) -> None:
-    state, phase, handle = viewer.snapshot()
-    st.subheader("Live browser view")
-    frame_mode = handle is not None and handle.get("viewerMode") == "frame_stream"
-    if frame_mode or (handle is None and viewer.mode == "frame_stream"):
-        st.caption("Frames come from the active local Chromium page. Viewing is observational only and does not affect QA authority.")
-    else:
-        st.caption("Live view launches Chromium in headed mode. Result/profile presentationMode: headless is accepted execution-profile metadata. Viewing is observational only and does not affect QA authority.")
-    labels = {"exploration": "Exploration", "compilation": "Compilation",
-              "replay_1": "Replay 1", "replay_2": "Replay 2"}
-    st.caption(f"Current phase: {labels.get(phase, 'Preparing')}" if state != "closed" else
-               f"Completed phase: {labels.get(phase, 'Preparing')}")
-    if frame_mode:
-        st.html("<script>const p=window.__p4LiveViewer; if(p){p.cancelled=true;if(p.rfb)p.rfb.disconnect();if(p.socket)p.socket.close();p.screen.remove();delete window.__p4LiveViewer}</script>",
-                unsafe_allow_javascript=True)
-        if state == "available":
-            st.caption("View only. Automation controls this browser session.")
-            if handle is not None and handle.get("frame") is not None:
-                try:
-                    st.image(handle["frame"], caption="Current execution page")
-                except Exception:
-                    viewer.mark_unavailable()
-                    st.warning("Live browser view unavailable. The final QA result is unchanged.")
-            else:
-                st.caption("Preparing image from the execution browser.")
-        else:
-            if state in {"not_started", "connecting"}: st.caption("Waiting for the execution browser.")
-            elif state == "transitioning": st.caption("Switching to the next workflow browser session.")
-            elif state == "closed": st.caption("Live browser session closed.")
-            else: st.warning("Live browser view unavailable. The final QA result is unchanged.")
-    elif state == "available" and handle is not None:
-        st.caption("View only. Browser input is disabled; automation controls this session.")
-        try:
-            st.html(_viewer_markup(handle, allow_expired_existing=True), unsafe_allow_javascript=True)
-        except ValueError:
-            viewer.mark_unavailable()
-            st.warning("Live browser view unavailable. The final QA result is unchanged.")
-    else:
-        st.html("<script>const p=window.__p4LiveViewer; if(p){p.cancelled=true;if(p.rfb)p.rfb.disconnect();if(p.socket)p.socket.close();p.screen.remove();delete window.__p4LiveViewer}</script>",
-                unsafe_allow_javascript=True)
-        if state in {"not_started", "connecting"}: st.caption("Waiting for the execution browser.")
-        elif state == "transitioning": st.caption("Switching to the next workflow browser session.")
-        elif state == "closed": st.caption("Live browser session closed.")
-        else: st.warning("Live browser view unavailable. The final QA result is unchanged.")
 
 
 def validate_input(target_url: str, task_text: str) -> UiRequest:
@@ -399,86 +178,13 @@ def _render_result(result: UiFinalResult) -> None:
         st.error("The engine result did not match the approved profile. No trusted QA result is available.")
         return
     if result.kind == "workflow_unavailable":
-        st.error("The selected workflow is unavailable or its trusted gate is not enabled. No test started.")
+        st.error("The trusted product workflow is unavailable. No test started.")
         return
     outcome = result.outcome
     if outcome is None:
         st.error("No trusted engine result is available.")
         return
-    if result.workflow_version in {"agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"}:
-        _render_agentic_result(result)
-        return
-    kind = outcome["kind"]
-    if kind == "process_failure":
-        st.error(f"Host process failure: {outcome['code']}")
-        st.caption(f"Cleanup: {outcome['cleanup']}")
-        return
-    if kind == "bridge_error":
-        st.error(f"Node bridge error: {outcome['code']}")
-        st.caption(f"Cleanup: {outcome['cleanup']}")
-        return
-    terminal = outcome["terminal"]
-    if kind == "success":
-        label = "QA result" if terminal["status"] == "QA_ASSERTION_PASSED" else "Execution result"
-        st.success(f"{label}: {terminal['status']}")
-    elif outcome["stopKind"] == "qa_failure":
-        st.error(f"QA assertion failed: {terminal['status']}")
-    else:
-        st.warning(f"Automation stopped: {terminal['status']}")
-    st.caption(f"Phase: {terminal['phase']}")
-    if "reason" in terminal:
-        st.caption(f"Reason: {terminal['reason']}")
-    context = outcome["context"]
-    progress = context["progress"]
-    st.subheader("Correlation and provenance")
-    st.write(f"TestSpec: {context['testSpecId']}")
-    st.write(f"Profile: {context['executionProfileRef']['id']}@{context['executionProfileRef']['version']}")
-    st.write(f"Profile fingerprint: {context['profileFingerprint']}")
-    st.write(f"Presentation: {context['presentationMode']}")
-    st.write(f"Observation: {context['observation']['state']}")
-    st.write(f"Autonomous eligible: {context['observation']['autonomousEligible']}")
-    if context["presentationMode"] == "headed":
-        st.caption("Headed execution is observational. A separate fresh headless workflow is required to establish autonomous equivalence.")
-    if "explorationAttemptId" in progress:
-        st.write(f"Exploration attempt: {progress['explorationAttemptId']}")
-    if "resolvedSpecId" in progress:
-        st.write(f"Resolved spec: {progress['resolvedSpecId']}")
-    for run_id in progress.get("executionRunIds", []):
-        st.write(f"Execution run: {run_id}")
-    st.subheader("Report and evidence")
-    if context["report"]["kind"] != "available":
-        st.info("No stored report is available for this result.")
-    elif result.projection_failed:
-        st.warning("Safe report details could not be retrieved. The QA result above is unchanged.")
-    elif result.projection is None:
-        st.warning("Safe report details are unavailable. The QA result above is unchanged.")
-    elif result.projection["kind"] == "unavailable":
-        st.warning(f"Safe report details unavailable: {result.projection['reason']}. The QA result is unchanged.")
-    else:
-        projection = result.projection
-        st.write(f"Screenshot: {projection['screenshot']}")
-        for item in projection["outcomes"]:
-            label = f"{item['phase']}: {item['status']}"
-            if "assertionType" in item:
-                label += f" ({item['assertionType']})"
-            st.write(label)
-            for key, title in (("executionRunId", "Run"), ("originStepId", "Origin step"),
-                               ("executionStepId", "Execution step")):
-                if key in item:
-                    st.caption(f"{title}: {item[key]}")
-            if "reason" in item:
-                st.caption(f"Reason: {item['reason']}")
-            for name in ("expected", "actual"):
-                value = item[name]
-                visible = value.get("value") if value["state"] == "displayable" else value["state"]
-                st.caption(f"{name}: {visible}")
-        st.caption(f"Authorized evidence descriptors: {len(projection['evidence'])}")
-        for item in projection["evidence"]:
-            st.write(f"{item['mediaType']} · {item['sensitivity']} · {item['byteLength']} bytes")
-            st.caption(f"Evidence: {item['evidenceId']} · {item['owner']['kind']} {item['owner']['id']}"
-                       f" · captured {item['capturedAt']}")
-        if projection["screenshot"] == "stored_restricted":
-            st.caption("Screenshot bytes are restricted and are not displayed.")
+    _render_agentic_result(result)
 
 
 def _render_agentic_result(result: UiFinalResult) -> None:
@@ -498,7 +204,6 @@ def _render_agentic_result(result: UiFinalResult) -> None:
     stage = terminal["stage"]
     categories = {
         "interpretation": "Request could not be interpreted",
-        "execution": "Execution reproduced without assertions; no QA verdict",
         "exploration": "Path not established",
         "compilation": "Compilation failed",
         "replay": "Replay failed",
@@ -513,9 +218,6 @@ def _render_agentic_result(result: UiFinalResult) -> None:
         st.warning(categories[stage])
     st.caption(f"Stage: {stage} · Status: {terminal['status']}")
     if "reason" in terminal: st.caption(f"Reason: {terminal['reason']}")
-    if "deferredStage" in record:
-        stop = record["deferredStage"]
-        st.caption(f"Deferred stage: {stop['stage']} · Category: {stop['category']} · Code: {stop['code']}")
     if "semanticReplay" in record:
         st.caption("Semantic lineage: TestSpec v7, grounding v1, compiler v5, resolved v10, runner v10, replay pair v2")
     st.caption(f"Cleanup: {record['cleanup']}")
@@ -538,13 +240,6 @@ def _render_agentic_result(result: UiFinalResult) -> None:
         st.warning("Safe report details could not be retrieved. The typed result above is unchanged.")
     elif projection is None or projection["kind"] == "unavailable":
         st.info("Safe report details are unavailable. The typed result above is unchanged.")
-    elif record["workflowVersion"] == "deferred-action-v1":
-        for index, replay in enumerate(projection["replays"], 1):
-            st.write(f"Replay {index}: {replay['state']}")
-            st.caption(f"Assertions: {replay['assertionCount']} ? Cleanup: {replay['cleanup']}")
-        st.write(f"Reproducibility: {projection['reproducibility']}")
-        if "authoritativeQa" in projection:
-            st.write(f"Authoritative QA: {projection['authoritativeQa']}")
     else:
         for name in ("exploration", "compilation", "replay"):
             summary = projection["stages"][name]
@@ -570,14 +265,22 @@ def render_shell(execute: Callable[..., UiFinalResult | None] | None = None,
     """
     st.title("UI test demo")
     st.caption("Local, single-operator workflow. Public targets require trusted approval.")
-    selected_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION", "legacy")
-    st.caption(f"Trusted workflow: {selected_workflow}" if selected_workflow in
-               {"legacy", "agentic-exploration-v1", "goal-directed-v1", "structured-action-v1", "deferred-action-v1", "semantic-general-v1"} else
-               "Trusted workflow: invalid selection")
-    if selected_workflow == "deferred-action-v1":
-        st.caption("Deferred workflow is gated for offline review pending the independent release gate.")
-    if selected_workflow == "semantic-general-v1":
-        st.caption("Semantic generalization route - offline-review gate (experimental).")
+    selected_workflow = os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION")
+    selected_backend = os.environ.get("PLAYWRIGHT_DEMO_BROWSER_BACKEND")
+    route_invalid = selected_workflow not in {None, "", "semantic-general-v1"} or selected_backend not in {None, ""}
+    if route_invalid:
+        st.error("Invalid trusted product route or browser backend. No test can start.")
+    else:
+        st.caption("Trusted workflow: semantic-general-v1")
+    pacing_invalid = False
+    try:
+        action_pause_ms = parse_demo_action_pause_ms(os.environ.get("PLAYWRIGHT_DEMO_ACTION_PAUSE_MS"))
+    except ValueError:
+        pacing_invalid = True
+        st.error("Invalid trusted demo pacing setting. No test can start.")
+    else:
+        if action_pause_ms:
+            st.caption(f"Demo pacing: {action_pause_ms} ms after actions")
     # Populate this slot after submission, but render it before the form and
     # the independently refreshing timeline so page growth cannot move it.
     live_view_slot = st.container()
@@ -586,7 +289,8 @@ def render_shell(execute: Callable[..., UiFinalResult | None] | None = None,
     with st.form("ui_test_request"):
         target_url = st.text_input("Public HTTP(S) URL", placeholder="https://example.org/")
         task_text = st.text_area("Testing task", placeholder="Describe the UI action and assertion.")
-        submitted = st.form_submit_button("Start test", disabled=status.phase == "running")
+        submitted = st.form_submit_button("Start test", disabled=status.phase == "running" or
+                                          route_invalid or pacing_invalid)
 
     if submitted:
         if status.phase == "running":

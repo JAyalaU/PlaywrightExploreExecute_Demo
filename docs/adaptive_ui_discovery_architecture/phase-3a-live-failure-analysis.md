@@ -1,0 +1,85 @@
+# Phase 3A live failure analysis: requirement grounding and progress
+
+**Scope:** Read-only diagnosis of the two reported held-out real-model attempts. No live attempt was rerun and no production code, prompt, schema, test, budget, or configuration was changed. Current source is authoritative. The checked-in Playwright failure artifacts contain failed assertions, but not the model's intake JSON or proposal trace. Findings below distinguish a proved code condition from a possible interpretation of missing run data.
+
+## Evidence available and missing
+
+The [held-out driver](../../tests/adaptive-phase3a-heldout.spec.ts) logs result, stop code, intake/proposal/action counts, clean coverage, timing, and the hidden fixture oracle. It does not log or save `report.trace.proposals`, `report.explorationChecks`, action effects, observations, or the validated requirement intake. The two retained `test-results/.../error-context.md` files contain only the `BLOCKED` versus `VERIFIED_PASS` assertion failure and test source. The controller holds proposals and checks in memory in [vertical-slice.ts](../../app/adaptive/vertical-slice.ts), but the intake is not part of its returned report. The exact model ledger, predicate values, goal IDs, observation IDs, and seven Security proposal bodies therefore cannot be recovered from retained evidence. The source text and source-span *candidates* below are reproducible; they are not a recovered validated ledger.
+
+| Run | Retained facts | Boundary reached |
+|---|---|---|
+| Activity | One intake call; zero proposals/actions; `BLOCKED`, `ACCEPTANCE_NOT_GROUNDED`; about 14.7 seconds | Initial intake validation before operational reasoning or browser action |
+| Security | One intake call; seven proposals; three actions; `BLOCKED`, `REPEATED_INEFFECTIVE_VERIFICATION`; about 55.7 seconds; fixture oracle `alertsEnabled: true` | Exploration verification repetition, before procedure or clean reset/execution |
+
+Neither result is evidence that a clean pass failed its final assertion: neither reached clean execution. In particular, the four Security `inconclusive` entries are initialized at intake and only replaced after clean verification ([vertical-slice.ts](../../app/adaptive/vertical-slice.ts)); they do not reveal the intermediate exploration evaluation.
+
+## Activity: exact rejection condition and ledger limits
+
+The authored clauses and exact zero-based source-span candidates are:
+
+| Clause | Span `[start,end)` | Reasonable classification | Browser-linked meaning |
+|---|---:|---|---|
+| `Visit Activity` | `[0,14)` | Required action | An Activity navigation/action must be performed; target is initially an observed `Activity` link in the local fixture |
+| `Confirm that the browser path is /activity` | `[16,58)` | Assertion | Final path equals `/activity` |
+
+These classifications and any goal IDs are **not confirmed live ledger fields**. Inferred prerequisites and the model's dependency list are also unavailable. The fixture starts at `/` and displays an Activity link; it serves the destination at `/activity` ([adaptive-phase3a-fixture.ts](../../tests/support/adaptive-phase3a-fixture.ts)). The authored path predicate is supported by the closed schema; it is simply false at the initial observation.
+
+The exact throw is [requirement-acceptance.ts](../../app/adaptive/requirement-acceptance.ts), `validateRequirementIntake`, lines 134–137: an acceptance-plan goal marked `status: 'grounded'` is rejected if *any* predicate is not `predicateGrounded` in the trusted observations. For a URL or path predicate, `predicateGrounded` (lines 44–47) requires an observation whose URL **already equals the expected URL or path**. Thus `ACCEPTANCE_NOT_GROUNDED` proves that at least one submitted plan goal was marked `grounded` while its predicate lacked the required observed match (or a constraint lacked its required observed target). It does **not** reveal which goal, predicate, or exact model field value. A premature `grounded` `/activity` predicate is consistent with the initial `/` page and is the most direct explanation, but the raw intake is unavailable, so it cannot be asserted as the exact emitted field.
+
+This is not an unsupported path predicate or evidence that `/activity` cannot be reached. It is a mismatch between the model's asserted grounding status and a deterministic gate that defines URL grounding as already observing the desired value. The model-facing intake instruction says to use `hypothesis` until the URL/path has appeared ([openai-reasoning.ts](../../app/adaptive/openai-reasoning.ts)); an initial `hypothesis` plan for `/activity` would pass this particular gate, as the offline Activity model does ([adaptive-phase3a.spec.ts](../../tests/adaptive-phase3a.spec.ts)). Whether the live model disregarded that instruction or expressed a different predicate cannot be distinguished without the intake object.
+
+## Grounding lifecycle versus intended architecture
+
+The [architecture](adaptive_ui_discovery_architecture_v1.md) calls for accepting authored obligations after initial observation, allowing unresolved targets while exploring, grounding them when suitable evidence appears, and verifying them in a separate clean pass. Current intake does permit a `hypothesis` or `needs_refinement` status, and `promoteGroundedAcceptance` later promotes a hypothesis when trusted observations satisfy its target check ([requirement-acceptance.ts](../../app/adaptive/requirement-acceptance.ts), lines 155–163). However, URL/path `predicateGrounded` uses **expected-value equality**, not just a safely specified observable target. Consequently a known authored path remains “not grounded” while the browser is on another path. This conflates *the predicate can be evaluated* with *the predicate is true*. It also means a goal that never reaches the expected path can remain inconclusive instead of becoming a verified false assertion: the verifier sets non-grounded goals to unknown before evaluating final evidence (lines 287–292).
+
+The intake gate correctly rejects an unsupported assertion or an unjustified claim that a named control was observed. Its current URL/path invariant is too strong for a pending destination: a syntactically valid, origin-scoped path is evaluable before it is satisfied. Admission, target binding, and eventual truth need distinct states. That correction should not allow the model to declare an absent element or unsupported property proven.
+
+## Security: seven-proposal reconstruction and exact repetition rule
+
+The authored source-span candidates are `Open Profile` `[0,12)`, `choose Security` `[14,29)`, `switch on Login alerts` `[31,53)`, and `verify that Login alerts stay checked` `[55,92)`. These are respectively plausible required actions, required actions, required actions, and assertion, with order following the instruction. The exact live ledger classification, predicate, action operation, dependency IDs, and goal IDs are not retained. The offline Security model uses a Security-link visibility transition for Profile, `/security` path for Security, and checkbox checked state for Login alerts ([adaptive-phase3a.spec.ts](../../tests/adaptive-phase3a.spec.ts), lines 57–70); that is an existence proof for a suitable plan, **not** the live model's plan.
+
+The following is the maximum faithful seven-turn reconstruction. Proposal numbering is chronological, but the retained summary gives no per-turn position or payload:
+
+| Proposal | Goal ID / observation ID / kind / page / gateway result / resulting observation / progress |
+|---:|---|
+| 1 | Not retained |
+| 2 | Not retained |
+| 3 | Not retained |
+| 4 | Not retained |
+| 5 | Not retained |
+| 6 | Not retained |
+| 7 | Not retained; the final accepted `verify` caused the repeat stop |
+
+Across those turns, exactly three browser actions were recorded by the supplied live summary; their order, target, operation, goal mapping, before/after observation, and effects are not retained. The hidden oracle's `alertsEnabled: true` is compatible with a successful check action, but does not prove that the three actions were Profile, Security, and check, nor that they were mapped to the right authored goals. At least three proposals were verifications: two repeated fingerprints that had appeared earlier. Those two repeats need not have been of the **same** fingerprint. Other proposals may have been observations or further checks. A successful action with an observed transition resets the ineffective counter, so the final two ineffective repeats occurred after the last such reset. This bound follows from [vertical-slice.ts](../../app/adaptive/vertical-slice.ts), lines 335–351, rather than from retained turn details.
+
+For each `verify`, the controller computes `satisfied` only when the typed verification matches the acceptance predicate, the new observation evaluates it true, and `verifyAcceptedRequirements` reports that goal `verified_true` (lines 335–339). It fingerprints normalized goal, predicate, and the satisfaction boolean; it omits the observation ID ([vertical-slice.ts](../../app/adaptive/vertical-slice.ts), lines 97–112). The first occurrence counts as new information even if unsatisfied; repeats with the same fingerprint increment `ineffective`. At two repeats, line 347 throws `REPEATED_INEFFECTIVE_VERIFICATION`. The repeated goal and predicate, whether its observed property was true/false/unknown, and whether it represented the intended assertion cannot be recovered. `verificationMatchesAcceptance` always returns false for a `required_action` goal (lines 80–95); if the model verified such a goal, it would never mark that check satisfied, even if the action itself had valid evidence. That is a possible contributor, not an established live event.
+
+The gateway accepts a verification only with current observation binding and a valid referenced target ([action-gateway.ts](../../app/adaptive/action-gateway.ts), lines 86–140). Browser dispatch for `verify` performs no interaction; the controller captures a fresh observation afterward ([browser.ts](../../app/adaptive/browser.ts), lines 221–225; [vertical-slice.ts](../../app/adaptive/vertical-slice.ts), lines 321–344). Thus repetition did yield new observation IDs, but not necessarily new **requirement evidence**.
+
+## Causal attribution and model feedback
+
+The clean verifier demands same-goal operation and target witness, returned delivery, source/after observation lineage, an observed effect, each action predicate false before and true after, and earlier dependency action evidence ([requirement-acceptance.ts](../../app/adaptive/requirement-acceptance.ts), lines 268–285). For the Security fixture, appropriate distinct proofs are: Profile click makes the Security link newly visible; Security click changes the URL to `/security` after Profile; checking Login alerts changes the checkbox from unchecked to checked; a later observation, ideally after reload, confirms persistence. These evidence forms are compatible with the current predicate vocabulary. A plan that binds `Open Profile` to the already-visible Profile button, however, would fail the false-before test even if the click correctly exposes Security. The observed effect and target witness should prove the action's causal transition, while a separately scoped outcome predicate proves the resulting state. No weakening to “final state alone” is warranted. Without the live plan and action receipts, no specific false-before or goal-attribution defect can be assigned to this attempt.
+
+The model receives current observation, authored ledger, acceptance plan, unresolved goal IDs, recent observations/actions, and budgets from the controller ([vertical-slice.ts](../../app/adaptive/vertical-slice.ts), lines 279–291). The Responses adapter projects only the last four **actions**, plus current observation, plan, and unresolved IDs ([openai-reasoning.ts](../../app/adaptive/openai-reasoning.ts), `propose`). It does not send `explorationChecks`, the `satisfied/newInformation` result, the actual evaluated property, the reason a check failed to count, or explicit before/after coverage changes. The ledger's goal `fulfillment` fields remain at intake's `pending` values during normal exploration, even where deterministic action evidence has advanced a goal. A model therefore cannot tell whether it repeated a check that was true but mapped to the wrong goal, false, unknown, or already counted. The deterministic controller *does* compute a result and repeat fingerprint, but withholds that result from subsequent model input. This is an identified feedback gap; the precise repeated model choice is unobserved.
+
+When exploration stops, `coverage` still holds the intake-initialized inconclusive entries, and independent verification is never run ([vertical-slice.ts](../../app/adaptive/vertical-slice.ts), lines 268 and 513–516). The fixture oracle evaluates hidden application state after the run and cannot substitute for clean action proof or the original assertion.
+
+## Why Phase 1/2 passed and what Phase 3A adds
+
+Earlier A/B/C runs used a small trusted fixture goal-rule evaluator and explicitly aligned checks for the notification goal. A/B had accessible targets; C had a screenshot-grounded gear and fresh clean re-identification. They reached a demonstrated procedure, trusted reset, clean actions, and independent final check (see [implementation status](implementation-status.md)). Phase 3A replaces fixture acceptance rules with a model-derived ledger and plan, exact source-span/clause coverage, goal IDs, predicate grounding status, and stricter action causality. The Activity rejection occurs before the existing exploration loop can exploit a visible link. The Security stop occurs after actions, where a derived predicate/goal mapping and missing check feedback now matter. These are general admission and progress-accounting boundaries, not evidence that Activity or Login alerts require special selectors.
+
+## Root-cause classification
+
+| Task | Supported classification | What remains unproved |
+|---|---|---|
+| Activity | A valid, supported authored navigation/assertion was rejected at initial intake because the model supplied at least one `grounded` goal whose predicate was not evidenced in the initial trusted observation. The URL/path grounding rule conflates current truth with evaluability; a model status error is also possible. This is **premature grounding rejection**, not correct rejection of unsupported intent. | Exact live ledger, which goal/predicate caused the check, and why the model chose its status. |
+| Security | Deterministic **verification-progress repetition** stopped exploration at the configured threshold. The model lacked explicit check-result feedback. Three actions and hidden final state do not establish goal attribution or causal proof; clean verification was never attempted. | The seven proposal payloads, repeated goal/predicate/value, action mapping, whether causal proof or plan grounding also blocked progress. |
+
+## Smallest general corrections and independent verification
+
+1. Define admission separately from current satisfaction. Preserve every source-bound authored obligation and admit a valid, safe, evaluable URL/path predicate as pending even when the current URL differs. Keep element targets as hypotheses until trusted evidence identifies them; retain unknown for unsupported or unobservable properties. Promotion should mean the target is evaluable, not that the desired value is already true. Test a different destination and a wrong final path, as well as Activity.
+2. Expose bounded, structured check feedback after each verification: goal ID, observed true/false/unknown, acceptance-predicate match, whether action proof or ordering is missing, coverage before/after, and repeat status. Keep browser facts authoritative and avoid raw provider output. Test a different checkbox task where an ineffective verify is followed by a productive action; confirm the model can change course without weakening the repeat stop.
+3. For each required action family, validate a goal-linked witnessed transition: newly revealed control for menu expansion, URL/state transition for navigation, false-to-true property for state setting, and ordered before/after action lineage. Keep an outcome or persistence assertion separate from action delivery. Test unrelated menu-navigation and toggle tasks with wrong-goal, already-true, missing-action, and reversed-order negatives.
+4. On any future **explicitly authorized** live diagnostic attempt, retain a bounded safe projection of intake goals, predicate statuses, proposal kind/goal/observation IDs, gateway outcome, action effect, and verification result. The present run cannot support an exact seven-proposal narrative. Do not rerun these live tasks as part of this diagnosis.
+
+These recommendations require focused implementation and offline tests before any new live acceptance claim. They do not alter the semantic-general product route or infer success from the fixture oracle.

@@ -5,8 +5,7 @@ loadProjectEnv();
 
 export default defineConfig({
   testDir: './tests',
-  // The system suite creates protected Chromium/proxy pairs; P2-2 adds a
-  // headed exploration plus two fresh replays. Two workers avoid exhausting
-  // local browser/socket resources while keeping independent contracts parallel.
+  // Local semantic tests create fresh Chromium sessions for grounding,
+  // compilation, and replay. Two workers bound browser/socket use.
   workers: 2,
 });

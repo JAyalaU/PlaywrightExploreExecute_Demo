@@ -1,9 +1,10 @@
-/** Trusted local composition for the separately gated semantic-general route. */
+/** Trusted local composition for the semantic-general product route. */
 import { randomUUID } from 'node:crypto';
 import { parseResultRecordV2, type ResultRecordV2 } from '../domain/agentic-result-v2.js';
 import { issueSemanticGroundedTraceV1, type SemanticGroundedTraceRecordV1 } from '../domain/semantic-resolved-v10.js';
 import { requireTrustedSemanticReplayReadbackV2 } from '../evidence/semantic-replay-store-v2.js';
 import { SemanticExplorationDiagnosticsV1Store } from '../evidence/semantic-exploration-diagnostics-v1.js';
+import { SemanticInterpretationDiagnosticsV1Store } from '../evidence/semantic-interpretation-diagnostics-v1.js';
 import { SemanticExplorationDiagnosticCollectorV1, semanticExplorationBrowserSnapshotV1,
   classifySemanticExplorationFailureV1,
   type SemanticExplorationBoundaryV1, type SemanticExplorationFailureV1,
@@ -12,33 +13,38 @@ import { DeferredBrowserDiagnosticCollector } from '../domain/deferred-browser-d
 import { McpExplorationSession } from '../exploration/mcp.js';
 import { SemanticGroundingSessionV1, SemanticGroundingStopV1 } from '../exploration/semantic-grounding-v1.js';
 import { createOpenAISemanticIntentModelsV3 } from '../interpretation/semantic-intent-v3-adapters.js';
-import { ModelCompletionFailure } from '../interpretation/model-failure.js';
-import { interpretSemanticIntentV3, type SemanticIntentModelsV3 } from '../interpretation/semantic-intent-v3.js';
+import type { SemanticIntentModelsV3 } from '../interpretation/semantic-intent-v3.js';
+import { interpretSemanticIntentWithEvidenceV3, SemanticPrimaryDiagnosticPersistenceFailureV1 } from
+  '../interpretation/semantic-intent-v3-boundary.js';
 import { runSemanticGeneralizedOptInV1 } from '../interpretation/semantic-general-production-v1.js';
-import { DeferredViewerLifecycle, type DeferredViewerPhase } from '../observability/deferred-viewer-channel.js';
-import { ProtectedContextFactory, parseTrustedBrowserBackend, profilePresentationMode,
-  type EffectiveProfile, type ExternalTargetGate, type ProfileCatalog, type ProfileRef,
-  type ProtectedBrowserSession, type ProtectedSessionOptions } from '../profile/index.js';
+import { LocalFrameViewerLifecycle, type LocalFrameViewerPhase } from '../observability/local-frame-channel.js';
+import { ProtectedContextFactory, type ProtectedBrowserSession,
+  type ProtectedSessionOptions } from '../profile/local-context.js';
+import { type NativeEffectiveProfile, type NativeProfileRef,
+  type NativeProfileCatalog } from '../profile/native-profile.js';
 import { envelopeForAgenticTerminalV2, type SubprocessResponseV2 } from '../subprocess/protocol-v2.js';
-import { toInterpretationRequest, type LocalWorkflowRequest, type LocalWorkflowTrustedDependencies,
-  type TrustedLocalConfiguration } from './contracts.js';
-import { LocalWorkflowError } from './workflow.js';
+import { requireSemanticGeneralProductEnvironment, toInterpretationRequest,
+  type LocalWorkflowRequest, type LocalWorkflowTrustedDependencies,
+  type ProductTrustedConfiguration } from './product-contracts.js';
+import { LocalWorkflowError } from './workflow-error.js';
 
 export type SemanticGeneralLocalOptionsV1 = { semanticModels?: SemanticIntentModelsV3 };
 
 export async function runSemanticGeneralLocalWorkflowV1(request: LocalWorkflowRequest,
-  config: TrustedLocalConfiguration, catalog: ProfileCatalog, gate: ExternalTargetGate | undefined,
+  config: ProductTrustedConfiguration, catalog: NativeProfileCatalog,
   dependencies: LocalWorkflowTrustedDependencies,
   options: SemanticGeneralLocalOptionsV1 & { signal?: AbortSignal }): Promise<SubprocessResponseV2> {
-  if (process.env.PLAYWRIGHT_DEMO_WORKFLOW_VERSION !== 'semantic-general-v1' ||
-      process.env.PLAYWRIGHT_DEMO_SEMANTIC_GENERALITY_GATE !== 'offline-review')
-    throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
+  try { requireSemanticGeneralProductEnvironment(); }
+  catch { throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION'); }
   const effective = catalog.resolve(request.executionProfileRef);
+  if (!('profileSchemaVersion' in effective.profile) ||
+      effective.profile.profileSchemaVersion !== '5')
+    throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION');
   const source = toInterpretationRequest(request, `local-${randomUUID()}`);
   const base = { resultVersion: '2' as const, workflowVersion: 'semantic-general-v1' as const,
     testSpecId: source.testSpecId, executionProfileRef: source.executionProfileRef,
-    profileFingerprint: effective.fingerprint, presentationMode: profilePresentationMode(effective.profile),
-    observation: profilePresentationMode(effective.profile) === 'headed' ? 'observational' as const : 'unobserved' as const };
+    profileFingerprint: effective.fingerprint, presentationMode: effective.profile.presentationMode,
+    observation: effective.profile.presentationMode === 'headed' ? 'observational' as const : 'unobserved' as const };
   const terminal = (fields: Pick<ResultRecordV2, 'terminal' | 'cleanup'> &
     Partial<Pick<ResultRecordV2, 'explorationAttemptId' | 'successfulTraceId' |
       'compilerAttemptId' | 'resolvedSpecId' | 'executionRunIds' | 'semanticReplay'>>): SubprocessResponseV2 =>
@@ -50,29 +56,33 @@ export async function runSemanticGeneralLocalWorkflowV1(request: LocalWorkflowRe
     models = options.semanticModels ?? createOpenAISemanticIntentModelsV3(dependencies.provider);
   } catch { throw new LocalWorkflowError('PROVIDER_CONFIGURATION_ERROR'); }
   if (options.signal?.aborted) throw new LocalWorkflowError('CANCELLED');
-  let providerFailure: 'PROVIDER_ERROR' | 'PROVIDER_TIMEOUT' | 'MODEL_ERROR' | 'MODEL_TIMEOUT' | undefined;
-  const observe = (model: SemanticIntentModelsV3['primary']): SemanticIntentModelsV3['primary'] => ({
-    complete: async input => {
-      try { return await model.complete(input); }
-      catch (error) {
-        if (error instanceof ModelCompletionFailure &&
-            ['PROVIDER_ERROR', 'PROVIDER_TIMEOUT', 'MODEL_ERROR', 'MODEL_TIMEOUT'].includes(error.code))
-          providerFailure = error.code as typeof providerFailure;
-        throw error;
-      }
-    },
-  });
-  const interpreted = await interpretSemanticIntentV3(source,
-    { primary: observe(models.primary), reviewer: observe(models.reviewer) }, options.signal);
+  let interpreted;
+  try { interpreted = await interpretSemanticIntentWithEvidenceV3(source, models,
+    config.artifactRoot, options.signal); }
+  catch (error) {
+    if (error instanceof SemanticPrimaryDiagnosticPersistenceFailureV1)
+      return terminal({ terminal: { stage: 'environment', status: 'ENVIRONMENT_FAILED',
+        reason: 'REDACTED_REASON' }, cleanup: 'not_started' });
+    throw error;
+  }
   if (options.signal?.aborted) throw new LocalWorkflowError('CANCELLED');
-  if (providerFailure) return terminal({ terminal: {
-    stage: 'environment', status: 'ENVIRONMENT_FAILED', reason: providerFailure,
-  }, cleanup: 'not_started' });
-  if (interpreted.kind === 'rejected') return terminal({ terminal: {
-    stage: 'interpretation', status: 'INTERPRETATION_FAILED',
-    reason: interpreted.code === 'INVALID_SOURCE_REPRESENTATION' ? 'INVALID_TEST_SPEC' :
-      interpreted.code === 'PROVIDER_OUTPUT_INVALID' ? 'MALFORMED_MODEL_OUTPUT' : 'REDACTED_REASON',
-  }, cleanup: 'not_started' });
+  if (interpreted.kind === 'rejected') {
+    if (['PROVIDER_ERROR', 'PROVIDER_TIMEOUT', 'MODEL_ERROR', 'MODEL_TIMEOUT'].includes(interpreted.code))
+      return terminal({ terminal: { stage: 'environment', status: 'ENVIRONMENT_FAILED',
+        reason: interpreted.code as 'PROVIDER_ERROR' | 'PROVIDER_TIMEOUT' | 'MODEL_ERROR' | 'MODEL_TIMEOUT' },
+      cleanup: 'not_started' });
+    if (interpreted.code === 'INVALID_SOURCE_REPRESENTATION' && interpreted.normalizationDiagnostic) {
+      try { await new SemanticInterpretationDiagnosticsV1Store(config.artifactRoot)
+        .write(source.testSpecId, interpreted.normalizationDiagnostic); }
+      catch { /* Private diagnostics cannot change the public interpretation terminal. */ }
+    }
+    return terminal({ terminal: {
+      stage: 'interpretation', status: 'INTERPRETATION_FAILED',
+      reason: interpreted.code === 'INVALID_SOURCE_REPRESENTATION' ? 'INVALID_TEST_SPEC' :
+        interpreted.code === 'PROVIDER_OUTPUT_INVALID' ||
+          interpreted.code === 'REVIEWER_OUTPUT_INVALID' ? 'MALFORMED_MODEL_OUTPUT' : 'REDACTED_REASON',
+    }, cleanup: 'not_started' });
+  }
   const admission = interpreted.admission;
   const attemptId = `semantic-attempt-${randomUUID()}`;
   const diagnostics = new SemanticExplorationDiagnosticCollectorV1(source.testSpecId, attemptId);
@@ -97,7 +107,7 @@ export async function runSemanticGeneralLocalWorkflowV1(request: LocalWorkflowRe
   let browserLaunchAttempted = false;
   let activeStep: SemanticExplorationStepDiagnosticV1 | null = null;
   let currentBrowser: ProtectedBrowserSession | undefined;
-  let viewer: DeferredViewerLifecycle | undefined;
+  let viewer: LocalFrameViewerLifecycle | undefined;
   const mark = (boundary: SemanticExplorationBoundaryV1) => diagnostics.record(boundary, activeStep);
   const safeState = () => semanticExplorationBrowserSnapshotV1(currentBrowser, {
     browserLaunchAttempted, documentGenerationId, domContentLoadedObserved,
@@ -108,21 +118,19 @@ export async function runSemanticGeneralLocalWorkflowV1(request: LocalWorkflowRe
     await diagnostics.fail(browser.browser === 'disconnected' ? 'BROWSER_DISCONNECTED' : category,
       Promise.resolve(browser), activeStep?.stepId ?? null);
   };
-  const backend = parseTrustedBrowserBackend(process.env.PLAYWRIGHT_DEMO_BROWSER_BACKEND);
   const liveView = process.env.PLAYWRIGHT_DEMO_LIVE_VIEW === '1';
-  const viewerMode = backend === 'local-windows' ? 'frame_stream' : 'rfb';
   if (liveView) {
     viewerState = 'opening'; mark('viewer_open_started');
-    try { viewer = await DeferredViewerLifecycle.connect(source.testSpecId, viewerMode, viewerDiagnostics.record);
+    try { viewer = await LocalFrameViewerLifecycle.connect(source.testSpecId, viewerDiagnostics.record);
       viewerState = 'ready'; mark('viewer_open_completed'); }
     catch { viewerState = 'terminal_unavailable'; await firstFailure('VIEWER_ONLY_FAILURE'); await persist();
       throw new LocalWorkflowError('INVALID_TRUSTED_CONFIGURATION'); }
   }
   const sessions = new Set<ProtectedBrowserSession>();
-  const phases: readonly DeferredViewerPhase[] = ['exploration', 'compilation', 'replay_1', 'replay_2'];
+  const phases: readonly LocalFrameViewerPhase[] = ['exploration', 'compilation', 'replay_1', 'replay_2'];
   let opened = 0;
   class ManagedFactory extends ProtectedContextFactory {
-    override async open(ref: ProfileRef, expected?: EffectiveProfile, sessionOptions?: ProtectedSessionOptions) {
+    override async open(ref: NativeProfileRef, expected?: NativeEffectiveProfile, sessionOptions?: ProtectedSessionOptions) {
       if (options.signal?.aborted) throw new LocalWorkflowError('CANCELLED');
       const exploration = sessionOptions?.observationOwner?.id === attemptId;
       const session = await super.open(ref, expected, exploration ? {
@@ -148,8 +156,7 @@ export async function runSemanticGeneralLocalWorkflowV1(request: LocalWorkflowRe
       return session;
     }
   }
-  const factory = new ManagedFactory(catalog, dependencies.authProvider, gate,
-    { viewOnlyHeaded: liveView && viewerMode === 'rfb' });
+  const factory = new ManagedFactory(catalog, dependencies.authProvider);
   const close = async (): Promise<boolean> => {
     const closed = await Promise.allSettled([...sessions].map(session => session.close()));
     sessions.clear();

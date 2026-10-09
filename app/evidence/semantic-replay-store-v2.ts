@@ -32,7 +32,7 @@ async function regular(file: string, limit: number): Promise<Buffer> {
   if (!info.isFile() || info.isSymbolicLink() || info.size > limit) throw new Error('Invalid semantic replay file');
   return readFile(file);
 }
-/** Authenticated replay-pair storage, version-isolated from deferred v9/v1. */
+/** Authenticated semantic replay-pair storage with its own versioned lineage. */
 export class SemanticReplayV2Store {
   readonly #root: string;
   #key: Promise<Buffer> | undefined;

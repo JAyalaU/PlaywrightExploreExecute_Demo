@@ -14,15 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, NotRequired, TypedDict
 
-from .protocol import (
+from .wire_common import (
     DEFAULT_DEADLINE_MS, MAX_DEADLINE_MS, MAX_RESPONSE_BYTES, MAX_STDERR_BYTES,
-    InvalidWire, parse_response, request_bytes,
+    InvalidWire,
 )
-from .protocol_v2 import parse_response as parse_response_v2, request_bytes as request_bytes_v2
-from .live_events import EventChannel, LiveEventBuffer
-from .live_images import ImageChannel, LiveImageBuffer
-from .live_viewer import ViewerChannel, LiveViewerBuffer
-from .deferred_live_viewer import DeferredViewerChannel, DeferredViewerBuffer
+from .protocol_v2 import parse_response, request_bytes
+from .local_frame_viewer import LocalFrameViewerChannel as DeferredViewerChannel, LocalFrameViewerBuffer as DeferredViewerBuffer
 
 FailureCode = Literal[
     "LAUNCH_FAILED", "MISSING_RESPONSE", "MALFORMED_RESPONSE",
@@ -214,57 +211,28 @@ def call_node(
     node_executable: str | Path = "node", deadline_ms: int = DEFAULT_DEADLINE_MS,
     cancel_event: threading.Event | None = None,
     environment: Mapping[str, str] | None = None,
-    live_events: LiveEventBuffer | None = None,
-    live_images: LiveImageBuffer | None = None,
-    live_viewer: LiveViewerBuffer | None = None,
     deferred_viewer: DeferredViewerBuffer | None = None,
-    protocol_version: Literal["1", "2"] = "1",
+    protocol_version: Literal["2"] = "2",
 ) -> HostCallResult:
-    """Invoke the built production entry and validate one P2-3A exchange.
+    """Invoke the built production entry and validate one v2 exchange.
 
     The executable, entry, config, environment and deadline are trusted host
     inputs. The task JSON cannot change model, profile policy or artifact root.
     """
     if type(deadline_ms) is not int or not 0 < deadline_ms <= MAX_DEADLINE_MS:
         raise ValueError("Invalid host deadline")
-    if protocol_version not in {"1", "2"}:
+    if protocol_version != "2":
         raise ValueError("Unsupported trusted protocol selection")
     if request.get("protocolVersion") != protocol_version:
         raise ValueError("Selected protocol/request mismatch")
-    if protocol_version == "2" and any(item is not None for item in (live_events, live_images, live_viewer)):
-        raise ValueError("Agentic observability channel is not reviewed")
-    if deferred_viewer is not None and (protocol_version != "2" or
-                                        os.environ.get("PLAYWRIGHT_DEMO_WORKFLOW_VERSION") not in {"deferred-action-v1", "semantic-general-v1"} or
-                                        os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") != "1"):
-        raise ValueError("Deferred viewer requires trusted deferred live-view selection")
-    data = (request_bytes_v2 if protocol_version == "2" else request_bytes)(request)
+    if deferred_viewer is not None and os.environ.get("PLAYWRIGHT_DEMO_LIVE_VIEW") != "1":
+        raise ValueError("Frame viewer requires trusted v2 live-view selection")
+    data = request_bytes(request)
     if cancel_event is not None and cancel_event.is_set():
         return _failure("CANCELLED", cleanup="not_started")
-    if live_images is not None and (live_events is None or live_images.events is not live_events):
-        raise ValueError("Live images require the matching event stream")
-    if live_viewer is not None and (live_events is None or live_viewer.events is not live_events):
-        raise ValueError("Live viewer requires the matching event stream")
-    channel = EventChannel(live_events) if live_events is not None else None
-    image_channel = ImageChannel(live_images) if live_images is not None else None
-    viewer_channel = ViewerChannel(live_viewer) if live_viewer is not None else None
     deferred_channel = DeferredViewerChannel(deferred_viewer) if deferred_viewer is not None else None
-    if channel is not None: channel.start()
-    if image_channel is not None: image_channel.start()
-    if viewer_channel is not None: viewer_channel.start()
     if deferred_channel is not None: deferred_channel.start()
     child_env = dict(os.environ if environment is None else environment)
-    if channel is not None:
-        child_env.update({"PLAYWRIGHT_DEMO_EVENT_PORT": str(channel.port),
-                          "PLAYWRIGHT_DEMO_EVENT_STREAM_ID": live_events.stream_id,
-                          "PLAYWRIGHT_DEMO_EVENT_CAPABILITY": channel.capability})
-    if image_channel is not None:
-        child_env.update({"PLAYWRIGHT_DEMO_IMAGE_PORT": str(image_channel.port),
-                          "PLAYWRIGHT_DEMO_IMAGE_STREAM_ID": live_events.stream_id,
-                          "PLAYWRIGHT_DEMO_IMAGE_CAPABILITY": image_channel.capability})
-    if viewer_channel is not None:
-        child_env.update({"PLAYWRIGHT_DEMO_VIEWER_PORT": str(viewer_channel.port),
-                          "PLAYWRIGHT_DEMO_VIEWER_STREAM_ID": live_events.stream_id,
-                          "PLAYWRIGHT_DEMO_VIEWER_CAPABILITY": viewer_channel.capability})
     if deferred_channel is not None:
         child_env.update({"PLAYWRIGHT_DEMO_DEFERRED_VIEWER_PORT": str(deferred_channel.port),
                           "PLAYWRIGHT_DEMO_DEFERRED_VIEWER_STREAM_ID": deferred_viewer.stream_id,
@@ -278,11 +246,7 @@ def call_node(
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
     except OSError:
-        if channel is not None: channel.close()
-        if image_channel is not None: image_channel.close()
-        if viewer_channel is not None: viewer_channel.close()
         if deferred_channel is not None: deferred_channel.close()
-        if live_events is not None: live_events.mark_unavailable()
         return _failure("LAUNCH_FAILED", cleanup="not_started")
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
     stdout = _Drain(process.stdout, MAX_RESPONSE_BYTES)
@@ -312,11 +276,7 @@ def call_node(
             break
         time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
     if failure is not None:
-        if channel is not None: channel.close()
-        if image_channel is not None: image_channel.close()
-        if viewer_channel is not None: viewer_channel.close()
         if deferred_channel is not None: deferred_channel.close()
-        if live_images is not None: live_images.clear()
         forced, descendants = _stop_child(process, graceful_cancel=failure == "CANCELLED")
         stdout.join(timeout=_GRACE_SECONDS)
         stderr.join(timeout=_GRACE_SECONDS)
@@ -326,21 +286,11 @@ def call_node(
             process.stderr.close()
         if not process.stdin.closed:
             process.stdin.close()
-        if live_events is not None: live_events.mark_unavailable()
         return _failure(failure, cleanup="unverified", forced=forced,
                         exit_code=process.returncode,
                         stderr=_stderr_summary(stderr.data),
                         descendants=descendants)
     process.wait()
-    if channel is not None:
-        channel.wait_for_eof()
-        channel.close()
-    if image_channel is not None:
-        image_channel.wait_for_eof()
-        image_channel.close()
-    if viewer_channel is not None:
-        viewer_channel.wait_for_eof()
-        viewer_channel.close()
     if deferred_channel is not None:
         deferred_channel.wait_for_eof()
         deferred_channel.close()
@@ -356,30 +306,17 @@ def call_node(
     if stdout.is_alive() or stderr.is_alive():
         process.stdout.close()
         process.stderr.close()
-        if live_events is not None: live_events.mark_unavailable()
-        if live_images is not None: live_images.clear()
         return _failure("DEADLINE_EXCEEDED", exit_code=process.returncode, stderr=diagnostic)
     if stdout.overflow or stderr.overflow:
-        if live_events is not None: live_events.mark_unavailable()
-        if live_images is not None: live_images.clear()
         return _failure("OUTPUT_LIMIT_EXCEEDED", exit_code=process.returncode, stderr=diagnostic)
     if not stdout.data:
-        if live_events is not None: live_events.mark_unavailable()
-        if live_images is not None: live_images.clear()
         return _failure("MISSING_RESPONSE", exit_code=process.returncode, stderr=diagnostic)
     try:
-        validated, expected_exit = (parse_response_v2 if protocol_version == "2" else parse_response)(
-            bytes(stdout.data), request["request"]["executionProfileRef"]
-        )
+        validated, expected_exit = parse_response(bytes(stdout.data), request["request"]["executionProfileRef"])
     except InvalidWire as error:
         code: FailureCode = "MULTIPLE_RESPONSE" if str(error) == "Multiple responses" else "MALFORMED_RESPONSE"
-        if live_events is not None: live_events.mark_unavailable()
-        if live_images is not None: live_images.clear()
         return _failure(code, exit_code=process.returncode, stderr=diagnostic)
     if process.returncode != expected_exit:
-        if live_events is not None: live_events.mark_unavailable()
-        if live_images is not None: live_images.clear()
         return _failure("UNEXPECTED_EXIT", exit_code=process.returncode, stderr=diagnostic)
-    if live_events is not None: live_events.reconcile(validated)
     return HostCallResult(validated, diagnostic,
                           provider_diagnostic=_provider_diagnostic(stderr.data))

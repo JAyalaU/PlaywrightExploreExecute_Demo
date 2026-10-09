@@ -1,33 +1,11 @@
-import {
-  INTERPRETATION_RESPONSE_FORMAT,
-  AGENTIC_INTERPRETATION_RESPONSE_FORMAT,
-  STRUCTURED_ACTION_INTERPRETATION_RESPONSE_FORMAT,
-  STEP_DECISION_RESPONSE_FORMAT,
-  AGENTIC_DECISION_RESPONSE_FORMAT,
-} from './openai-wire.js';
 import { randomUUID } from 'node:crypto';
-import { AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT } from './verification-wire.js';
-import { DEFERRED_ACTION_INTERPRETATION_RESPONSE_FORMAT } from './deferred-action-wire.js';
-import { ACTION_V2_PRIMARY_RESPONSE_FORMAT, ACTION_V2_INDEPENDENT_RESPONSE_FORMAT,
-  LEGACY_ACTION_V2_PRIMARY_RESPONSE_FORMAT, LEGACY_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT,
-  PREVIOUS_ACTION_V2_PRIMARY_RESPONSE_FORMAT, PREVIOUS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT,
-  PREVIOUS_OFFSETLESS_ACTION_V2_PRIMARY_RESPONSE_FORMAT,
-  PREVIOUS_OFFSETLESS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT,
-  PREVIOUS_CANONICAL_ACTION_V2_PRIMARY_RESPONSE_FORMAT,
-  PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT } from './deferred-action-v2-wire.js';
-import { POC_PRIMARY_RESPONSE_FORMAT, POC_FIDELITY_RESPONSE_FORMAT } from './deferred-action-poc-wire.js';
 import { SEMANTIC_INTENT_PRIMARY_V3_FORMAT, SEMANTIC_INTENT_FIDELITY_V3_FORMAT } from './semantic-intent-v3-wire.js';
-import { ACTION_GROUNDING_RESPONSE_FORMAT, ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT } from './action-grounding-wire.js';
-import { NATIVE_OPTION_VERIFICATION_RESPONSE_FORMAT } from './native-option-verification-wire.js';
-import { liveProviderDebugEnabled, recordLiveProviderError } from './deferred-action-v2-live-debug.js';
+import { liveProviderDebugEnabled, recordLiveProviderError } from './provider-live-debug.js';
+import type { SemanticPrimaryOutputCorrelationV1, SemanticPrimaryOutputDiagnosticV1,
+  SemanticPrimaryOutputPredicateV1 } from
+  './semantic-primary-output-diagnostic-v1.js';
 
-type ResponseFormat = typeof INTERPRETATION_RESPONSE_FORMAT | typeof AGENTIC_INTERPRETATION_RESPONSE_FORMAT |
-  typeof STRUCTURED_ACTION_INTERPRETATION_RESPONSE_FORMAT | typeof STEP_DECISION_RESPONSE_FORMAT |
-  typeof AGENTIC_DECISION_RESPONSE_FORMAT | typeof AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT |
-  typeof DEFERRED_ACTION_INTERPRETATION_RESPONSE_FORMAT | typeof ACTION_V2_PRIMARY_RESPONSE_FORMAT |
-  typeof PREVIOUS_ACTION_V2_PRIMARY_RESPONSE_FORMAT |
-  typeof SEMANTIC_INTENT_PRIMARY_V3_FORMAT | typeof SEMANTIC_INTENT_FIDELITY_V3_FORMAT |
-  typeof ACTION_GROUNDING_RESPONSE_FORMAT | typeof NATIVE_OPTION_VERIFICATION_RESPONSE_FORMAT;
+type ResponseFormat = typeof SEMANTIC_INTENT_PRIMARY_V3_FORMAT | typeof SEMANTIC_INTENT_FIDELITY_V3_FORMAT;
 export type OpenAIReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface OpenAIResponsesConfig {
@@ -61,16 +39,17 @@ export type OpenAIResponseFailureCode =
   | 'PROVIDER_RESPONSE_TOO_LARGE';
 
 export type OpenAIResponseOutcome =
-  | { kind: 'completed'; output: string }
+  | { kind: 'completed'; output: string; semanticPrimaryCorrelation?: SemanticPrimaryOutputCorrelationV1 }
   | { kind: 'failure'; code: OpenAIResponseFailureCode;
-      /** Restricted transport fact. Only a completed malformed model response permits the deferred retry. */
+      /** Restricted transport fact for completed malformed structured output. */
       completedMalformedOutput?: boolean;
-      providerResponseState?: 'completed' | 'incomplete' | 'unavailable' };
+      providerResponseState?: 'completed' | 'incomplete' | 'unavailable';
+      semanticPrimaryDiagnostic?: SemanticPrimaryOutputDiagnosticV1 };
 
 export interface OpenAIResponseDiagnostic {
   kind: 'provider_failure';
   callId: string;
-  stage: 'interpretation' | 'step_decision' | 'agentic_decision' | 'agentic_verification';
+  stage: 'interpretation';
   code: OpenAIResponseFailureCode;
   source: 'configuration' | 'input' | 'http_status' | 'provider_response' |
     'response_contract' | 'response_body' | 'transport_exception' | 'timeout';
@@ -116,7 +95,7 @@ async function withAbort<T>(signal: AbortSignal, operation: () => Promise<T>): P
   }
 }
 
-async function readBounded(response: Response): Promise<unknown> {
+async function readBounded(response: Response, onInvalidJson?: () => void): Promise<unknown> {
   if (!response.body) return undefined;
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -136,42 +115,55 @@ async function readBounded(response: Response): Promise<unknown> {
   try {
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))) as unknown;
   } catch {
+    onInvalidJson?.();
     return undefined;
   }
 }
 
-function extract(response: unknown, maxOutputChars: number): OpenAIResponseOutcome {
+function extract(response: unknown, maxOutputChars: number, diagnostic?:
+  (predicate: SemanticPrimaryOutputPredicateV1, phase: SemanticPrimaryOutputDiagnosticV1['phase'],
+    structuredOutputPresent?: boolean, refusalPresent?: boolean) => SemanticPrimaryOutputDiagnosticV1,
+  invalidBodyJson = false): OpenAIResponseOutcome {
+  const invalid = (predicate: SemanticPrimaryOutputPredicateV1,
+    phase: SemanticPrimaryOutputDiagnosticV1['phase'], completedMalformedOutput = true,
+    structuredOutputPresent = false, refusalPresent = false): OpenAIResponseOutcome => ({
+      kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID',
+      ...(completedMalformedOutput ? { completedMalformedOutput: true } : {}),
+      ...(diagnostic ? { semanticPrimaryDiagnostic: diagnostic(predicate, phase,
+        structuredOutputPresent, refusalPresent) } : {}),
+    });
   const body = record(response);
-  if (!body) return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID' };
+  if (!body) return invalid(invalidBodyJson ? 'JSON_PARSE_FAILED' : 'RESPONSE_BODY_INVALID',
+    'response_body', false);
   if (body.status !== 'completed' || body.error != null || body.incomplete_details != null) {
     return { kind: 'failure', code: body.status === 'incomplete' ? 'PROVIDER_INCOMPLETE' : 'PROVIDER_ERROR' };
   }
-  if (!Array.isArray(body.output)) return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID', completedMalformedOutput: true };
+  if (!Array.isArray(body.output)) return invalid('STRUCTURED_OUTPUT_MISSING', 'response_envelope');
   const messages = body.output.filter((item: unknown) => record(item)?.type === 'message');
   if (messages.length !== 1 || body.output.some((item: unknown) => !['message', 'reasoning'].includes(String(record(item)?.type)))) {
-    return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID', completedMalformedOutput: true };
+    return invalid('STRUCTURED_OUTPUT_MISSING', 'response_envelope');
   }
   const message = record(messages[0]);
   if (message?.status !== 'completed' || message.role !== 'assistant' || !Array.isArray(message.content)) {
-    return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID', completedMalformedOutput: true };
+    return invalid('OUTPUT_MESSAGE_SHAPE_INVALID', 'response_envelope');
   }
   if (message.content.some((part: unknown) => record(part)?.type === 'refusal')) {
     return { kind: 'failure', code: 'PROVIDER_REFUSAL' };
   }
-  if (message.content.length !== 1) return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID', completedMalformedOutput: true };
+  if (message.content.length !== 1) return invalid('OUTPUT_CONTENT_SHAPE_INVALID', 'output_text');
   const part = record(message.content[0]);
   if (part?.type !== 'output_text' || typeof part.text !== 'string' || !part.text.trim()) {
-    return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID', completedMalformedOutput: true };
+    return invalid('STRUCTURED_OUTPUT_MISSING', 'output_text');
   }
   if (part.text.length > maxOutputChars) return { kind: 'failure', code: 'PROVIDER_RESPONSE_TOO_LARGE' };
   try {
     const parsed = JSON.parse(part.text) as unknown;
     const structured = record(parsed);
     if (!structured || !('response' in structured)) {
-      return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID' };
+      return invalid('RESPONSE_FORMAT_MISMATCH', 'output_text', false, true);
     }
   } catch {
-    return { kind: 'failure', code: 'PROVIDER_OUTPUT_INVALID', completedMalformedOutput: true };
+    return invalid('JSON_PARSE_FAILED', 'output_text', true, true);
   }
   return { kind: 'completed', output: part.text };
 }
@@ -194,34 +186,35 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
     async complete(request: OpenAIResponseRequest): Promise<OpenAIResponseOutcome> {
       const started = Date.now();
       const callId = randomUUID();
-      const deferredSourceFormat = request.format === ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === POC_PRIMARY_RESPONSE_FORMAT || request.format === POC_FIDELITY_RESPONSE_FORMAT ||
-        request.format === SEMANTIC_INTENT_PRIMARY_V3_FORMAT || request.format === SEMANTIC_INTENT_FIDELITY_V3_FORMAT;
-      const stage = request.format === INTERPRETATION_RESPONSE_FORMAT ||
-        request.format === AGENTIC_INTERPRETATION_RESPONSE_FORMAT ||
-        request.format === STRUCTURED_ACTION_INTERPRETATION_RESPONSE_FORMAT ||
-        request.format === DEFERRED_ACTION_INTERPRETATION_RESPONSE_FORMAT ||
-        request.format === LEGACY_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === LEGACY_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_OFFSETLESS_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_OFFSETLESS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_CANONICAL_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === POC_PRIMARY_RESPONSE_FORMAT || request.format === POC_FIDELITY_RESPONSE_FORMAT ||
-        request.format === SEMANTIC_INTENT_PRIMARY_V3_FORMAT || request.format === SEMANTIC_INTENT_FIDELITY_V3_FORMAT ? 'interpretation' :
-        request.format === AGENTIC_DECISION_RESPONSE_FORMAT || request.format === ACTION_GROUNDING_RESPONSE_FORMAT ||
-          request.format === ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT ? 'agentic_decision' :
-          request.format === AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT ||
-            request.format === NATIVE_OPTION_VERIFICATION_RESPONSE_FORMAT ? 'agentic_verification' : 'step_decision';
+      const structuredSourceFormat = request.format === SEMANTIC_INTENT_PRIMARY_V3_FORMAT ||
+        request.format === SEMANTIC_INTENT_FIDELITY_V3_FORMAT;
+      const stage = 'interpretation' as const;
+      const semanticPrimary = request.format === SEMANTIC_INTENT_PRIMARY_V3_FORMAT;
+      const primaryDiagnostic = (body: unknown, predicate: SemanticPrimaryOutputPredicateV1,
+        phase: SemanticPrimaryOutputDiagnosticV1['phase'], structuredOutputPresent = false,
+        refusalPresent = false): SemanticPrimaryOutputDiagnosticV1 => {
+        const item = record(body);
+        const status = item?.status;
+        const reason = record(item?.incomplete_details)?.reason;
+        const providerCode = record(item?.error)?.code;
+        const responseId = item?.id;
+        return { phase, predicate, stepIndex: null, fieldFamily: 'response',
+          responseStatus: status === 'completed' || status === 'incomplete' ? status :
+            status === undefined ? 'unavailable' : 'other',
+          structuredOutputPresent, refusalPresent,
+          incompleteClass: reason === 'max_output_tokens' || reason === 'content_filter' ? reason :
+            status === 'incomplete' ? 'other' : null,
+          providerCallId: callId,
+          providerResponseId: typeof responseId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(responseId) ?
+            responseId : null,
+          model, providerErrorCode: typeof providerCode === 'string' &&
+            /^[A-Za-z0-9_-]{1,64}$/.test(providerCode) ? providerCode : null };
+      };
       const fail = (code: OpenAIResponseFailureCode, source: OpenAIResponseDiagnostic['source'],
         response?: Response, transportCode?: OpenAIResponseDiagnostic['transportCode'],
         completedMalformedOutput = false,
-        providerResponseState: 'completed' | 'incomplete' | 'unavailable' = 'unavailable'): OpenAIResponseOutcome => {
+        providerResponseState: 'completed' | 'incomplete' | 'unavailable' = 'unavailable',
+        semanticPrimaryDiagnostic?: SemanticPrimaryOutputDiagnosticV1): OpenAIResponseOutcome => {
         try {
           config.diagnostic?.({ kind: 'provider_failure', callId, stage, code, source,
             ...(response ? { httpStatus: response.status } : {}),
@@ -229,45 +222,15 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
             elapsedMs: Math.max(0, Date.now() - started) });
         } catch { /* Diagnostics never change the model outcome. */ }
         return { kind: 'failure', code,
-          ...(deferredSourceFormat ? { providerResponseState,
+          ...(semanticPrimary && semanticPrimaryDiagnostic ? { semanticPrimaryDiagnostic } : {}),
+          ...(structuredSourceFormat ? { providerResponseState,
             ...(completedMalformedOutput ? { completedMalformedOutput: true } : {}) } : {}) };
       };
       if (request.signal.aborted) return fail('PROVIDER_TIMEOUT', 'timeout');
-      // Only the new reviewed source formats carry both verbatim source contracts.
-      const instructionLimit = request.format === ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_OFFSETLESS_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_OFFSETLESS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_CANONICAL_ACTION_V2_PRIMARY_RESPONSE_FORMAT ||
-        request.format === PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT ? 12_288 : MAX_INSTRUCTION_CHARS;
-      if (!request.systemInstruction.trim() || request.systemInstruction.length > instructionLimit ||
+      if (!request.systemInstruction.trim() || request.systemInstruction.length > MAX_INSTRUCTION_CHARS ||
           !request.input.trim() || request.input.length > MAX_INPUT_CHARS ||
-          (request.format !== INTERPRETATION_RESPONSE_FORMAT &&
-            request.format !== AGENTIC_INTERPRETATION_RESPONSE_FORMAT &&
-            request.format !== STRUCTURED_ACTION_INTERPRETATION_RESPONSE_FORMAT &&
-            request.format !== DEFERRED_ACTION_INTERPRETATION_RESPONSE_FORMAT &&
-            request.format !== LEGACY_ACTION_V2_PRIMARY_RESPONSE_FORMAT &&
-            request.format !== LEGACY_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT &&
-            request.format !== PREVIOUS_ACTION_V2_PRIMARY_RESPONSE_FORMAT &&
-            request.format !== PREVIOUS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT &&
-            request.format !== PREVIOUS_OFFSETLESS_ACTION_V2_PRIMARY_RESPONSE_FORMAT &&
-            request.format !== PREVIOUS_OFFSETLESS_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT &&
-            request.format !== PREVIOUS_CANONICAL_ACTION_V2_PRIMARY_RESPONSE_FORMAT &&
-            request.format !== PREVIOUS_CANONICAL_ACTION_V2_INDEPENDENT_RESPONSE_FORMAT &&
-            request.format !== ACTION_V2_PRIMARY_RESPONSE_FORMAT &&
-            request.format !== ACTION_V2_INDEPENDENT_RESPONSE_FORMAT &&
-            request.format !== POC_PRIMARY_RESPONSE_FORMAT &&
-            request.format !== POC_FIDELITY_RESPONSE_FORMAT &&
-            request.format !== SEMANTIC_INTENT_PRIMARY_V3_FORMAT &&
-            request.format !== SEMANTIC_INTENT_FIDELITY_V3_FORMAT &&
-            request.format !== ACTION_GROUNDING_RESPONSE_FORMAT &&
-            request.format !== ACTION_GROUNDING_INDEPENDENT_RESPONSE_FORMAT &&
-            request.format !== STEP_DECISION_RESPONSE_FORMAT &&
-            request.format !== AGENTIC_DECISION_RESPONSE_FORMAT &&
-            request.format !== NATIVE_OPTION_VERIFICATION_RESPONSE_FORMAT &&
-            request.format !== AGENTIC_VERIFICATION_DECISION_RESPONSE_FORMAT)) {
+          (request.format !== SEMANTIC_INTENT_PRIMARY_V3_FORMAT &&
+            request.format !== SEMANTIC_INTENT_FIDELITY_V3_FORMAT)) {
         return fail('PROVIDER_INPUT_INVALID', 'input');
       }
       let key: string | undefined;
@@ -302,8 +265,12 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
           }
           return fail('PROVIDER_ERROR', 'http_status', response);
         }
-        const body = await withAbort(request.signal, () => readBounded(response));
-        const outcome = extract(body, maxOutputChars);
+        let invalidBodyJson = false;
+        const body = await withAbort(request.signal, () => readBounded(response,
+          () => { invalidBodyJson = true; }));
+        const outcome = extract(body, maxOutputChars, semanticPrimary ?
+          (predicate, phase, structured, refusal) => primaryDiagnostic(body, predicate, phase,
+            structured, refusal) : undefined, invalidBodyJson);
         if (outcome.kind === 'failure') {
           const status = record(body)?.status;
           const providerResponseState = status === 'completed' ? 'completed' :
@@ -315,10 +282,19 @@ export function createOpenAIResponsesClient(config: OpenAIResponsesConfig) {
             recordLiveProviderError({ source: 'provider_response', responseFormat: request.format.name,
               model, elapsedMs: Date.now() - started, httpStatus: response.status,
               providerResponseState, providerError: record(body)?.error, apiKey: key });
+          const special = semanticPrimary && (outcome.code === 'PROVIDER_REFUSAL' ||
+            outcome.code === 'PROVIDER_INCOMPLETE') ? primaryDiagnostic(body,
+              outcome.code === 'PROVIDER_REFUSAL' ? 'PROVIDER_REFUSAL' : 'RESPONSE_INCOMPLETE',
+              'response_envelope', Array.isArray(record(body)?.output),
+              outcome.code === 'PROVIDER_REFUSAL') : undefined;
           return fail(outcome.code, source, response, undefined, outcome.completedMalformedOutput === true,
-            providerResponseState);
+            providerResponseState, outcome.semanticPrimaryDiagnostic ?? special);
         }
-        return outcome;
+        if (!semanticPrimary) return outcome;
+        const responseId = record(body)?.id;
+        return { ...outcome, semanticPrimaryCorrelation: { providerCallId: callId,
+          providerResponseId: typeof responseId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(responseId) ?
+            responseId : null, model } };
       } catch (error) {
         if (request.signal.aborted) return fail('PROVIDER_TIMEOUT', 'timeout');
         if (!(error instanceof Error && error.message === 'RESPONSE_TOO_LARGE'))
